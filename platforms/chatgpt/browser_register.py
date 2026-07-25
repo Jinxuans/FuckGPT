@@ -4,6 +4,7 @@ import json
 import random
 import re
 import secrets
+import sys
 import time
 import uuid
 from typing import Any, Callable, Optional
@@ -11,7 +12,7 @@ from urllib.parse import urljoin, urlparse
 
 from camoufox.sync_api import Camoufox
 
-from .._browser_backend import BrowserBackendConfig, open_browser_backend
+from .._browser_backend import BrowserBackendConfig, keep_browser_context_open, open_browser_backend
 from .constants import (
     OPENAI_AUTH,
     CHATGPT_APP,
@@ -1222,6 +1223,8 @@ def _infer_page_type(data: dict | None, current_url: str = "") -> str:
         return "about_you"
     if "log-in/password" in url:
         return "login_password"
+    if "choose-an-account" in url:
+        return "account_chooser"
     if "sign-in-with-chatgpt" in url and "consent" in url:
         return "consent"
     if "workspace" in url and "select" in url:
@@ -2629,6 +2632,7 @@ class ChatGPTBrowserRegister:
         post_codex_oauth: bool = False,
         codex_phone_callback: Optional[Callable[[], str]] = None,
         codex_oauth_timeout: int = 300,
+        keep_browser_open: bool = False,
         log_fn: Callable[[str], None] = print,
         backend_config: Optional[BrowserBackendConfig] = None,
     ):
@@ -2638,6 +2642,7 @@ class ChatGPTBrowserRegister:
         self.post_codex_oauth = bool(post_codex_oauth)
         self.codex_phone_callback = codex_phone_callback
         self.codex_oauth_timeout = int(codex_oauth_timeout or 300)
+        self.keep_browser_open = bool(keep_browser_open)
         self.log = log_fn
         # backend_config 为 None 时默认 Camoufox，跟老调用方一致。
         # BitBrowser 路径需要上层 plugin.py 显式传 backend_config。
@@ -2675,7 +2680,10 @@ class ChatGPTBrowserRegister:
                 launch_opts["proxy"] = proxy
                 launch_opts["geoip"] = True
 
-        with self._open_browser(launch_opts) as browser:
+        browser_context = self._open_browser(launch_opts)
+        browser = browser_context.__enter__()
+        keep_open = bool(self.keep_browser_open and not self.backend_config.is_headless)
+        try:
             page = browser.new_page()
             self.log("启动浏览器上下文注册状态机")
             final_state = _browser_registration_flow(
@@ -2726,3 +2734,9 @@ class ChatGPTBrowserRegister:
                     result["post_codex_oauth"] = {"ok": False, "error": str(exc)}
                     self.log(f"注册后 Codex OAuth 授权失败: {exc}")
             return result
+        finally:
+            if keep_open:
+                keep_browser_context_open(browser_context, browser, label=f"chatgpt-register:{email}")
+                self.log("浏览器窗口已保留，可手动关闭")
+            else:
+                browser_context.__exit__(*sys.exc_info())

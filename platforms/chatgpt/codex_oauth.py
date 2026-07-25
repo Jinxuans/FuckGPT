@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import secrets
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -16,7 +17,7 @@ from urllib.parse import parse_qs, urlencode, urlparse
 
 import requests
 
-from .._browser_backend import BrowserBackendConfig, open_browser_backend
+from .._browser_backend import BrowserBackendConfig, keep_browser_context_open, open_browser_backend
 from .browser_register import (
     EMAIL_INPUT_SELECTORS,
     EMAIL_SUBMIT_SELECTORS,
@@ -259,6 +260,8 @@ PHONE_TEXT_MESSAGE_SELECTORS = [
     '[role="option"]:has-text("短信")',
 ]
 
+ACCOUNT_CHOOSER_SUBMIT_GRACE_SECONDS = 15
+
 
 @dataclass(slots=True)
 class PKCECodes:
@@ -492,6 +495,195 @@ def _click_continue_like_button(page, log: Callable[[str], None], context: str) 
         log(f"{context}: 已点击 {selector}")
         return True
     return False
+
+
+def _normalize_email_for_compare(value: str) -> str:
+    return str(value or "").strip().lower()
+
+
+def _account_chooser_submission_pending(page, email: str) -> bool:
+    expected_email = _normalize_email_for_compare(email)
+    if not expected_email:
+        return False
+    try:
+        return bool(
+            page.evaluate(
+                """
+                (expectedEmail) => {
+                  const extractEmail = (text) => {
+                    const match = String(text || '').match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,}/i);
+                    return match ? match[0].trim().toLowerCase() : '';
+                  };
+                  return Array.from(document.querySelectorAll('button[name="session_id"]')).some((button) => {
+                    const email = extractEmail(button.innerText || button.textContent || '');
+                    return email === expectedEmail && (
+                      button.disabled
+                      || button.getAttribute('aria-busy') === 'true'
+                      || button.getAttribute('data-state') === 'loading'
+                    );
+                  });
+                }
+                """,
+                expected_email,
+            )
+        )
+    except Exception:
+        return False
+
+
+def _detect_codex_next_step_from_dom(page) -> str:
+    try:
+        result = page.evaluate(
+            """
+            () => {
+              const visible = (el) => {
+                if (!el) return false;
+                const style = window.getComputedStyle(el);
+                const rect = el.getBoundingClientRect();
+                return style && style.display !== 'none' && style.visibility !== 'hidden'
+                  && rect.width > 0 && rect.height > 0;
+              };
+              const hasVisible = (selector) => Array.from(document.querySelectorAll(selector)).some(visible);
+              if (hasVisible('input[type="tel"], input[name="phone"], input[name="phone_number"], input[name="phoneNumber"], input[id*="phone" i], input[placeholder*="phone" i], input[autocomplete="tel"], input[autocomplete="tel-national"]')) {
+                return 'add_phone';
+              }
+              if (hasVisible('input[type="password"], input[name="password"], input[autocomplete="new-password"]')) {
+                return 'login_password';
+              }
+              if (hasVisible("input[inputmode='numeric'], input[autocomplete='one-time-code'], input[type='number'], input[name*='code' i], input[id*='code' i]")) {
+                return 'email_otp_verification';
+              }
+              return '';
+            }
+            """
+        )
+        return str(result or "").strip()
+    except Exception:
+        return ""
+
+
+def _handle_account_chooser(page, email: str, log: Callable[[str], None]) -> bool:
+    expected_email = _normalize_email_for_compare(email)
+    if not expected_email:
+        return False
+    try:
+        result = page.evaluate(
+            """
+            (expectedEmail) => {
+              const visible = (el) => {
+                if (!el) return false;
+                const style = window.getComputedStyle(el);
+                const rect = el.getBoundingClientRect();
+                return style && style.display !== 'none' && style.visibility !== 'hidden'
+                  && rect.width > 0 && rect.height > 0;
+              };
+              const extractEmail = (text) => {
+                const match = String(text || '').match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,}/i);
+                return match ? match[0].trim() : '';
+              };
+              const buttons = Array.from(document.querySelectorAll('button[name="session_id"]'));
+              const accounts = buttons.map((button) => ({
+                email: extractEmail(button.innerText || button.textContent || ''),
+                visible: visible(button),
+              }));
+              for (let i = 0; i < buttons.length; i += 1) {
+                const account = accounts[i];
+                if (!account.visible || account.email.toLowerCase() !== expectedEmail) continue;
+                return { action: 'select', index: i, email: account.email };
+              }
+              const switchLink = document.querySelector('a[href="/log-in-or-create-account"], a[href*="/log-in-or-create-account"]');
+              if (visible(switchLink)) {
+                return { action: 'switch', accounts: accounts.map((item) => item.email).filter(Boolean) };
+              }
+              return { action: 'none', accounts: accounts.map((item) => item.email).filter(Boolean) };
+            }
+            """,
+            expected_email,
+        )
+    except Exception as exc:
+        log(f"Codex OAuth 账号选择页处理失败: {exc}")
+        return False
+
+    if not isinstance(result, dict):
+        return False
+    action = str(result.get("action") or "")
+    if action == "select":
+        selected_email = str(result.get("email") or "").strip()
+        index = int(result.get("index") or 0)
+        try:
+            page.locator('button[name="session_id"]').nth(index).click(timeout=5000)
+        except Exception as exc:
+            log(f"Codex OAuth 账号选择页: 匹配账号点击失败 {selected_email or email}: {exc}")
+            return False
+        log(f"Codex OAuth 账号选择页: 已选择匹配账号 {selected_email or email}")
+        return True
+    if action == "switch":
+        accounts = [str(item) for item in (result.get("accounts") or []) if str(item or "").strip()]
+        suffix = f"；页面已有账号: {', '.join(accounts)}" if accounts else ""
+        try:
+            page.locator('a[href="/log-in-or-create-account"], a[href*="/log-in-or-create-account"]').first.click(timeout=5000)
+        except Exception as exc:
+            log(f"Codex OAuth 账号选择页: 切换账号点击失败: {exc}")
+            return False
+        log(f"Codex OAuth 账号选择页: 未匹配预期邮箱 {email}，改为登录另一个帐户{suffix}")
+        return True
+    log(f"Codex OAuth 账号选择页: 未找到可用账号或切换入口，预期邮箱 {email}")
+    return False
+
+
+def _get_invalid_session_error_page(page) -> dict[str, Any]:
+    try:
+        result = page.evaluate(
+            """
+            () => {
+              const visible = (el) => {
+                if (!el) return false;
+                const style = window.getComputedStyle(el);
+                const rect = el.getBoundingClientRect();
+                return style && style.display !== 'none' && style.visibility !== 'hidden'
+                  && rect.width > 0 && rect.height > 0;
+              };
+              const text = String(document.body?.innerText || '').replace(/\\s+/g, ' ').trim();
+              const retry = Array.from(document.querySelectorAll('button, [role="button"], input[type="button"], input[type="submit"]'))
+                .find((el) => visible(el) && /try\\s+again|重试|重試|再試行|もう一度|やり直す/i.test(String(el.innerText || el.textContent || el.value || '')));
+              return {
+                invalidSession: /invalid\\s+session\\s+id/i.test(text),
+                retryVisible: Boolean(retry),
+                text,
+              };
+            }
+            """
+        )
+        return result if isinstance(result, dict) else {}
+    except Exception:
+        return {}
+
+
+def _click_invalid_session_try_again(page) -> bool:
+    try:
+        clicked = bool(
+            page.evaluate(
+                """
+                () => {
+                  const visible = (el) => {
+                    if (!el) return false;
+                    const style = window.getComputedStyle(el);
+                    const rect = el.getBoundingClientRect();
+                    return style && style.display !== 'none' && style.visibility !== 'hidden'
+                      && rect.width > 0 && rect.height > 0;
+                  };
+                  const retry = Array.from(document.querySelectorAll('button, [role="button"], input[type="button"], input[type="submit"]'))
+                    .find((el) => visible(el) && /try\\s+again|重试|重試|再試行|もう一度|やり直す/i.test(String(el.innerText || el.textContent || el.value || '')));
+                  if (!retry) return false;
+                  retry.click();
+                  return true;
+                }
+                """
+            )
+        )
+        return clicked
+    except Exception:
+        return False
 
 
 def _mask_phone_number(phone_number: str) -> str:
@@ -889,6 +1081,8 @@ def _drive_codex_oauth_page(
     deadline = time.time() + max(int(timeout), 30)
     last_signature = ""
     repeated = 0
+    invalid_session_retries = 0
+    account_chooser_grace_until = 0.0
 
     while time.time() < deadline:
         if callback_server.event.is_set():
@@ -897,6 +1091,12 @@ def _drive_codex_oauth_page(
         current_url = str(getattr(page, "url", "") or "")
         state = _derive_registration_state_from_page(page)
         page_type = str(state.get("page_type") or "")
+        dom_page_type = ""
+        if page_type == "account_chooser":
+            dom_page_type = _detect_codex_next_step_from_dom(page)
+            if dom_page_type:
+                page_type = dom_page_type
+                state["page_type"] = dom_page_type
         signature = f"{page_type}|{current_url}"
         if signature == last_signature:
             repeated += 1
@@ -907,6 +1107,43 @@ def _drive_codex_oauth_page(
 
         if "localhost:1455/auth/callback" in current_url or "localhost:1455/success" in current_url:
             return callback_server.wait(10)
+
+        invalid_session = _get_invalid_session_error_page(page)
+        if invalid_session.get("invalidSession"):
+            invalid_session_retries += 1
+            account_chooser_grace_until = 0.0
+            if invalid_session_retries <= 3:
+                log(f"Codex OAuth 缓存账号 session 失效，点击 Try again 后重选账号 ({invalid_session_retries}/3)")
+                if _click_invalid_session_try_again(page):
+                    time.sleep(1)
+                    continue
+                log("Codex OAuth Invalid session ID 页面未找到 Try again，重新打开授权链接")
+                _goto_with_retry(page, auth_url, wait_until="domcontentloaded", timeout=30000, log=log)
+                time.sleep(1)
+                continue
+            log("Codex OAuth 缓存账号 session 连续失效，重新打开授权链接")
+            _goto_with_retry(page, auth_url, wait_until="domcontentloaded", timeout=30000, log=log)
+            time.sleep(1)
+            continue
+
+        if page_type == "account_chooser":
+            if account_chooser_grace_until and time.time() < account_chooser_grace_until:
+                log("Codex OAuth 账号选择页: 已提交，宽限期内观察下一步")
+                time.sleep(1)
+                continue
+            if _account_chooser_submission_pending(page, email):
+                log("Codex OAuth 账号选择页: 账号选择已提交，等待页面跳转")
+                account_chooser_grace_until = max(
+                    account_chooser_grace_until,
+                    time.time() + ACCOUNT_CHOOSER_SUBMIT_GRACE_SECONDS,
+                )
+                time.sleep(1)
+                continue
+            if _handle_account_chooser(page, email, log):
+                account_chooser_grace_until = time.time() + ACCOUNT_CHOOSER_SUBMIT_GRACE_SECONDS
+                time.sleep(1)
+                continue
+            raise RuntimeError("Codex OAuth 账号选择页未找到匹配账号或切换入口")
 
         email_selector = None
         try:
@@ -1008,6 +1245,9 @@ def _finalize_codex_oauth_callback(
     token_payload = _exchange_code_for_tokens(code, pkce, proxy=proxy)
     expires_in = int(token_payload.get("expires_in") or 0)
     identity = _token_identity(str(token_payload.get("id_token") or ""))
+    identity_email = str(identity.get("email") or "").strip()
+    if identity_email and _normalize_email_for_compare(identity_email) != _normalize_email_for_compare(email):
+        raise RuntimeError(f"Codex OAuth 返回邮箱不匹配: 预期 {email}，实际 {identity_email}")
     expires_at = ""
     if expires_in > 0:
         expires_at = datetime.fromtimestamp(time.time() + expires_in, tz=timezone.utc).isoformat().replace("+00:00", "Z")
@@ -1018,7 +1258,7 @@ def _finalize_codex_oauth_callback(
         "refresh_token": str(token_payload.get("refresh_token") or ""),
         "account_id": identity.get("account_id") or "",
         "last_refresh": _utcnow(),
-        "email": identity.get("email") or email,
+        "email": identity_email or email,
         "type": "codex",
         "expired": expires_at,
     }
@@ -1103,6 +1343,7 @@ def perform_codex_oauth_login(
     auth_dir: str | os.PathLike[str] | None = None,
     timeout: int = 300,
     backend_config: BrowserBackendConfig | None = None,
+    keep_browser_open: bool = False,
 ) -> dict[str, Any]:
     log = log_fn or (lambda _message: None)
     email = str(email or "").strip()
@@ -1127,12 +1368,15 @@ def perform_codex_oauth_login(
     _apply_camoufox_visible_window_limit(launch_opts, browser_config)
 
     with _OAuthCallbackServer(port=CODEX_CALLBACK_PORT) as callback_server:
-        with open_browser_backend(
+        browser_context = open_browser_backend(
             launch_opts=launch_opts,
             config=browser_config,
             camoufox_class=Camoufox,
             log=log,
-        ) as browser:
+        )
+        browser = browser_context.__enter__()
+        keep_open = bool(keep_browser_open and not browser_config.is_headless)
+        try:
             page = browser.new_page()
             callback = _drive_codex_oauth_page(
                 page,
@@ -1145,6 +1389,12 @@ def perform_codex_oauth_login(
                 phone_callback=phone_callback,
                 timeout=timeout,
             )
+        finally:
+            if keep_open:
+                keep_browser_context_open(browser_context, browser, label=f"codex-oauth:{email}")
+                log("Codex OAuth 浏览器窗口已保留，可手动关闭")
+            else:
+                browser_context.__exit__(*sys.exc_info())
 
     return _finalize_codex_oauth_callback(
         callback,

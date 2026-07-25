@@ -757,10 +757,14 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
                 except Exception:
                     pass
                 browser_mode = str(extra.get("codex_oauth_browser_mode") or "").strip().lower()
+                keep_browser_open = str(extra.get("codex_oauth_keep_browser_open") or "").strip().lower()
                 codex_action = platform.execute_action(
                     "codex_oauth_authorize",
                     account,
-                    {"browser_mode": browser_mode or ("headed" if str(payload.get("executor_type") or "") == "headed" else "headless")},
+                    {
+                        "browser_mode": browser_mode or ("headed" if str(payload.get("executor_type") or "") == "headed" else "headless"),
+                        "keep_browser_open": keep_browser_open,
+                    },
                 )
                 if codex_action.get("ok") and isinstance(codex_action.get("data"), dict):
                     account.extra = {**dict(account.extra or {}), **codex_action["data"]}

@@ -42,6 +42,20 @@ VALID_WINDOW_MODES = ("headed", "hidden", "headless")
 ``headed``（Camoufox 不支持移屏外显示，强行 hidden 没意义）。"""
 
 
+_KEPT_BROWSER_CONTEXTS: list[tuple[Any, Any, str]] = []
+
+
+def keep_browser_context_open(context_manager: Any, browser: Any, *, label: str = "") -> None:
+    """Keep a browser context alive after the task returns.
+
+    Most browser backends in this project are context managers. If the caller
+    exits the ``with`` block, the visible window is closed. Holding both the
+    context manager and the browser object here lets a headed debug window stay
+    open until the service process exits or the user closes it manually.
+    """
+    _KEPT_BROWSER_CONTEXTS.append((context_manager, browser, str(label or "")))
+
+
 @dataclass
 class BrowserBackendConfig:
     """browser backend 启动配置 —— 跨调用点的统一入参。

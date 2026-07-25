@@ -306,6 +306,7 @@ class ChatGPTPlatform(BasePlatform):
             from platforms.chatgpt.browser_register import ChatGPTBrowserRegister
             post_codex_oauth = _truthy(ctx.extra.get("auto_codex_oauth_after_register"))
             codex_phone_callback = self._build_codex_phone_callback(ctx.proxy) if post_codex_oauth else None
+            keep_browser_open = _truthy(ctx.extra.get("codex_oauth_keep_browser_open"))
 
             return ChatGPTBrowserRegister(
                 headless=(ctx.executor_type == "headless"),
@@ -314,6 +315,7 @@ class ChatGPTPlatform(BasePlatform):
                 post_codex_oauth=post_codex_oauth,
                 codex_phone_callback=codex_phone_callback,
                 codex_oauth_timeout=int(ctx.extra.get("codex_oauth_timeout") or 300),
+                keep_browser_open=keep_browser_open,
                 log_fn=ctx.log,
                 backend_config=(ctx.extra or {}).get("_reuse_backend_config"),
             )
@@ -368,6 +370,7 @@ class ChatGPTPlatform(BasePlatform):
             {"id": "codex_oauth_authorize", "label": "Codex OAuth 授权",
              "params": [
                  {"key": "browser_mode", "label": "浏览器模式", "type": "text", "options": ["headed", "headless"]},
+                 {"key": "keep_browser_open", "label": "完成后保留浏览器窗口", "type": "select", "options": ["false", "true"]},
              ]},
             {"id": "get_account_state", "label": "查询账号状态/订阅", "params": []},
             {"id": "upload_cpa", "label": "上传 CPA",
@@ -426,6 +429,7 @@ class ChatGPTPlatform(BasePlatform):
             if not browser_mode:
                 browser_mode = str((self.config.extra or {}).get("codex_oauth_browser_mode") or "headed").strip().lower()
             headless = browser_mode in {"headless", "true", "1", "yes", "后台", "后台浏览器"}
+            keep_browser_open = _truthy(params.get("keep_browser_open") or (self.config.extra or {}).get("codex_oauth_keep_browser_open"))
             otp_callback = None
             try:
                 from core.mailbox_store import MailboxStore
@@ -462,6 +466,7 @@ class ChatGPTPlatform(BasePlatform):
                 log_fn=self.log,
                 otp_callback=otp_callback,
                 phone_callback=phone_callback,
+                keep_browser_open=keep_browser_open,
             )
             return {"ok": True, "data": result}
 

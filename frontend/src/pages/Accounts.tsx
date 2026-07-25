@@ -239,6 +239,7 @@ function RegisterModal({
   const [autoUploadSub2Api, setAutoUploadSub2Api] = useState(false)
   const [autoCodexOAuth, setAutoCodexOAuth] = useState(false)
   const [codexOAuthBrowserMode, setCodexOAuthBrowserMode] = useState('headed')
+  const [keepCodexBrowserOpen, setKeepCodexBrowserOpen] = useState(false)
   const [sub2ApiConfigOpen, setSub2ApiConfigOpen] = useState(false)
   const [sub2ApiUrl, setSub2ApiUrl] = useState('http://127.0.0.1:8080')
   const [sub2ApiApiKey, setSub2ApiApiKey] = useState('')
@@ -357,6 +358,7 @@ function RegisterModal({
         auto_upload_sub2api_agent_identity: autoUploadSub2Api,
         auto_codex_oauth_after_register: autoCodexOAuth,
         codex_oauth_browser_mode: codexOAuthBrowserMode,
+        codex_oauth_keep_browser_open: keepCodexBrowserOpen,
       }
       if (selection.identityProvider === 'mailbox') {
         if (selection.executorType === 'protocol') {
@@ -555,6 +557,17 @@ function RegisterModal({
                         <option value="headed">可视浏览器</option>
                         <option value="headless">后台浏览器</option>
                       </select>
+                      {codexOAuthBrowserMode === 'headed' ? (
+                        <label className="flex items-center gap-2 text-xs text-[var(--text-muted)] sm:col-span-2">
+                          <input
+                            type="checkbox"
+                            checked={keepCodexBrowserOpen}
+                            onChange={(event) => setKeepCodexBrowserOpen(event.target.checked)}
+                            className="h-4 w-4 accent-[var(--accent)]"
+                          />
+                          完成后保留浏览器窗口
+                        </label>
+                      ) : null}
                     </div>
                   ) : null}
                 </div>
