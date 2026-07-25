@@ -1,5 +1,5 @@
-appId: com.abaiautoplus.app
-productName: aBaiAutoplus
+appId: com.jinxuans.fuckgpt
+productName: FuckGPT
 copyright: Copyright © 2026
 
 directories:
@@ -9,8 +9,8 @@ directories:
 # 自动更新：从 GitHub Releases 检查
 publish:
   provider: github
-  owner: asz798838958
-  repo: aBaiAutoplus
+  owner: Jinxuans
+  repo: FuckGPT
 
 # 将 PyInstaller 产物和前端静态文件打包进 resources/
 extraResources:

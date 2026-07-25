@@ -101,16 +101,16 @@ function Sidebar({
         {!collapsed && (
           <div className="flex items-center gap-2.5 min-w-0 flex-1">
             <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-[var(--accent)] text-[11px] font-bold text-white">
-              A
+              F
             </div>
             <span className="truncate text-sm font-semibold text-[var(--text-primary)]">
-              aBaiAutoplus
+              FuckGPT
             </span>
           </div>
         )}
         {collapsed && (
           <div className="flex h-7 w-7 items-center justify-center rounded-lg bg-[var(--accent)] text-[11px] font-bold text-white">
-            A
+            F
           </div>
         )}
       </div>
@@ -305,10 +305,10 @@ function LoginScreen({ onLogin }: { onLogin: (token: string) => void }) {
       >
         <div className="flex items-center gap-2.5">
           <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-[var(--accent)] text-sm font-bold text-white">
-            A
+            F
           </div>
           <h1 className="text-base font-semibold text-[var(--text-primary)]">
-            aBaiAutoplus
+            FuckGPT
           </h1>
         </div>
         <p className="text-sm text-[var(--text-muted)]">{t("login.prompt")}</p>

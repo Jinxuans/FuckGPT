@@ -1,7 +1,7 @@
 {
-  "name": "abaiautoplus",
+  "name": "fuckgpt",
   "version": "1.0.0",
-  "description": "aBaiAutoplus - 多平台 AI 账号自动注册与管理工具",
+  "description": "FuckGPT - 本地 ChatGPT/Codex 账号自动化管理工具",
   "main": "main.js",
   "scripts": {
     "dev": "electron .",

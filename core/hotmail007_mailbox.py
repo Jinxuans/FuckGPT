@@ -217,7 +217,7 @@ class Hotmail007Mailbox(BaseMailbox):
         response = self.session.get(
             self._url(path),
             params=params,
-            headers={"Accept": "application/json", "User-Agent": "aBaiAutoplus/hotmail007"},
+            headers={"Accept": "application/json", "User-Agent": "FuckGPT/hotmail007"},
             proxies=self.proxy,
             timeout=self.request_timeout,
         )

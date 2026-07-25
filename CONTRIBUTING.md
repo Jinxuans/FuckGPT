@@ -1,6 +1,6 @@
 # 参与贡献
 
-感谢你对 aBaiAutoplus 的关注！欢迎提交 Issue 和 Pull Request。
+感谢你对 FuckGPT 的关注！欢迎提交 Issue 和 Pull Request。
 
 ## 开发环境
 

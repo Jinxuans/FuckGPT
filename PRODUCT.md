@@ -1,4 +1,4 @@
-# Product
+# FuckGPT Product Brief
 
 ## Register
 
@@ -6,7 +6,7 @@ product
 
 ## Users
 
-This is a self-hosted local operations panel used by one operator to register, manage, export, and re-authorize ChatGPT/Codex accounts.
+FuckGPT is a self-hosted local operations panel used by one operator to register, manage, export, and re-authorize ChatGPT/Codex accounts.
 
 ## Product Purpose
 

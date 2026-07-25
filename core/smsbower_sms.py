@@ -145,7 +145,7 @@ class SMSBowerClient(BaseSmsProvider):
             response = self.session.get(
                 self.base_url,
                 params=query,
-                headers={"Accept": "application/json, text/plain, */*", "User-Agent": "aBaiAutoplus/smsbower"},
+                headers={"Accept": "application/json, text/plain, */*", "User-Agent": "FuckGPT/smsbower"},
                 proxies=self.proxy,
                 timeout=self.request_timeout,
             )
