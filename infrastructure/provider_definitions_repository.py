@@ -318,6 +318,22 @@ _BUILTIN_DEFINITIONS: list[dict] = [
                 "category": "connection",
                 "hint": "等待短信验证码时使用；可在后续流程中按任务覆盖。",
             },
+            {
+                "key": "smsbower_buy_max_attempts",
+                "label": "买号重试次数",
+                "placeholder": "20",
+                "default_value": "20",
+                "category": "connection",
+                "hint": "当 SMSBower 返回 NO_NUMBERS / 暂无号码时继续重试买号，直到成功或达到次数上限。",
+            },
+            {
+                "key": "smsbower_buy_retry_interval",
+                "label": "买号重试间隔秒",
+                "placeholder": "3",
+                "default_value": "3",
+                "category": "connection",
+                "hint": "买号暂无库存时两次重试之间的等待时间。",
+            },
         ],
     },
     # ── proxy ────────────────────────────────────────────────────────

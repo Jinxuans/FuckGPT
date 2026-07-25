@@ -15,8 +15,12 @@ def test_config_options_exposes_smsbower_catalog(client):
 
     assert "smsbower_max_price" in field_keys
     assert "smsbower_min_price" in field_keys
+    assert "smsbower_buy_max_attempts" in field_keys
+    assert "smsbower_buy_retry_interval" in field_keys
     assert "smsbower_ref" not in field_keys
     assert fields["smsbower_default_country"]["label"] == "默认国家 ID"
+    assert fields["smsbower_buy_max_attempts"]["default_value"] == "20"
+    assert fields["smsbower_buy_retry_interval"]["default_value"] == "3"
 
 
 def test_sms_provider_test_fetches_balance_without_purchase(client, monkeypatch):
