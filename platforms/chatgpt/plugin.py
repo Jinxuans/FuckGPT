@@ -41,6 +41,7 @@ class ChatGPTPlatform(BasePlatform):
     capabilities = [
         "query_state",      # Query account state/quota
         "switch_desktop",   # Switch to Codex desktop
+        "codex_oauth_authorize",  # Create Codex OAuth credentials through browser login
         "upload_cpa",       # Upload to CPA system
         "upload_tm",        # Upload to Team Manager
     ]
@@ -208,6 +209,7 @@ class ChatGPTPlatform(BasePlatform):
     def get_platform_actions(self) -> list:
         return [
             {"id": "switch_account", "label": "切换到 Codex 桌面端", "params": []},
+            {"id": "codex_oauth_authorize", "label": "Codex OAuth 授权", "params": []},
             {"id": "get_account_state", "label": "查询账号状态/订阅", "params": []},
             {"id": "upload_cpa", "label": "上传 CPA",
              "params": [
@@ -220,6 +222,16 @@ class ChatGPTPlatform(BasePlatform):
                  {"key": "api_key", "label": "TM API Key", "type": "text"},
              ]},
         ]
+
+    def execute_action(self, action_id: str, account: Account, params: dict) -> dict:
+        aliases = {
+            "switch_account": "switch_desktop",
+            "get_account_state": "query_state",
+        }
+        resolved_action = aliases.get(action_id, action_id)
+        if resolved_action in self.capabilities:
+            return self._handle_capability(resolved_action, account, params or {})
+        return self._execute_platform_action(resolved_action, account, params or {})
 
     def get_desktop_state(self) -> dict:
         from platforms.chatgpt.switch import get_codex_desktop_state
@@ -243,6 +255,50 @@ class ChatGPTPlatform(BasePlatform):
         a.cookies = extra.get("cookies", "")
         a.user_id = account.user_id or ""
         a.account_id = account.user_id or ""
+
+        if action_id == "codex_oauth_authorize":
+            from platforms.chatgpt.codex_oauth import perform_codex_oauth_login
+
+            if not account.email:
+                return {"ok": False, "error": "Codex OAuth 授权需要账号邮箱"}
+            if not account.password:
+                return {"ok": False, "error": "Codex OAuth 授权需要账号密码"}
+            otp_callback = None
+            try:
+                from core.mailbox_store import MailboxStore
+
+                mailbox, mailbox_account, _mailbox_context = MailboxStore().resolve_mailbox_for_account(
+                    platform="chatgpt",
+                    account_id=int(getattr(account, "id", 0) or 0) if getattr(account, "id", None) else 0,
+                    proxy=proxy,
+                    extra=self.config.extra if self.config else {},
+                )
+                before_ids = mailbox.get_current_ids(mailbox_account)
+
+                def _otp_callback():
+                    self.log("等待 Codex OAuth 邮箱验证码...")
+                    code = mailbox.wait_for_code(
+                        mailbox_account,
+                        keyword="",
+                        timeout=180,
+                        before_ids=before_ids,
+                    )
+                    if code:
+                        self.log(f"Codex OAuth 验证码: {code}")
+                    return code
+
+                otp_callback = _otp_callback
+            except Exception as exc:
+                self.log(f"未绑定可用验证邮箱，Codex OAuth 如触发验证码将失败: {exc}")
+            result = perform_codex_oauth_login(
+                email=account.email,
+                password=account.password,
+                proxy=proxy,
+                headless=True,
+                log_fn=self.log,
+                otp_callback=otp_callback,
+            )
+            return {"ok": True, "data": result}
 
         if action_id == "switch_desktop":
             from platforms.chatgpt.switch import (

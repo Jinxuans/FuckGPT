@@ -41,9 +41,46 @@ PERSISTED_ACTION_DATA_KEYS = {
     "orgId",
     "auth_token",
     "authToken",
+    "codex_access_token",
+    "codex_refresh_token",
+    "codex_id_token",
+    "codex_account_id",
+    "codex_email",
+    "codex_plan_type",
+    "codex_expires_at",
+    "codex_last_refresh",
+    "codex_auth_path",
 }
 
 STATEFUL_ACTION_IDS = {"get_account_state", "switch_account", "query_state", "switch_desktop"}
+CODEX_OAUTH_SECRET_RESULT_KEYS = {
+    "codex_access_token",
+    "codex_refresh_token",
+    "codex_id_token",
+}
+
+
+def _mask_secret(value: Any) -> str:
+    text = str(value or "")
+    if not text:
+        return ""
+    if len(text) <= 12:
+        return "***"
+    return f"{text[:6]}...{text[-4:]}"
+
+
+def _safe_action_result_data(action_id: str, data: Any) -> Any:
+    if action_id != "codex_oauth_authorize" or not isinstance(data, dict):
+        return data
+    safe = dict(data)
+    for key in CODEX_OAUTH_SECRET_RESULT_KEYS:
+        if key in safe:
+            preview_key = f"{key}_preview"
+            safe[preview_key] = safe.get(preview_key) or _mask_secret(safe.get(key))
+            safe.pop(key, None)
+    return safe
+
+
 def _utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
@@ -274,6 +311,10 @@ class PlatformRuntime:
                     instance._cancel_check_fn = cancel_check
             account = build_platform_account(session, model)
             try:
+                setattr(account, "id", int(model.id or 0))
+            except Exception:
+                pass
+            try:
                 if callable(cancel_check) and cancel_check():
                     return ActionExecutionResult(ok=False, error="任务已取消")
                 result: dict[str, Any] = instance.execute_action(command.action_id, account, command.params)
@@ -313,6 +354,6 @@ class PlatformRuntime:
                     session.commit()
             return ActionExecutionResult(
                 ok=bool(result.get("ok")),
-                data=result.get("data"),
+                data=_safe_action_result_data(command.action_id, result.get("data")),
                 error=str(result.get("error", "")),
             )
