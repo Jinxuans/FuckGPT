@@ -1,9 +1,9 @@
 import { useState } from "react";
 import { X } from "lucide-react";
 import { useI18n } from "@/lib/i18n-context";
-import qrImage from "../../../assets/screenshots/qrcode_1784128938168.jpg";
+import qrImage from "../../../assets/screenshots/qrcode_1784961442718.jpg";
 
-const QQ_GROUP_URL = "https://qm.qq.com/q/VfehONV8cQ";
+const QQ_GROUP_URL = "https://qm.qq.com/q/zLpB9sJ9DM";
 
 export default function WelcomeDialog() {
   const { t } = useI18n();

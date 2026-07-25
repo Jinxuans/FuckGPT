@@ -163,4 +163,5 @@ npm run build
 
 ## 友情链接
 
+- QQ 群：828116546（https://qm.qq.com/q/zLpB9sJ9DM）
 - [LINUX DO - 新的理想型社区](https://linux.do/)
