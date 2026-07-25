@@ -740,6 +740,42 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
                 logger.log(f"邮箱资源绑定记录失败: {mailbox_link_exc}", level="warning")
             if resolved_proxy:
                 proxy_pool.report_success(resolved_proxy)
+            post_codex_oauth = dict((account.extra or {}).get("post_codex_oauth") or {})
+            auto_codex_oauth_enabled = str(extra.get("auto_codex_oauth_after_register") or "").strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+                "是",
+                "开启",
+                "启用",
+            }
+            if auto_codex_oauth_enabled and not post_codex_oauth:
+                logger.log(f"{account.email} 注册后执行 Codex OAuth 授权")
+                try:
+                    setattr(account, "id", saved_account_id)
+                except Exception:
+                    pass
+                browser_mode = str(extra.get("codex_oauth_browser_mode") or "").strip().lower()
+                codex_action = platform.execute_action(
+                    "codex_oauth_authorize",
+                    account,
+                    {"browser_mode": browser_mode or ("headed" if str(payload.get("executor_type") or "") == "headed" else "headless")},
+                )
+                if codex_action.get("ok") and isinstance(codex_action.get("data"), dict):
+                    account.extra = {**dict(account.extra or {}), **codex_action["data"]}
+                    save_account(account)
+                    post_codex_oauth = {"ok": True}
+                else:
+                    post_codex_oauth = {"ok": False, "error": str(codex_action.get("error") or codex_action.get("data") or "unknown")}
+            if post_codex_oauth:
+                if post_codex_oauth.get("ok"):
+                    logger.log(f"{account.email} 的 Codex OAuth 授权已完成")
+                else:
+                    logger.log(
+                        f"{account.email} 注册成功，但 Codex OAuth 授权失败: {post_codex_oauth.get('error') or 'unknown'}",
+                        level="warning",
+                    )
             if sub2api_upload_config:
                 logger.log(f"正在上传 {account.email} 的 Agent Identity 到 Sub2API")
                 try:
@@ -762,10 +798,13 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
                     logger.log(f"{account.email} 的 Agent Identity 已上传到 Sub2API")
             logger.record_success()
             logger.log(f"注册成功: {account.email}")
-            return {
+            item = {
                 "account_id": saved_account_id,
                 "email": account.email,
             }
+            if auto_codex_oauth_enabled or post_codex_oauth:
+                item["codex_oauth"] = post_codex_oauth or {"ok": False, "skipped": True}
+            return item
         except Exception as exc:
             if resolved_proxy:
                 proxy_pool.report_fail(resolved_proxy)

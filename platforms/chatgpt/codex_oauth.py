@@ -25,12 +25,14 @@ from .browser_register import (
     _apply_camoufox_visible_window_limit,
     _build_proxy_config,
     _click_first,
+    _click_first_no_wait,
     _derive_registration_state_from_page,
     _extract_auth_error_text,
     _fill_input_like_user,
     _goto_with_retry,
     _submit_otp_via_page,
     _submit_oauth_password_direct,
+    _wait_for_any_selector,
 )
 
 
@@ -42,6 +44,220 @@ CODEX_REDIRECT_URI = f"http://localhost:{CODEX_CALLBACK_PORT}/auth/callback"
 CODEX_SCOPE = "openid email profile offline_access"
 CODEX_USER_AGENT = "codex_cli_rs/0.144.1 (Windows 10.0.0; x86_64)"
 DEFAULT_CODEX_AUTH_DIR = Path("data") / "codex_auths"
+
+PHONE_COUNTRY_CODE_MAP = {
+    "1": "United States",
+    "7": "Russia",
+    "20": "Egypt",
+    "27": "South Africa",
+    "30": "Greece",
+    "31": "Netherlands",
+    "32": "Belgium",
+    "33": "France",
+    "34": "Spain",
+    "36": "Hungary",
+    "39": "Italy",
+    "40": "Romania",
+    "44": "United Kingdom",
+    "45": "Denmark",
+    "46": "Sweden",
+    "47": "Norway",
+    "48": "Poland",
+    "49": "Germany",
+    "51": "Peru",
+    "52": "Mexico",
+    "53": "Cuba",
+    "54": "Argentina",
+    "55": "Brazil",
+    "56": "Chile",
+    "57": "Colombia",
+    "58": "Venezuela",
+    "60": "Malaysia",
+    "61": "Australia",
+    "62": "Indonesia",
+    "63": "Philippines",
+    "64": "New Zealand",
+    "65": "Singapore",
+    "66": "Thailand",
+    "81": "Japan",
+    "82": "South Korea",
+    "84": "Vietnam",
+    "86": "China",
+    "90": "Turkey",
+    "91": "India",
+    "92": "Pakistan",
+    "93": "Afghanistan",
+    "94": "Sri Lanka",
+    "95": "Myanmar",
+    "98": "Iran",
+    "212": "Morocco",
+    "213": "Algeria",
+    "216": "Tunisia",
+    "218": "Libya",
+    "220": "Gambia",
+    "221": "Senegal",
+    "234": "Nigeria",
+    "254": "Kenya",
+    "255": "Tanzania",
+    "256": "Uganda",
+    "260": "Zambia",
+    "263": "Zimbabwe",
+    "351": "Portugal",
+    "353": "Ireland",
+    "354": "Iceland",
+    "358": "Finland",
+    "370": "Lithuania",
+    "371": "Latvia",
+    "372": "Estonia",
+    "374": "Armenia",
+    "375": "Belarus",
+    "380": "Ukraine",
+    "381": "Serbia",
+    "385": "Croatia",
+    "420": "Czech Republic",
+    "421": "Slovakia",
+    "855": "Cambodia",
+    "856": "Laos",
+    "880": "Bangladesh",
+    "886": "Taiwan",
+    "960": "Maldives",
+    "966": "Saudi Arabia",
+    "971": "United Arab Emirates",
+    "972": "Israel",
+    "977": "Nepal",
+    "992": "Tajikistan",
+    "993": "Turkmenistan",
+    "994": "Azerbaijan",
+    "995": "Georgia",
+    "996": "Kyrgyzstan",
+    "998": "Uzbekistan",
+}
+
+PHONE_DIAL_TO_ISO = {
+    "1": "US",
+    "7": "RU",
+    "20": "EG",
+    "27": "ZA",
+    "30": "GR",
+    "31": "NL",
+    "32": "BE",
+    "33": "FR",
+    "34": "ES",
+    "36": "HU",
+    "39": "IT",
+    "40": "RO",
+    "44": "GB",
+    "45": "DK",
+    "46": "SE",
+    "47": "NO",
+    "48": "PL",
+    "49": "DE",
+    "51": "PE",
+    "52": "MX",
+    "53": "CU",
+    "54": "AR",
+    "55": "BR",
+    "56": "CL",
+    "57": "CO",
+    "58": "VE",
+    "60": "MY",
+    "61": "AU",
+    "62": "ID",
+    "63": "PH",
+    "64": "NZ",
+    "65": "SG",
+    "66": "TH",
+    "81": "JP",
+    "82": "KR",
+    "84": "VN",
+    "86": "CN",
+    "90": "TR",
+    "91": "IN",
+    "92": "PK",
+    "93": "AF",
+    "94": "LK",
+    "95": "MM",
+    "98": "IR",
+    "212": "MA",
+    "213": "DZ",
+    "216": "TN",
+    "218": "LY",
+    "220": "GM",
+    "221": "SN",
+    "234": "NG",
+    "254": "KE",
+    "255": "TZ",
+    "256": "UG",
+    "260": "ZM",
+    "263": "ZW",
+    "351": "PT",
+    "353": "IE",
+    "354": "IS",
+    "358": "FI",
+    "370": "LT",
+    "371": "LV",
+    "372": "EE",
+    "374": "AM",
+    "375": "BY",
+    "380": "UA",
+    "381": "RS",
+    "385": "HR",
+    "420": "CZ",
+    "421": "SK",
+    "855": "KH",
+    "856": "LA",
+    "880": "BD",
+    "886": "TW",
+    "960": "MV",
+    "966": "SA",
+    "971": "AE",
+    "972": "IL",
+    "977": "NP",
+    "992": "TJ",
+    "993": "TM",
+    "994": "AZ",
+    "995": "GE",
+    "996": "KG",
+    "998": "UZ",
+}
+
+PHONE_INPUT_SELECTORS = [
+    'input[type="tel"]',
+    'input[name="phone"]',
+    'input[name="phone_number"]',
+    'input[name="phoneNumber"]',
+    'input[id*="phone" i]',
+    'input[placeholder*="phone" i]',
+    'input[autocomplete="tel"]',
+    'input[autocomplete="tel-national"]',
+]
+
+PHONE_SEND_SELECTORS = [
+    'button:has-text("Send code via SMS")',
+    'button:has-text("Send code")',
+    'button:has-text("Send via SMS")',
+    'button:has-text("Send link via SMS")',
+    'button:has-text("Send")',
+    'button[type="submit"]',
+    'button:has-text("Continue")',
+    'button:has-text("continue")',
+    'button:has-text("发送")',
+]
+
+PHONE_TEXT_MESSAGE_SELECTORS = [
+    'label:has-text("Text Message")',
+    'button:has-text("Text Message")',
+    '[role="radio"]:has-text("Text Message")',
+    '[role="option"]:has-text("Text Message")',
+    'label:has-text("SMS")',
+    'button:has-text("SMS")',
+    '[role="radio"]:has-text("SMS")',
+    '[role="option"]:has-text("SMS")',
+    'label:has-text("短信")',
+    'button:has-text("短信")',
+    '[role="radio"]:has-text("短信")',
+    '[role="option"]:has-text("短信")',
+]
 
 
 @dataclass(slots=True)
@@ -278,6 +494,385 @@ def _click_continue_like_button(page, log: Callable[[str], None], context: str) 
     return False
 
 
+def _mask_phone_number(phone_number: str) -> str:
+    text = str(phone_number or "").strip()
+    if len(text) <= 4:
+        return text
+    if len(text) <= 8:
+        return f"{text[:2]}****{text[-2:]}"
+    return f"{text[:4]}****{text[-2:]}"
+
+
+def _parse_phone_country_and_local(phone_number: str) -> tuple[str, str, str]:
+    num = str(phone_number or "").lstrip("+").strip().replace(" ", "").replace("-", "")
+    for length in (3, 2, 1):
+        if length > len(num):
+            continue
+        prefix = num[:length]
+        if prefix in PHONE_COUNTRY_CODE_MAP:
+            return prefix, num[length:], PHONE_COUNTRY_CODE_MAP[prefix]
+    return "", num, ""
+
+
+def _digits_only(value: str) -> str:
+    return "".join(ch for ch in str(value or "") if ch.isdigit())
+
+
+def _phone_input_contains(page, selector: str, expected: str) -> tuple[bool, str]:
+    try:
+        actual = str(page.evaluate("(sel) => document.querySelector(sel)?.value || ''", selector) or "")
+    except Exception:
+        actual = ""
+    actual_digits = _digits_only(actual)
+    expected_digits = _digits_only(expected)
+    if not expected_digits:
+        return False, actual
+    return expected_digits in actual_digits, actual
+
+
+def _select_phone_country_ui(page, dial_code: str, country_name: str, log: Callable[[str], None]) -> bool:
+    if not dial_code and not country_name:
+        log("Codex OAuth add_phone: 无法识别国家码，跳过国家选择")
+        return False
+    iso_code = PHONE_DIAL_TO_ISO.get(dial_code, "")
+    dial_pattern = f"(+{dial_code})"
+
+    try:
+        already = page.evaluate(
+            """
+            (dialPattern) => {
+              const visible = (el) => {
+                if (!el) return false;
+                const style = window.getComputedStyle(el);
+                const rect = el.getBoundingClientRect();
+                return style && style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+              };
+              for (const el of Array.from(document.querySelectorAll('button, [role="button"], [role="combobox"], select, div, span'))) {
+                if (!visible(el)) continue;
+                const text = String(el.innerText || el.textContent || '').trim();
+                if (text.includes(dialPattern) && text.length < 100) return true;
+              }
+              return false;
+            }
+            """,
+            dial_pattern,
+        )
+        if already:
+            return True
+    except Exception:
+        pass
+
+    if iso_code:
+        try:
+            selected = page.evaluate(
+                """
+                (isoCode) => {
+                  const selects = Array.from(document.querySelectorAll('select'));
+                  for (const select of selects) {
+                    const option = Array.from(select.options || []).find((item) => {
+                      const value = String(item.value || '').toUpperCase();
+                      const text = String(item.textContent || '').toUpperCase();
+                      return value === isoCode || text.includes(isoCode);
+                    });
+                    if (!option) continue;
+                    select.value = option.value;
+                    select.dispatchEvent(new Event('input', { bubbles: true }));
+                    select.dispatchEvent(new Event('change', { bubbles: true }));
+                    return true;
+                  }
+                  return false;
+                }
+                """,
+                iso_code,
+            )
+            if selected:
+                log(f"Codex OAuth add_phone: 已通过 select 选择国家 {country_name or iso_code}")
+                return True
+        except Exception:
+            pass
+
+    for trigger in (
+        '[role="combobox"]',
+        'button[aria-haspopup="listbox"]',
+        'button:has-text("+")',
+        'button',
+    ):
+        try:
+            if not page.locator(trigger).first.is_visible(timeout=500):
+                continue
+            page.locator(trigger).first.click(timeout=1500)
+            time.sleep(0.5)
+            for option in (
+                f'[role="option"]:has-text("{dial_pattern}")',
+                f'[role="option"]:has-text("{country_name}")',
+                f'li:has-text("{dial_pattern}")',
+                f'li:has-text("{country_name}")',
+                f'button:has-text("{dial_pattern}")',
+            ):
+                try:
+                    if page.locator(option).first.is_visible(timeout=700):
+                        page.locator(option).first.click(timeout=1500)
+                        log(f"Codex OAuth add_phone: 已选择国家 {country_name or dial_pattern}")
+                        return True
+                except Exception:
+                    continue
+        except Exception:
+            continue
+    log(f"Codex OAuth add_phone: 未能选择国家 {country_name or dial_pattern}，将尝试填写完整号码")
+    return False
+
+
+def _select_text_message_delivery(page, log: Callable[[str], None]) -> bool:
+    selector = _click_first_no_wait(page, PHONE_TEXT_MESSAGE_SELECTORS, timeout=3)
+    if selector:
+        log(f"Codex OAuth add_phone: 已选择短信方式 {selector}")
+        return True
+    try:
+        clicked = bool(
+            page.evaluate(
+                """
+                () => {
+                  const visible = (el) => {
+                    if (!el) return false;
+                    const style = window.getComputedStyle(el);
+                    const rect = el.getBoundingClientRect();
+                    return style && style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+                  };
+                  const candidates = Array.from(document.querySelectorAll('label, button, [role="radio"], [role="option"], div, span'))
+                    .filter((el) => {
+                      if (!visible(el)) return false;
+                      const text = String(el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                      return (text.includes('text message') || text === 'sms' || text.includes('短信')) && !text.includes('whatsapp');
+                    });
+                  for (const el of candidates) {
+                    const target = el.closest('label, button, [role="radio"], [role="option"]') || el;
+                    if (!visible(target)) continue;
+                    target.click();
+                    return true;
+                  }
+                  const radios = Array.from(document.querySelectorAll('input[type="radio"]'));
+                  for (const radio of radios) {
+                    const label = radio.closest('label') || document.querySelector(`label[for="${radio.id}"]`);
+                    const text = String(label?.innerText || label?.textContent || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                    if ((text.includes('text message') || text === 'sms' || text.includes('短信')) && !text.includes('whatsapp')) {
+                      radio.click();
+                      radio.dispatchEvent(new Event('input', { bubbles: true }));
+                      radio.dispatchEvent(new Event('change', { bubbles: true }));
+                      return true;
+                    }
+                  }
+                  return false;
+                }
+                """
+            )
+        )
+        if clicked:
+            log("Codex OAuth add_phone: 已通过文本匹配选择 Text Message")
+            return True
+    except Exception as exc:
+        log(f"Codex OAuth add_phone: 选择 Text Message 异常: {exc}")
+    log("Codex OAuth add_phone: 未发现 Text Message 选择项，继续尝试发送")
+    return False
+
+
+def _handle_add_phone_challenge(
+    page,
+    phone_callback: Callable[[], str],
+    *,
+    log: Callable[[str], None],
+    resume_url: str,
+    max_phone_attempts: int = 3,
+) -> None:
+    if not callable(phone_callback):
+        raise RuntimeError("Codex OAuth 遇到 add_phone，但未配置接码服务")
+
+    last_error: Exception | None = None
+    for attempt in range(max_phone_attempts):
+        if attempt:
+            log(f"Codex OAuth add_phone: 换号重试 {attempt + 1}/{max_phone_attempts}")
+            try:
+                page.goto("https://auth.openai.com/add-phone", wait_until="domcontentloaded", timeout=15000)
+                time.sleep(1)
+            except Exception:
+                pass
+        try:
+            _do_add_phone_attempt(page, phone_callback, log=log, resume_url=resume_url)
+            return
+        except Exception as exc:
+            last_error = exc
+            message = str(exc)
+            retryable = (
+                "未获取到短信验证码" in message
+                or "等待短信验证码超时" in message
+                or "NO_NUMBERS" in message
+                or "暂无号码" in message
+                or "无号码" in message
+                or "phone_number_in_use" in message
+                or "no numbers" in message.lower()
+                or "no_number" in message.lower()
+                or "no number" in message.lower()
+                or "already" in message.lower()
+                or "in use" in message.lower()
+            )
+            if hasattr(phone_callback, "cleanup"):
+                try:
+                    phone_callback.cleanup()
+                except Exception:
+                    pass
+            if not retryable:
+                raise
+            if hasattr(phone_callback, "reset"):
+                try:
+                    phone_callback.reset()
+                except Exception:
+                    pass
+            log(f"Codex OAuth add_phone: {message}，准备换号")
+    raise RuntimeError(f"Codex OAuth add_phone 手机验证失败: {last_error}")
+
+
+def _do_add_phone_attempt(
+    page,
+    phone_callback: Callable[[], str],
+    *,
+    log: Callable[[str], None],
+    resume_url: str,
+) -> None:
+    log("Codex OAuth add_phone: 开始获取手机号")
+    phone_number = str(phone_callback() or "").strip()
+    if not phone_number:
+        raise RuntimeError("未获取到手机号")
+    log(f"Codex OAuth add_phone: 提交手机号 {_mask_phone_number(phone_number)}")
+
+    current_url = str(getattr(page, "url", "") or "")
+    if "add-phone" not in current_url:
+        page.goto("https://auth.openai.com/add-phone", wait_until="domcontentloaded", timeout=30000)
+    time.sleep(1)
+
+    dial_code, local_number, country_name = _parse_phone_country_and_local(phone_number)
+    country_selected = _select_phone_country_ui(page, dial_code, country_name, log)
+    phone_selector = _wait_for_any_selector(page, PHONE_INPUT_SELECTORS, timeout=10)
+    if not phone_selector:
+        raise RuntimeError("未找到手机号输入框")
+
+    fill_value = local_number if country_selected and local_number else phone_number
+    filled = _fill_input_like_user(page, phone_selector, fill_value)
+    if not filled:
+        filled, actual_value = _phone_input_contains(page, phone_selector, fill_value)
+        if filled:
+            log(f"Codex OAuth add_phone: 手机号已填写并被页面格式化 value={actual_value[:16]}...")
+    if not filled:
+        log("Codex OAuth add_phone: 常规填写失败，尝试键盘 fallback")
+        try:
+            page.click(phone_selector)
+            time.sleep(0.2)
+            for shortcut in ("Control+A", "Meta+A"):
+                try:
+                    page.keyboard.press(shortcut)
+                    time.sleep(0.1)
+                    page.keyboard.press("Backspace")
+                    time.sleep(0.1)
+                except Exception:
+                    pass
+            page.keyboard.type(fill_value, delay=40)
+            time.sleep(0.3)
+            filled, actual_value = _phone_input_contains(page, phone_selector, fill_value)
+            if filled:
+                log(f"Codex OAuth add_phone: 键盘 fallback 成功 value={actual_value[:16]}...")
+        except Exception as exc:
+            log(f"Codex OAuth add_phone: 键盘 fallback 失败: {exc}")
+            filled = False
+    if not filled:
+        log("Codex OAuth add_phone: 键盘 fallback 失败，尝试 JS setValue")
+        try:
+            filled = bool(
+                page.evaluate(
+                    """
+                    ({ selector, value }) => {
+                      const input = document.querySelector(selector);
+                      if (!input) return false;
+                      input.focus();
+                      const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
+                      if (setter) setter.call(input, value);
+                      else input.value = value;
+                      input.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: value }));
+                      input.dispatchEvent(new Event('change', { bubbles: true }));
+                      input.dispatchEvent(new Event('blur', { bubbles: true }));
+                      const digits = (raw) => String(raw || '').replace(/\\D/g, '');
+                      return digits(input.value).includes(digits(value));
+                    }
+                    """,
+                    {"selector": phone_selector, "value": fill_value},
+                )
+            )
+            if filled:
+                log("Codex OAuth add_phone: JS setValue fallback 成功")
+        except Exception as exc:
+            log(f"Codex OAuth add_phone: JS setValue fallback 失败: {exc}")
+    if not filled:
+        _, actual_value = _phone_input_contains(page, phone_selector, fill_value)
+        raise RuntimeError(f"手机号输入框填写失败: {phone_selector} value={actual_value[:40]}")
+    log(f"Codex OAuth add_phone: 手机号输入框已填写 {phone_selector}")
+
+    _select_text_message_delivery(page, log)
+    time.sleep(0.5)
+
+    send_selector = _click_first_no_wait(page, PHONE_SEND_SELECTORS, timeout=8)
+    if not send_selector:
+        raise RuntimeError("未找到发送验证码按钮")
+    log(f"Codex OAuth add_phone: 已点击发送按钮 {send_selector}")
+    time.sleep(2)
+
+    error_text = _extract_auth_error_text(page)
+    if error_text:
+        if hasattr(phone_callback, "mark_send_failed"):
+            phone_callback.mark_send_failed(error_text)
+        raise RuntimeError(f"手机号提交失败: {error_text[:200]}")
+    if hasattr(phone_callback, "mark_send_succeeded"):
+        phone_callback.mark_send_succeeded()
+
+    for code_attempt in range(3):
+        sms_code = str(phone_callback() or "").strip()
+        if not sms_code:
+            raise RuntimeError("未获取到短信验证码")
+        otp_result = _submit_otp_via_page(page, sms_code, log)
+        log(f"Codex OAuth add_phone: 短信验证码提交状态 {otp_result.get('status', 0)}")
+        if otp_result.get("ok"):
+            if hasattr(phone_callback, "report_success"):
+                phone_callback.report_success()
+            if resume_url:
+                page.goto(resume_url, wait_until="domcontentloaded", timeout=30000)
+            return
+        page_error = _extract_auth_error_text(page)
+        if page_error and any(token in page_error.lower() for token in ("invalid", "incorrect", "wrong", "expired")):
+            if hasattr(phone_callback, "mark_code_failed"):
+                phone_callback.mark_code_failed(page_error)
+            log(f"Codex OAuth add_phone: 短信验证码无效，继续等待下一条: {page_error[:100]}")
+            continue
+        if hasattr(phone_callback, "mark_code_failed"):
+            phone_callback.mark_code_failed(page_error or str(otp_result.get("status") or "failed"))
+        raise RuntimeError(f"短信验证码校验失败: {page_error[:200] if page_error else otp_result.get('status')}")
+    raise RuntimeError("短信验证码校验失败: 多次验证码均未通过")
+
+
+def _try_skip_add_phone(page, *, auth_url: str, callback_server: _OAuthCallbackServer, log: Callable[[str], None]) -> bool:
+    log("Codex OAuth add_phone: 未配置接码，尝试重新访问授权链接跳过")
+    try:
+        page.goto(auth_url, wait_until="domcontentloaded", timeout=15000)
+        for _ in range(8):
+            if callback_server.event.is_set():
+                return True
+            current_url = str(getattr(page, "url", "") or "")
+            if "code=" in current_url or "localhost:1455/auth/callback" in current_url:
+                return True
+            state = _derive_registration_state_from_page(page)
+            if str(state.get("page_type") or "") in {"consent", "workspace_selection", "organization_selection"}:
+                return False
+            time.sleep(1)
+    except Exception as exc:
+        log(f"Codex OAuth add_phone: 跳过尝试异常: {exc}")
+    return False
+
+
 def _drive_codex_oauth_page(
     page,
     *,
@@ -287,6 +882,7 @@ def _drive_codex_oauth_page(
     callback_server: _OAuthCallbackServer,
     log: Callable[[str], None],
     otp_callback: Callable[[], str] | None,
+    phone_callback: Callable[[], str] | None,
     timeout: int,
 ) -> dict[str, str]:
     _goto_with_retry(page, auth_url, wait_until="domcontentloaded", timeout=45000, log=log)
@@ -356,6 +952,21 @@ def _drive_codex_oauth_page(
             time.sleep(1)
             continue
 
+        if page_type == "add_phone":
+            if callable(phone_callback):
+                log("Codex OAuth 检测到 add_phone，开始短信验证")
+                _handle_add_phone_challenge(
+                    page,
+                    phone_callback,
+                    log=log,
+                    resume_url=auth_url,
+                )
+                time.sleep(1)
+                continue
+            if _try_skip_add_phone(page, auth_url=auth_url, callback_server=callback_server, log=log):
+                return callback_server.wait(10)
+            raise RuntimeError("Codex OAuth 登录触发 add_phone，但未配置可用接码服务")
+
         if page_type in {"consent", "workspace_selection", "organization_selection"} or any(
             token in current_url for token in ("sign-in-with-chatgpt", "workspace", "organization", "consent")
         ):
@@ -374,6 +985,112 @@ def _drive_codex_oauth_page(
     raise RuntimeError("Codex OAuth 浏览器登录超时")
 
 
+def _finalize_codex_oauth_callback(
+    callback: dict[str, str],
+    *,
+    expected_state: str,
+    pkce: PKCECodes,
+    email: str,
+    proxy: str | None,
+    auth_dir: str | os.PathLike[str] | None,
+    log: Callable[[str], None],
+) -> dict[str, Any]:
+    if callback.get("error"):
+        detail = callback.get("error_description") or callback["error"]
+        raise RuntimeError(f"Codex OAuth 回调失败: {detail}")
+    if callback.get("state") != expected_state:
+        raise RuntimeError("Codex OAuth state 校验失败")
+    code = str(callback.get("code") or "").strip()
+    if not code:
+        raise RuntimeError("Codex OAuth 回调缺少 code")
+
+    log("Codex OAuth 回调已收到，正在交换 token")
+    token_payload = _exchange_code_for_tokens(code, pkce, proxy=proxy)
+    expires_in = int(token_payload.get("expires_in") or 0)
+    identity = _token_identity(str(token_payload.get("id_token") or ""))
+    expires_at = ""
+    if expires_in > 0:
+        expires_at = datetime.fromtimestamp(time.time() + expires_in, tz=timezone.utc).isoformat().replace("+00:00", "Z")
+
+    token_record = {
+        "id_token": str(token_payload.get("id_token") or ""),
+        "access_token": str(token_payload.get("access_token") or ""),
+        "refresh_token": str(token_payload.get("refresh_token") or ""),
+        "account_id": identity.get("account_id") or "",
+        "last_refresh": _utcnow(),
+        "email": identity.get("email") or email,
+        "type": "codex",
+        "expired": expires_at,
+    }
+    auth_path = _save_codex_auth_file(token_record, auth_dir=auth_dir)
+    log(f"Codex OAuth 登录数据已保存: {auth_path}")
+
+    return {
+        "message": "Codex OAuth 授权完成",
+        "codex_auth_path": str(auth_path),
+        "codex_email": token_record["email"],
+        "codex_account_id": token_record["account_id"],
+        "codex_plan_type": identity.get("plan_type") or "unknown",
+        "codex_access_token": token_record["access_token"],
+        "codex_refresh_token": token_record["refresh_token"],
+        "codex_id_token": token_record["id_token"],
+        "codex_expires_at": token_record["expired"],
+        "codex_last_refresh": token_record["last_refresh"],
+        "codex_access_token_preview": _mask_secret(token_record["access_token"]),
+        "codex_refresh_token_preview": _mask_secret(token_record["refresh_token"]),
+        "codex_id_token_preview": _mask_secret(token_record["id_token"]),
+    }
+
+
+def perform_codex_oauth_login_on_page(
+    page,
+    *,
+    email: str,
+    password: str,
+    proxy: str | None = None,
+    log_fn: Callable[[str], None] | None = None,
+    otp_callback: Callable[[], str] | None = None,
+    phone_callback: Callable[[], str] | None = None,
+    auth_dir: str | os.PathLike[str] | None = None,
+    timeout: int = 300,
+) -> dict[str, Any]:
+    log = log_fn or (lambda _message: None)
+    email = str(email or "").strip()
+    password = str(password or "")
+    if not email:
+        raise RuntimeError("Codex OAuth 需要账号邮箱")
+    if not password:
+        raise RuntimeError("Codex OAuth 需要账号密码")
+
+    pkce = generate_pkce_codes()
+    state = secrets.token_urlsafe(32)
+    auth_url = build_codex_authorize_url(state, pkce)
+    log("Codex OAuth 授权链接已生成，复用当前浏览器窗口")
+
+    with _OAuthCallbackServer(port=CODEX_CALLBACK_PORT) as callback_server:
+        callback = _drive_codex_oauth_page(
+            page,
+            auth_url=auth_url,
+            email=email,
+            password=password,
+            callback_server=callback_server,
+            log=log,
+            otp_callback=otp_callback,
+            phone_callback=phone_callback,
+            timeout=timeout,
+        )
+
+    return _finalize_codex_oauth_callback(
+        callback,
+        expected_state=state,
+        pkce=pkce,
+        email=email,
+        proxy=proxy,
+        auth_dir=auth_dir,
+        log=log,
+    )
+
+
 def perform_codex_oauth_login(
     *,
     email: str,
@@ -382,6 +1099,7 @@ def perform_codex_oauth_login(
     headless: bool = True,
     log_fn: Callable[[str], None] | None = None,
     otp_callback: Callable[[], str] | None = None,
+    phone_callback: Callable[[], str] | None = None,
     auth_dir: str | os.PathLike[str] | None = None,
     timeout: int = 300,
     backend_config: BrowserBackendConfig | None = None,
@@ -424,51 +1142,16 @@ def perform_codex_oauth_login(
                 callback_server=callback_server,
                 log=log,
                 otp_callback=otp_callback,
+                phone_callback=phone_callback,
                 timeout=timeout,
             )
 
-    if callback.get("error"):
-        detail = callback.get("error_description") or callback["error"]
-        raise RuntimeError(f"Codex OAuth 回调失败: {detail}")
-    if callback.get("state") != state:
-        raise RuntimeError("Codex OAuth state 校验失败")
-    code = str(callback.get("code") or "").strip()
-    if not code:
-        raise RuntimeError("Codex OAuth 回调缺少 code")
-
-    log("Codex OAuth 回调已收到，正在交换 token")
-    token_payload = _exchange_code_for_tokens(code, pkce, proxy=proxy)
-    expires_in = int(token_payload.get("expires_in") or 0)
-    identity = _token_identity(str(token_payload.get("id_token") or ""))
-    expires_at = ""
-    if expires_in > 0:
-        expires_at = datetime.fromtimestamp(time.time() + expires_in, tz=timezone.utc).isoformat().replace("+00:00", "Z")
-
-    token_record = {
-        "id_token": str(token_payload.get("id_token") or ""),
-        "access_token": str(token_payload.get("access_token") or ""),
-        "refresh_token": str(token_payload.get("refresh_token") or ""),
-        "account_id": identity.get("account_id") or "",
-        "last_refresh": _utcnow(),
-        "email": identity.get("email") or email,
-        "type": "codex",
-        "expired": expires_at,
-    }
-    auth_path = _save_codex_auth_file(token_record, auth_dir=auth_dir)
-    log(f"Codex OAuth 登录数据已保存: {auth_path}")
-
-    return {
-        "message": "Codex OAuth 授权完成",
-        "codex_auth_path": str(auth_path),
-        "codex_email": token_record["email"],
-        "codex_account_id": token_record["account_id"],
-        "codex_plan_type": identity.get("plan_type") or "unknown",
-        "codex_access_token": token_record["access_token"],
-        "codex_refresh_token": token_record["refresh_token"],
-        "codex_id_token": token_record["id_token"],
-        "codex_expires_at": token_record["expired"],
-        "codex_last_refresh": token_record["last_refresh"],
-        "codex_access_token_preview": _mask_secret(token_record["access_token"]),
-        "codex_refresh_token_preview": _mask_secret(token_record["refresh_token"]),
-        "codex_id_token_preview": _mask_secret(token_record["id_token"]),
-    }
+    return _finalize_codex_oauth_callback(
+        callback,
+        expected_state=state,
+        pkce=pkce,
+        email=email,
+        proxy=proxy,
+        auth_dir=auth_dir,
+        log=log,
+    )

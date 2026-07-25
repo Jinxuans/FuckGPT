@@ -204,6 +204,8 @@ function RegisterModal({
   const [dynamicProxy, setDynamicProxy] = useState('')
   const [outlookPoolText, setOutlookPoolText] = useState('')
   const [autoUploadSub2Api, setAutoUploadSub2Api] = useState(false)
+  const [autoCodexOAuth, setAutoCodexOAuth] = useState(false)
+  const [codexOAuthBrowserMode, setCodexOAuthBrowserMode] = useState('headed')
   const [sub2ApiConfigOpen, setSub2ApiConfigOpen] = useState(false)
   const [sub2ApiUrl, setSub2ApiUrl] = useState('http://127.0.0.1:8080')
   const [sub2ApiApiKey, setSub2ApiApiKey] = useState('')
@@ -320,6 +322,8 @@ function RegisterModal({
       const extra: Record<string, any> = {
         identity_provider: selection.identityProvider,
         auto_upload_sub2api_agent_identity: autoUploadSub2Api,
+        auto_codex_oauth_after_register: autoCodexOAuth,
+        codex_oauth_browser_mode: codexOAuthBrowserMode,
       }
       if (selection.identityProvider === 'mailbox') {
         if (selection.executorType === 'protocol') {
@@ -487,6 +491,38 @@ function RegisterModal({
                     >
                       {t('accounts.configureSub2Api')}
                     </button>
+                  ) : null}
+                </div>
+
+                <div className="rounded-xl border border-[var(--border)] bg-[var(--bg-pane)]/45 px-4 py-3">
+                  <label className="flex cursor-pointer items-start gap-3">
+                    <input
+                      type="checkbox"
+                      checked={autoCodexOAuth}
+                      onChange={(event) => setAutoCodexOAuth(event.target.checked)}
+                      className="mt-0.5 h-4 w-4 accent-[var(--accent)]"
+                    />
+                    <span>
+                      <span className="block text-sm font-medium text-[var(--text-primary)]">
+                        注册后执行 Codex OAuth
+                      </span>
+                      <span className="mt-1 block text-xs text-[var(--text-muted)]">
+                        注册先保存账号；开启后继续获取 Codex 授权数据。浏览器注册会复用当前窗口，协议注册会另起授权窗口。
+                      </span>
+                    </span>
+                  </label>
+                  {autoCodexOAuth ? (
+                    <div className="mt-3 grid gap-2 sm:grid-cols-[160px_1fr]">
+                      <label className="text-xs text-[var(--text-muted)] sm:pt-2">Codex 浏览器模式</label>
+                      <select
+                        value={codexOAuthBrowserMode}
+                        onChange={(event) => setCodexOAuthBrowserMode(event.target.value)}
+                        className="control-surface control-surface-compact"
+                      >
+                        <option value="headed">可视浏览器</option>
+                        <option value="headless">后台浏览器</option>
+                      </select>
+                    </div>
                   ) : null}
                 </div>
 

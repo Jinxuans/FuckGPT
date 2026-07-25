@@ -2626,12 +2626,18 @@ class ChatGPTBrowserRegister:
         headless: bool,
         proxy: Optional[str] = None,
         otp_callback: Optional[Callable[[], str]] = None,
+        post_codex_oauth: bool = False,
+        codex_phone_callback: Optional[Callable[[], str]] = None,
+        codex_oauth_timeout: int = 300,
         log_fn: Callable[[str], None] = print,
         backend_config: Optional[BrowserBackendConfig] = None,
     ):
         self.headless = headless
         self.proxy = proxy
         self.otp_callback = otp_callback
+        self.post_codex_oauth = bool(post_codex_oauth)
+        self.codex_phone_callback = codex_phone_callback
+        self.codex_oauth_timeout = int(codex_oauth_timeout or 300)
         self.log = log_fn
         # backend_config 为 None 时默认 Camoufox，跟老调用方一致。
         # BitBrowser 路径需要上层 plugin.py 显式传 backend_config。
@@ -2699,4 +2705,24 @@ class ChatGPTBrowserRegister:
                 "session": session_info.get("session", {}),
                 "registration_state": final_state,
             }
+            if self.post_codex_oauth:
+                self.log("注册后动作: 复用当前浏览器窗口执行 Codex OAuth")
+                from platforms.chatgpt.codex_oauth import perform_codex_oauth_login_on_page
+
+                try:
+                    codex_result = perform_codex_oauth_login_on_page(
+                        page,
+                        email=email,
+                        password=password,
+                        proxy=self.proxy,
+                        log_fn=self.log,
+                        otp_callback=self.otp_callback,
+                        phone_callback=self.codex_phone_callback,
+                        timeout=self.codex_oauth_timeout,
+                    )
+                    result.update(codex_result)
+                    result["post_codex_oauth"] = {"ok": True}
+                except Exception as exc:
+                    result["post_codex_oauth"] = {"ok": False, "error": str(exc)}
+                    self.log(f"注册后 Codex OAuth 授权失败: {exc}")
             return result

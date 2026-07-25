@@ -50,6 +50,15 @@ PLATFORM_CREDENTIAL_TYPES: dict[str, str] = {
     "wos_session": "token",
     "sso": "cookie",
     "sso_rw": "cookie",
+    "codex_access_token": "token",
+    "codex_refresh_token": "token",
+    "codex_id_token": "token",
+    "codex_account_id": "identifier",
+    "codex_email": "identifier",
+    "codex_plan_type": "identifier",
+    "codex_expires_at": "identifier",
+    "codex_last_refresh": "identifier",
+    "codex_auth_path": "identifier",
 }
 
 PRIMARY_TOKEN_WRITE_KEYS: dict[str, str] = {
