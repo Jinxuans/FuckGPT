@@ -9,7 +9,8 @@ from core.db import ProviderDefinitionModel, ProviderSettingModel, engine
 
 logger = logging.getLogger(__name__)
 
-SUPPORTED_MAILBOX_PROVIDER_KEYS = ("local_ms_pool", "api_mailbox")
+SUPPORTED_MAILBOX_PROVIDER_KEYS = ("local_ms_pool", "api_mailbox", "hotmail007")
+SUPPORTED_SMS_PROVIDER_KEYS = ("smsbower",)
 
 
 def _utcnow() -> datetime:
@@ -116,6 +117,85 @@ _BUILTIN_DEFINITIONS: list[dict] = [
         ],
     },
     {
+        "provider_type": "mailbox",
+        "provider_key": "hotmail007",
+        "label": "Hotmail007",
+        "description": "通过 Hotmail007 API 循环购买邮箱账号，并用最新邮件接口获取验证码；购买循环无固定延迟，适合抢短暂库存",
+        "driver_type": "hotmail007",
+        "default_auth_mode": "apikey",
+        "enabled": True,
+        "category": "thirdparty",
+        "auth_modes": [{"value": "apikey", "label": "API Key"}],
+        "fields": [
+            {
+                "key": "hotmail007_client_key",
+                "label": "Client Key",
+                "secret": True,
+                "category": "auth",
+                "hint": "Hotmail007 用户中心的 API Key；请求会作为 clientKey query 参数传入。",
+            },
+            {
+                "key": "hotmail007_product_id",
+                "label": "商品 ID",
+                "placeholder": "例如 11,12",
+                "category": "connection",
+                "hint": "Hotmail007 商品卡片上的 productId。支持用英文/中文逗号或空白填写多个，每次购买尝试会随机选择一个。",
+            },
+            {
+                "key": "hotmail007_base_url",
+                "label": "API 基址",
+                "placeholder": "https://hotmail007.com/api",
+                "default_value": "https://hotmail007.com/api",
+                "category": "connection",
+            },
+            {
+                "key": "hotmail007_buy_quantity",
+                "label": "每次购买数量",
+                "placeholder": "1",
+                "default_value": "1",
+                "category": "connection",
+                "hint": "核心注册流程通常填 1；大于 1 时多买到的账号会在当前进程内缓存给后续注册使用。",
+            },
+            {
+                "key": "hotmail007_buy_max_attempts",
+                "label": "购买最大尝试次数",
+                "placeholder": "200",
+                "default_value": "200",
+                "category": "connection",
+                "hint": "购买循环没有固定延迟；库存不足、瞬时失败会立即重试，直到成功、达到次数或超时。",
+            },
+            {
+                "key": "hotmail007_buy_timeout_seconds",
+                "label": "购买超时秒",
+                "placeholder": "30",
+                "default_value": "30",
+                "category": "connection",
+            },
+            {
+                "key": "hotmail007_request_timeout",
+                "label": "单次请求超时秒",
+                "placeholder": "8",
+                "default_value": "8",
+                "category": "connection",
+            },
+            {
+                "key": "hotmail007_folders",
+                "label": "取件文件夹",
+                "placeholder": "inbox,junkemail",
+                "default_value": "inbox,junkemail",
+                "category": "connection",
+                "hint": "仅支持 inbox 和 junkemail。会依次查询这些文件夹的最新邮件。",
+            },
+            {
+                "key": "hotmail007_include_junk",
+                "label": "同时查询垃圾邮件",
+                "type": "toggle",
+                "default_value": "true",
+                "category": "connection",
+            },
+        ],
+    },
+    {
         "provider_type": "captcha",
         "provider_key": "yescaptcha_api",
         "label": "YesCaptcha",
@@ -168,6 +248,77 @@ _BUILTIN_DEFINITIONS: list[dict] = [
         "category": "thirdparty",
         "auth_modes": [],
         "fields": [],
+    },
+    # ── sms ──────────────────────────────────────────────────────────
+    {
+        "provider_type": "sms",
+        "provider_key": "smsbower",
+        "label": "SMSBower",
+        "description": "通过 SMSBower API 购买手机号、查询短信验证码并更新激活状态，用于后续自动绑定手机号",
+        "driver_type": "smsbower",
+        "default_auth_mode": "apikey",
+        "enabled": True,
+        "category": "thirdparty",
+        "auth_modes": [{"value": "apikey", "label": "API Key"}],
+        "fields": [
+            {
+                "key": "smsbower_api_key",
+                "label": "API Key",
+                "secret": True,
+                "category": "auth",
+                "hint": "SMSBower 用户中心的 API Key；请求会作为 api_key query 参数传入，日志与异常会脱敏。",
+            },
+            {
+                "key": "smsbower_default_service",
+                "label": "默认服务代码",
+                "placeholder": "例如 go / ot / tg",
+                "category": "connection",
+                "hint": "SMSBower 文档中的 service 参数；后续绑定流程也可以运行时覆盖。",
+            },
+            {
+                "key": "smsbower_default_country",
+                "label": "默认国家 ID",
+                "placeholder": "例如 0",
+                "category": "connection",
+                "hint": "SMSBower 文档中的 country 参数，也就是国家 ID；后续绑定流程也可以运行时覆盖。",
+            },
+            {
+                "key": "smsbower_max_price",
+                "label": "最高价格",
+                "placeholder": "例如 0.5",
+                "category": "connection",
+                "hint": "可选；购买手机号时作为 maxPrice 参数传入，用于限制最高可接受价格。",
+            },
+            {
+                "key": "smsbower_min_price",
+                "label": "最低价格",
+                "placeholder": "例如 0.1",
+                "category": "connection",
+                "hint": "可选；购买手机号时作为 minPrice 参数传入，用于限制最低可接受价格。",
+            },
+            {
+                "key": "smsbower_base_url",
+                "label": "API 地址",
+                "placeholder": "https://smsbower.page/stubs/handler_api.php",
+                "default_value": "https://smsbower.page/stubs/handler_api.php",
+                "category": "connection",
+            },
+            {
+                "key": "smsbower_request_timeout",
+                "label": "单次请求超时秒",
+                "placeholder": "15",
+                "default_value": "15",
+                "category": "connection",
+            },
+            {
+                "key": "smsbower_poll_interval",
+                "label": "查码轮询间隔秒",
+                "placeholder": "3",
+                "default_value": "3",
+                "category": "connection",
+                "hint": "等待短信验证码时使用；可在后续流程中按任务覆盖。",
+            },
+        ],
     },
     # ── proxy ────────────────────────────────────────────────────────
     {
@@ -240,6 +391,8 @@ class ProviderDefinitionsRepository:
                 item.enabled = (
                     seed["provider_key"] in SUPPORTED_MAILBOX_PROVIDER_KEYS
                     if seed["provider_type"] == "mailbox"
+                    else seed["provider_key"] in SUPPORTED_SMS_PROVIDER_KEYS
+                    if seed["provider_type"] == "sms"
                     else seed.get("enabled", True)
                 )
                 item.is_builtin = True
@@ -265,6 +418,15 @@ class ProviderDefinitionsRepository:
                     item.updated_at = _utcnow()
                     session.add(item)
                     changed = True
+                if (
+                    item.provider_type == "sms"
+                    and item.provider_key not in SUPPORTED_SMS_PROVIDER_KEYS
+                    and item.enabled
+                ):
+                    item.enabled = False
+                    item.updated_at = _utcnow()
+                    session.add(item)
+                    changed = True
 
             if changed:
                 session.commit()
@@ -279,6 +441,8 @@ class ProviderDefinitionsRepository:
             items = session.exec(query.order_by(ProviderDefinitionModel.id)).all()
             if provider_type == "mailbox":
                 items = [item for item in items if item.provider_key in SUPPORTED_MAILBOX_PROVIDER_KEYS]
+            if provider_type == "sms":
+                items = [item for item in items if item.provider_key in SUPPORTED_SMS_PROVIDER_KEYS]
             return items
 
     def get_by_key(self, provider_type: str, provider_key: str) -> ProviderDefinitionModel | None:
@@ -300,6 +464,8 @@ class ProviderDefinitionsRepository:
         seen: dict[str, dict] = {}
         for d in definitions:
             if provider_type == "mailbox" and d.provider_key not in SUPPORTED_MAILBOX_PROVIDER_KEYS:
+                continue
+            if provider_type == "sms" and d.provider_key not in SUPPORTED_SMS_PROVIDER_KEYS:
                 continue
             dt = d.driver_type or ""
             if dt and dt not in seen:

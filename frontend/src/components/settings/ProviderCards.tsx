@@ -361,6 +361,7 @@ export default function ProviderCards({ providerType, catalog, settings, onReloa
   const settingsMap: Record<string, ProviderSetting> = {}
   for (const s of settings) settingsMap[s.provider_key] = s
   const defaultKey = settings.find(s => s.is_default)?.provider_key || ''
+  const providerTypeLabelKey = `providers.type.${providerType}` as TranslationKey
 
   const grouped: Record<string, ProviderOption[]> = {}
   for (const p of catalog) {
@@ -548,7 +549,7 @@ export default function ProviderCards({ providerType, catalog, settings, onReloa
                     onClick={() => onCreateCustom?.()}
                   >
                     <Plus className="h-4 w-4" />
-                    {t('providers.addCustom', { type: t('providers.type.mailbox') })}
+                    {t('providers.addCustom', { type: t(providerTypeLabelKey) })}
                   </button>
                 )}
               </div>

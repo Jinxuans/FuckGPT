@@ -41,6 +41,8 @@ type NavItem = {
 const SETTINGS_NAV_ITEMS: { labelKey: TranslationKey; hash: string }[] = [
   { labelKey: "nav.settings.general", hash: "general" },
   { labelKey: "nav.settings.mailbox", hash: "mailbox" },
+  { labelKey: "nav.settings.mailboxResources", hash: "mailboxResources" },
+  { labelKey: "nav.settings.sms", hash: "sms" },
 ];
 
 const NAV_ITEMS: NavItem[] = [

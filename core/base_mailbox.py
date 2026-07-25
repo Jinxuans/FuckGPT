@@ -151,9 +151,28 @@ def _create_api_mailbox(extra: dict, proxy: str | None) -> BaseMailbox:
     )
 
 
+def _create_hotmail007(extra: dict, proxy: str | None) -> BaseMailbox:
+    from core.hotmail007_mailbox import Hotmail007Mailbox
+
+    return Hotmail007Mailbox(
+        client_key=extra.get("hotmail007_client_key", ""),
+        product_id=extra.get("hotmail007_product_id", ""),
+        base_url=extra.get("hotmail007_base_url", ""),
+        buy_quantity=extra.get("hotmail007_buy_quantity", 1),
+        buy_max_attempts=extra.get("hotmail007_buy_max_attempts", 200),
+        buy_timeout_seconds=extra.get("hotmail007_buy_timeout_seconds", 30),
+        request_timeout=extra.get("hotmail007_request_timeout", 8),
+        folders=extra.get("hotmail007_folders", ""),
+        include_junk=extra.get("hotmail007_include_junk", "true"),
+        proxy=proxy,
+        log_fn=extra.get("_log_fn"),
+    )
+
+
 MAILBOX_FACTORY_REGISTRY = {
     "local_ms_pool": _create_local_ms_pool,
     "api_mailbox": _create_api_mailbox,
+    "hotmail007": _create_hotmail007,
 }
 
 

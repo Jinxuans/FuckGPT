@@ -5,7 +5,11 @@ from datetime import datetime, timezone
 from sqlmodel import Session, select
 
 from core.db import ProviderSettingModel, engine
-from infrastructure.provider_definitions_repository import ProviderDefinitionsRepository, SUPPORTED_MAILBOX_PROVIDER_KEYS
+from infrastructure.provider_definitions_repository import (
+    ProviderDefinitionsRepository,
+    SUPPORTED_MAILBOX_PROVIDER_KEYS,
+    SUPPORTED_SMS_PROVIDER_KEYS,
+)
 
 
 def _utcnow() -> datetime:
@@ -25,6 +29,8 @@ class ProviderSettingsRepository:
             ).all()
             if provider_type == "mailbox":
                 items = [item for item in items if item.provider_key in SUPPORTED_MAILBOX_PROVIDER_KEYS]
+            if provider_type == "sms":
+                items = [item for item in items if item.provider_key in SUPPORTED_SMS_PROVIDER_KEYS]
             return items
 
     def get(self, setting_id: int) -> ProviderSettingModel | None:
@@ -67,6 +73,8 @@ class ProviderSettingsRepository:
             ).all()
         if provider_type == "mailbox":
             items = [item for item in items if item.provider_key in SUPPORTED_MAILBOX_PROVIDER_KEYS]
+        if provider_type == "sms":
+            items = [item for item in items if item.provider_key in SUPPORTED_SMS_PROVIDER_KEYS]
         return sorted(items, key=lambda item: (not bool(item.is_default), int(item.id or 0)))
 
     def get_default_provider_key(self, provider_type: str, *, enabled_only: bool = True) -> str:
@@ -90,6 +98,8 @@ class ProviderSettingsRepository:
             ).all()
             if provider_type == "mailbox":
                 remaining = [item for item in remaining if item.provider_key in SUPPORTED_MAILBOX_PROVIDER_KEYS]
+            if provider_type == "sms":
+                remaining = [item for item in remaining if item.provider_key in SUPPORTED_SMS_PROVIDER_KEYS]
             if is_default and remaining:
                 fallback = remaining[0]
                 fallback.is_default = True

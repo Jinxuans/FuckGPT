@@ -38,6 +38,7 @@ class ProviderSettingsService:
         return {
             "mailbox_settings": self.list_settings("mailbox"),
             "captcha_settings": self.list_settings("captcha"),
+            "sms_settings": self.list_settings("sms"),
             "captcha_policy": self.get_captcha_policy(),
         }
 

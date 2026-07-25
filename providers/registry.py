@@ -29,6 +29,7 @@ _registry: dict[str, dict[str, type]] = {
     "mailbox": {},
     "captcha": {},
     "proxy": {},
+    "sms": {},
 }
 
 _loaded = False
@@ -75,8 +76,9 @@ def load_all() -> None:
     import providers.captcha
     import providers.proxy
     import providers.mailbox
+    import providers.sms
 
-    for package in (providers.captcha, providers.proxy, providers.mailbox):
+    for package in (providers.captcha, providers.proxy, providers.mailbox, providers.sms):
         for _finder, name, _ispkg in pkgutil.iter_modules(
             package.__path__, package.__name__ + "."
         ):

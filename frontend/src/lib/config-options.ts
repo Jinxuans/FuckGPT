@@ -50,10 +50,13 @@ export type CaptchaPolicy = {
 export type ConfigOptionsResponse = {
   mailbox_providers: ProviderOption[]
   captcha_providers: ProviderOption[]
+  sms_providers?: ProviderOption[]
   mailbox_drivers?: ProviderDriver[]
   captcha_drivers?: ProviderDriver[]
+  sms_drivers?: ProviderDriver[]
   mailbox_settings?: ProviderSetting[]
   captcha_settings?: ProviderSetting[]
+  sms_settings?: ProviderSetting[]
   captcha_policy?: CaptchaPolicy
   executor_options?: ChoiceOption[]
   identity_mode_options?: ChoiceOption[]

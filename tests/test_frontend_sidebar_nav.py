@@ -35,16 +35,18 @@ def test_sidebar_hides_accounts_menu_and_other_business_links():
     assert "nav.tasks" not in source
 
 
-def test_sidebar_only_keeps_general_and_mailbox_settings_submenu_items():
+def test_sidebar_keeps_general_mailbox_resources_and_sms_settings_submenu_items():
     source = APP_TSX.read_text(encoding="utf-8")
 
     start = source.index("const SETTINGS_NAV_ITEMS:")
     end = source.index("];", start)
     block = source[start:end]
 
-    assert block.count('hash: "') == 2
+    assert block.count('hash: "') == 4
     assert 'labelKey: "nav.settings.general", hash: "general"' in block
     assert 'labelKey: "nav.settings.mailbox", hash: "mailbox"' in block
+    assert 'labelKey: "nav.settings.mailboxResources", hash: "mailboxResources"' in block
+    assert 'labelKey: "nav.settings.sms", hash: "sms"' in block
 
     assert "currentTab" in source
     assert "/settings?tab=${item.hash}" in source

@@ -27,10 +27,13 @@ class ConfigService:
         return {
             "mailbox_providers": self.provider_definitions.list_definitions("mailbox", enabled_only=True),
             "captcha_providers": self.provider_definitions.list_definitions("captcha", enabled_only=True),
+            "sms_providers": self.provider_definitions.list_definitions("sms", enabled_only=True),
             "mailbox_drivers": self.provider_definitions.list_driver_templates("mailbox"),
             "captcha_drivers": self.provider_definitions.list_driver_templates("captcha"),
+            "sms_drivers": self.provider_definitions.list_driver_templates("sms"),
             "captcha_policy": self.provider_settings.get_captcha_policy(),
             "mailbox_settings": self.provider_settings.list_settings("mailbox"),
             "captcha_settings": self.provider_settings.list_settings("captcha"),
+            "sms_settings": self.provider_settings.list_settings("sms"),
             **platform_options,
         }

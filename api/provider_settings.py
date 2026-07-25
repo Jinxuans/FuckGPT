@@ -60,7 +60,7 @@ class ProviderTestRequest(BaseModel):
 
 @router.post("/test")
 def test_provider(body: ProviderTestRequest):
-    """测试 provider 配置是否正确 — 尝试创建/获取一个邮箱地址。"""
+    """测试 provider 配置是否正确。"""
     from infrastructure.provider_definitions_repository import ProviderDefinitionsRepository
 
     definitions = ProviderDefinitionsRepository()
@@ -75,6 +75,8 @@ def test_provider(body: ProviderTestRequest):
         return _test_mailbox(definition.driver_type or body.provider_key, extra, definition)
     elif body.provider_type == "captcha":
         return {"ok": True, "message": "验证码服务暂不支持在线测试，请在注册任务中验证"}
+    elif body.provider_type == "sms":
+        return _test_sms(definition.driver_type or body.provider_key, extra)
     return {"ok": False, "error": f"不支持测试的 provider 类型: {body.provider_type}"}
 
 
@@ -110,3 +112,26 @@ def _test_mailbox(driver_type: str, extra: dict, definition) -> dict:
             "error": f"测试失败: {str(exc)}",
             "detail": traceback.format_exc()[-500:],
         }
+
+
+def _test_sms(driver_type: str, extra: dict) -> dict:
+    """通过余额接口测试短信 provider 配置，不购买手机号。"""
+    if driver_type != "smsbower":
+        return {"ok": False, "error": f"未找到短信驱动: {driver_type}"}
+
+    from core.smsbower_sms import DEFAULT_BASE_URL, SMSBowerClient
+
+    client = SMSBowerClient.from_config(extra)
+    if not client.api_key:
+        return {"ok": False, "error": "SMSBower API Key 未配置"}
+    try:
+        balance = client.get_balance()
+        balance_text = f"{balance:g}"
+        return {
+            "ok": True,
+            "message": f"SMSBower 连接成功，账户余额：{balance_text}",
+            "balance": balance,
+            "base_url": client.base_url or DEFAULT_BASE_URL,
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": f"SMSBower 连接失败: {str(exc)}"}

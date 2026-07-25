@@ -51,6 +51,8 @@ const ZH_MESSAGES = {
   "nav.settings": "设置",
   "nav.settings.general": "通用",
   "nav.settings.mailbox": "邮箱服务",
+  "nav.settings.mailboxResources": "邮箱资源",
+  "nav.settings.sms": "接码服务",
   "sidebar.theme.light": "浅色",
   "sidebar.theme.dark": "深色",
   "sidebar.theme.system": "系统",
@@ -85,6 +87,8 @@ const ZH_MESSAGES = {
   "settings.title.general": "通用设置",
   "settings.title.register": "注册策略",
   "settings.title.mailbox": "邮箱服务",
+  "settings.title.mailboxResources": "邮箱资源",
+  "settings.title.sms": "接码服务",
   "settings.title.captcha": "验证服务",
   "settings.title.proxies": "代理资源",
   "settings.title.chatgpt": "ChatGPT",
@@ -128,6 +132,8 @@ const ZH_MESSAGES = {
     "普通使用者只需要理解两件事：注册身份选“系统邮箱”还是“第三方账号”，执行方式选“协议模式 / 后台浏览器自动 / 可视浏览器自动”。这里的配置只是设置默认值。",
   "settings.provider.mailboxUsage":
     "只有在注册身份选择“系统邮箱”时，才会使用这里的邮箱服务配置。列表行内可以直接查看详情、编辑、设默认和删除。",
+  "settings.provider.smsUsage":
+    "用于后续自动绑定手机号流程。当前只负责保存 SMSBower 配置；测试按钮只做本地配置校验，不会购买手机号。",
   "settings.provider.captchaUsage":
     "协议模式会按已启用顺序自动选择远程打码服务；浏览器模式使用当前默认的验证码 provider。列表行内可以直接查看详情、编辑、设默认、删除。",
   "settings.chatgpt.cpaDesc": "注册完成后自动上传到 CPA 管理平台",
@@ -342,6 +348,7 @@ const ZH_MESSAGES = {
   "providers.addCustom": "添加自定义{type}服务",
   "providers.type.mailbox": "邮箱",
   "providers.type.captcha": "验证",
+  "providers.type.sms": "接码",
   "taskLog.status": "Status",
   "taskLog.progress": "Progress",
   "taskLog.events": "Events",
@@ -444,6 +451,8 @@ const EN_MESSAGES: Record<TranslationKey, string> = {
   "nav.settings": "Settings",
   "nav.settings.general": "General",
   "nav.settings.mailbox": "Mailbox",
+  "nav.settings.mailboxResources": "Mailbox Resources",
+  "nav.settings.sms": "SMS",
   "sidebar.theme.light": "Light",
   "sidebar.theme.dark": "Dark",
   "sidebar.theme.system": "System",
@@ -478,6 +487,8 @@ const EN_MESSAGES: Record<TranslationKey, string> = {
   "settings.title.general": "General Settings",
   "settings.title.register": "Registration",
   "settings.title.mailbox": "Mailbox Services",
+  "settings.title.mailboxResources": "Mailbox Resources",
+  "settings.title.sms": "SMS Services",
   "settings.title.captcha": "Captcha Services",
   "settings.title.proxies": "Proxy Resources",
   "settings.title.chatgpt": "ChatGPT",
@@ -521,6 +532,8 @@ const EN_MESSAGES: Record<TranslationKey, string> = {
     "Most users only need to choose between “System Mailbox” and “OAuth Account”, then choose Protocol, Background Browser, or Visible Browser. These settings only define the defaults.",
   "settings.provider.mailboxUsage":
     "Mailbox services are used only when the registration identity is “System Mailbox”. Rows support details, editing, default selection, and deletion.",
+  "settings.provider.smsUsage":
+    "Reserved for automatic phone binding. This page currently saves SMSBower settings only; the test button validates local config and will not purchase a number.",
   "settings.provider.captchaUsage":
     "Protocol mode selects remote captcha services in enabled order; browser mode uses the current default captcha provider. Rows support details, editing, default selection, and deletion.",
   "settings.chatgpt.cpaDesc":
@@ -748,6 +761,7 @@ const EN_MESSAGES: Record<TranslationKey, string> = {
   "providers.addCustom": "Add Custom {type} Service",
   "providers.type.mailbox": "Mailbox",
   "providers.type.captcha": "Captcha",
+  "providers.type.sms": "SMS",
   "taskLog.status": "Status",
   "taskLog.progress": "Progress",
   "taskLog.events": "Events",

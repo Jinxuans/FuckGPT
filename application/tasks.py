@@ -499,6 +499,7 @@ def _build_platform_instance(platform_name: str, payload: dict[str, Any], logger
     executor_type = str(payload.get("executor_type", "headless") or "headless")
     captcha_solver = str(payload.get("captcha_solver", "auto") or "auto")
     extra = dict(payload.get("extra") or {})
+    extra["_log_fn"] = logger.log
     config = RegisterConfig(
         executor_type=executor_type,
         captcha_solver=captcha_solver,
@@ -657,6 +658,7 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
     password = payload.get("password") or None
     explicit_proxy = str(payload.get("proxy") or "").strip() or None
     extra = dict(payload.get("extra") or {})
+    extra["_log_fn"] = logger.log
     task_id = str(getattr(logger, "task_id", "") or "")
     sub2api_upload_enabled = bool(extra.get("auto_upload_sub2api_agent_identity"))
     sub2api_upload_config = (
@@ -727,6 +729,15 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
             account = platform.register(email=email, password=password)
             saved_account = save_account(account)
             saved_account_id = int(saved_account.id)
+            try:
+                from core.mailbox_store import MailboxStore
+
+                MailboxStore().record_registration_link(
+                    account_id=saved_account_id,
+                    platform_account=account,
+                )
+            except Exception as mailbox_link_exc:
+                logger.log(f"邮箱资源绑定记录失败: {mailbox_link_exc}", level="warning")
             if resolved_proxy:
                 proxy_pool.report_success(resolved_proxy)
             if sub2api_upload_config:

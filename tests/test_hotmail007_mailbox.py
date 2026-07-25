@@ -1,0 +1,162 @@
+from __future__ import annotations
+
+import json
+
+from core.base_mailbox import MAILBOX_FACTORY_REGISTRY, MailboxAccount
+from core.hotmail007_mailbox import Hotmail007Mailbox, parse_hotmail007_account
+from infrastructure.provider_definitions_repository import ProviderDefinitionsRepository
+
+
+class FakeResponse:
+    def __init__(self, payload, status_code=200):
+        self.payload = payload
+        self.status_code = status_code
+        self.text = payload if isinstance(payload, str) else json.dumps(payload)
+
+    def json(self):
+        return self.payload
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise RuntimeError(f"HTTP {self.status_code}")
+
+
+class FakeSession:
+    def __init__(self, payloads):
+        self.payloads = list(payloads)
+        self.calls = []
+
+    def get(self, url, **kwargs):
+        self.calls.append((url, kwargs))
+        if not self.payloads:
+            raise RuntimeError("no fake payloads left")
+        return FakeResponse(self.payloads.pop(0))
+
+
+def test_parse_hotmail007_account_accepts_documented_colon_format():
+    entry = parse_hotmail007_account("user@outlook.com:mail-pass:refresh-token:client-id")
+
+    assert entry.email == "user@outlook.com"
+    assert entry.password == "mail-pass"
+    assert entry.refresh_token == "refresh-token"
+    assert entry.client_id == "client-id"
+    assert entry.api_account == "user@outlook.com:mail-pass:refresh-token:client-id"
+
+
+def test_hotmail007_buy_loops_until_success_without_sleep(monkeypatch):
+    logs = []
+    choices = iter(["12", "11", "12"])
+    monkeypatch.setattr("core.hotmail007_mailbox.random.choice", lambda items: next(choices))
+    session = FakeSession(
+        [
+            {"code": 1001, "success": False, "message": "库存不足", "data": {}},
+            {"code": 1001, "success": False, "message": "库存不足", "data": {}},
+            {
+                "code": 0,
+                "success": True,
+                "message": "success",
+                "data": {
+                    "accounts": [
+                        "user@outlook.com:mail-pass:refresh-token:client-id",
+                    ]
+                },
+            },
+        ]
+    )
+    mailbox = Hotmail007Mailbox(
+        client_key="client-key",
+        product_id="11,12",
+        buy_max_attempts=5,
+        buy_timeout_seconds=5,
+        session=session,
+        log_fn=logs.append,
+    )
+
+    account = mailbox.get_email()
+
+    assert account.email == "user@outlook.com"
+    assert len(session.calls) == 3
+    assert [call[0] for call in session.calls] == [
+        "https://hotmail007.com/api/open/buy",
+        "https://hotmail007.com/api/open/buy",
+        "https://hotmail007.com/api/open/buy",
+    ]
+    assert [call[1]["params"]["productId"] for call in session.calls] == ["12", "11", "12"]
+    assert session.calls[-1][1]["params"] == {
+        "clientKey": "client-key",
+        "productId": "12",
+        "quantity": 1,
+    }
+    assert account.extra["provider_account"]["provider_name"] == "hotmail007"
+    assert account.extra["provider_account"]["credentials"]["api_account"] == (
+        "user@outlook.com:mail-pass:refresh-token:client-id"
+    )
+    assert logs[0].startswith("Hotmail007 开始循环购买邮箱")
+    assert any("第 1 次购买未成功" in item for item in logs)
+    assert any("第 1 次购买未成功，productId=12" in item for item in logs)
+    assert any("购买成功：第 3 次尝试，productId=12，获得邮箱 user@outlook.com" in item for item in logs)
+    assert not any("client-key" in item or "refresh-token" in item or "mail-pass" in item for item in logs)
+
+
+def test_hotmail007_wait_for_code_reads_latest_mail_from_inbox():
+    logs = []
+    session = FakeSession(
+        [
+            {
+                "code": 0,
+                "success": True,
+                "message": "success",
+                "data": {
+                    "from": "noreply@example.com",
+                    "subject": "Your temporary ChatGPT login code",
+                    "text": "Your verification code is 654321.",
+                    "html": "",
+                    "receivedAt": "2026-07-25T00:00:00Z",
+                },
+            }
+        ]
+    )
+    mailbox = Hotmail007Mailbox(
+        client_key="client-key",
+        product_id="11",
+        folders="inbox",
+        session=session,
+        log_fn=logs.append,
+    )
+    mail_account = MailboxAccount(
+        email="user@outlook.com",
+        account_id="user@outlook.com",
+        extra={
+            "provider_account": {
+                "credentials": {
+                    "api_account": "user@outlook.com:mail-pass:refresh-token:client-id",
+                },
+                "metadata": {"issued_at": 1784937600},
+            }
+        },
+    )
+
+    assert mailbox.wait_for_code(mail_account, timeout=1) == "654321"
+    assert session.calls[0][0] == "https://hotmail007.com/api/open/mail/latest"
+    assert session.calls[0][1]["params"] == {
+        "clientKey": "client-key",
+        "account": "user@outlook.com:mail-pass:refresh-token:client-id",
+        "folder": "inbox",
+        "start_timestamp": 1784937600,
+    }
+    assert any("开始等待验证码：user@outlook.com" in item for item in logs)
+    assert any("正在取件：user@outlook.com / inbox" in item for item in logs)
+    assert any("获取验证码成功：user@outlook.com，验证码 654321" in item for item in logs)
+    assert not any("client-key" in item or "refresh-token" in item or "mail-pass" in item for item in logs)
+
+
+def test_hotmail007_is_exposed_in_mailbox_catalog_and_factory():
+    repository = ProviderDefinitionsRepository()
+    repository.ensure_seeded()
+
+    definitions = repository.list_by_type("mailbox", enabled_only=True)
+    drivers = repository.list_driver_templates("mailbox")
+
+    assert "hotmail007" in {item.provider_key for item in definitions}
+    assert "hotmail007" in {item["driver_type"] for item in drivers}
+    assert "hotmail007" in MAILBOX_FACTORY_REGISTRY
