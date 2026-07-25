@@ -1076,15 +1076,18 @@ function ActionMenu({
       left = Math.max(viewportPadding, window.innerWidth - menuWidth - viewportPadding)
     }
 
-    let top = rect.bottom + 8
-    if (top + estimatedHeight > window.innerHeight - viewportPadding) {
-      top = Math.max(viewportPadding, rect.top - estimatedHeight - 8)
-    }
+    const spaceBelow = window.innerHeight - rect.bottom - viewportPadding
+    const spaceAbove = rect.top - viewportPadding
+    const openUp = spaceBelow < estimatedHeight && spaceAbove > spaceBelow
+    const maxHeight = Math.max(160, Math.min(estimatedHeight, openUp ? spaceAbove : spaceBelow))
+    const top = openUp
+      ? Math.max(viewportPadding, rect.top - maxHeight - 8)
+      : rect.bottom + 8
 
     setMenuPosition({
       top: Math.round(top),
       left: Math.round(left),
-      maxHeight: Math.max(160, window.innerHeight - viewportPadding * 2),
+      maxHeight,
     })
   }, [actions.length])
 
@@ -1846,13 +1849,13 @@ export default function Accounts() {
         <table className="table-fixed w-full min-w-[980px] text-sm">
           <colgroup>
             <col className="w-10" />
-            <col className="w-[27%]" />
-            <col className="w-[12%]" />
-            <col className="w-[23%]" />
+            <col className="w-[25%]" />
+            <col className="w-[10%]" />
+            <col className="w-[22%]" />
             <col className="w-[13%]" />
-            <col className="w-[8%]" />
-            <col className="w-[12%]" />
-            <col className="w-[5%]" />
+            <col className="w-[6%]" />
+            <col className="w-[10%]" />
+            <col className="w-[14%]" />
           </colgroup>
           <thead className="sticky top-0 z-10  bg-[var(--bg-pane)]/80">
             <tr className="border-b border-[var(--border)] text-xs uppercase tracking-wider font-medium text-[var(--text-muted)]">
