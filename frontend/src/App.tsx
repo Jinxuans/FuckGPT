@@ -11,6 +11,7 @@ import { I18nProvider, useI18n } from "@/lib/i18n-context";
 import type { TranslationKey } from "@/lib/i18n";
 import Dashboard from "@/pages/Dashboard";
 import Accounts from "@/pages/Accounts";
+import MailboxResources from "@/pages/MailboxResources";
 import SettingsPage from "@/pages/SettingsPage";
 import UpdateBanner from "@/components/UpdateBanner";
 import WelcomeDialog from "@/components/WelcomeDialog";
@@ -22,6 +23,7 @@ import {
   Monitor,
   Languages,
   Users,
+  Mail,
   PanelLeftClose,
   PanelLeft,
 } from "lucide-react";
@@ -41,13 +43,13 @@ type NavItem = {
 const SETTINGS_NAV_ITEMS: { labelKey: TranslationKey; hash: string }[] = [
   { labelKey: "nav.settings.general", hash: "general" },
   { labelKey: "nav.settings.mailbox", hash: "mailbox" },
-  { labelKey: "nav.settings.mailboxResources", hash: "mailboxResources" },
   { labelKey: "nav.settings.sms", hash: "sms" },
 ];
 
 const NAV_ITEMS: NavItem[] = [
   { path: "/", labelKey: "nav.dashboard", icon: LayoutDashboard, exact: true },
   { path: "/accounts/chatgpt", label: "chatgpt free", icon: Users },
+  { path: "/mailboxes", labelKey: "nav.mailboxResources", icon: Mail },
   { path: "/settings", labelKey: "nav.settings", icon: SettingsIcon },
 ];
 
@@ -229,6 +231,7 @@ function Shell({
   setTheme: (t: string) => void;
   toggleTheme: () => void;
 }) {
+  const location = useLocation();
   const [collapsed, setCollapsed] = useState(
     () => localStorage.getItem("sidebar-collapsed") === "true",
   );
@@ -247,11 +250,12 @@ function Shell({
         setCollapsed={setCollapsed}
       />
       <main className="flex-1 overflow-y-auto">
-        <div className="mx-auto max-w-6xl px-6 py-6 lg:px-8">
+        <div className={cn("mx-auto px-6 py-6 lg:px-8", location.pathname === "/mailboxes" ? "max-w-7xl" : "max-w-6xl")}>
           <UpdateBanner />
           <Routes>
             <Route path="/" element={<Dashboard />} />
             <Route path="/accounts/chatgpt" element={<Accounts />} />
+            <Route path="/mailboxes" element={<MailboxResources />} />
             <Route
               path="/settings"
               element={<SettingsPage theme={theme} setTheme={setTheme} />}

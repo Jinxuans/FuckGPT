@@ -48,10 +48,10 @@ const ZH_MESSAGES = {
   "common.standby": "待命",
 
   "nav.dashboard": "总览",
+  "nav.mailboxResources": "邮箱资源",
   "nav.settings": "设置",
   "nav.settings.general": "通用",
   "nav.settings.mailbox": "邮箱服务",
-  "nav.settings.mailboxResources": "邮箱资源",
   "nav.settings.sms": "接码服务",
   "sidebar.theme.light": "浅色",
   "sidebar.theme.dark": "深色",
@@ -448,10 +448,10 @@ const EN_MESSAGES: Record<TranslationKey, string> = {
   "common.standby": "Standby",
 
   "nav.dashboard": "Dashboard",
+  "nav.mailboxResources": "Mailbox Resources",
   "nav.settings": "Settings",
   "nav.settings.general": "General",
   "nav.settings.mailbox": "Mailbox",
-  "nav.settings.mailboxResources": "Mailbox Resources",
   "nav.settings.sms": "SMS",
   "sidebar.theme.light": "Light",
   "sidebar.theme.dark": "Dark",

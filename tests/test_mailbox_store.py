@@ -167,6 +167,103 @@ def test_record_allocated_mailbox_persists_provider_resource_without_link(monkey
     assert store.list_links() == []
 
 
+def test_list_resources_summarizes_mailbox_status_and_chatgpt_link(monkeypatch, tmp_path):
+    _patch_mailbox_paths(monkeypatch, tmp_path)
+    store = MailboxStore()
+    account = store.create_account(
+        {
+            "provider": "local_ms_pool",
+            "email": "parent@outlook.com",
+            "credentials": {"email": "parent@outlook.com", "password": "mail-password"},
+        }
+    )
+    first = store.reserve_address(
+        {
+            "mailbox_account_id": account["id"],
+            "alias_index": 1,
+            "reserved_for": {"platform": "chatgpt", "status": "allocated"},
+        }
+    )
+    second = store.reserve_address(
+        {
+            "mailbox_account_id": account["id"],
+            "alias_index": 2,
+            "reserved_for": {"platform": "chatgpt", "status": "allocated"},
+        }
+    )
+    store.link_account(
+        platform="chatgpt",
+        account_id=77,
+        account_email="registered@example.com",
+        mailbox_address_id=second["id"],
+    )
+
+    resources = store.list_resources()
+    by_address = {item["address"]: item for item in resources}
+
+    assert by_address["parent+reg1@outlook.com"]["status"] == "allocated"
+    assert by_address["parent+reg1@outlook.com"]["chatgpt_account_id"] is None
+    assert by_address["parent+reg2@outlook.com"]["status"] == "registered"
+    assert by_address["parent+reg2@outlook.com"]["chatgpt_account_id"] == 77
+    assert by_address["parent+reg2@outlook.com"]["provider"] == "local_ms_pool"
+
+
+def test_list_resources_only_returns_actual_mailbox_addresses(monkeypatch, tmp_path):
+    _patch_mailbox_paths(monkeypatch, tmp_path)
+    store = MailboxStore()
+    store.create_account(
+        {
+            "provider": "local_ms_pool",
+            "email": "parent@outlook.com",
+            "credentials": {"email": "parent@outlook.com", "password": "mail-password"},
+        }
+    )
+
+    assert store.list_resources() == []
+
+
+def test_list_messages_for_address_uses_stored_mailbox_credentials(monkeypatch, tmp_path):
+    _patch_mailbox_paths(monkeypatch, tmp_path)
+    captured = {}
+
+    class FakeMailbox:
+        def list_messages(self, account, limit=10):
+            captured["account"] = account
+            captured["limit"] = limit
+            return [{"subject": "hello", "preview": "body"}]
+
+    def fake_create_mailbox(provider, extra, proxy=None):
+        captured["provider"] = provider
+        captured["extra"] = extra
+        captured["proxy"] = proxy
+        return FakeMailbox()
+
+    monkeypatch.setattr("core.mailbox_store.create_mailbox", fake_create_mailbox)
+    store = MailboxStore()
+    account = store.create_account(
+        {
+            "provider": "local_ms_pool",
+            "email": "parent@outlook.com",
+            "credentials": {"email": "parent@outlook.com", "password": "mail-password"},
+        }
+    )
+    address = store.reserve_address(
+        {
+            "mailbox_account_id": account["id"],
+            "address": "parent+reg1@outlook.com",
+        }
+    )
+
+    messages = store.list_messages_for_address(mailbox_address_id=address["id"], limit=3, proxy="http://proxy.example")
+
+    assert messages == [{"subject": "hello", "preview": "body"}]
+    assert captured["provider"] == "local_ms_pool"
+    assert captured["extra"]["password"] == "mail-password"
+    assert captured["proxy"] == "http://proxy.example"
+    assert captured["account"].email == "parent+reg1@outlook.com"
+    assert captured["limit"] == 3
+
+
 class _FailingCurrentIdsMailbox:
     def __init__(self, mailbox_account: MailboxAccount):
         self.mailbox_account = mailbox_account

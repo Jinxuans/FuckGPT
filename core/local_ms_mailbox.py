@@ -602,6 +602,31 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
             return self._graph_messages(entry)
         return self._imap_messages(entry)
 
+    def list_messages(self, account: MailboxAccount, limit: int = 10) -> list[dict]:
+        limit = max(1, min(int(limit or 10), 50))
+        messages: list[dict] = []
+        for mail in self._messages(account):
+            if not self._message_is_for_account(mail, account):
+                continue
+            sender = mail.get("from") or {}
+            if isinstance(sender, dict):
+                email_address = sender.get("emailAddress") or {}
+                sender = email_address.get("address") or email_address.get("name") or ""
+            messages.append(
+                {
+                    "id": self._message_id(mail),
+                    "subject": mail.get("subject") or "",
+                    "from": sender or "",
+                    "to": sorted(self._message_recipients(mail)),
+                    "received_at": mail.get("receivedDateTime") or "",
+                    "preview": self._clean_search_text(self._message_text(mail))[:1000],
+                    "provider": "local_ms_pool",
+                }
+            )
+            if len(messages) >= limit:
+                break
+        return messages
+
     def get_current_ids(self, account: MailboxAccount) -> set:
         try:
             return {

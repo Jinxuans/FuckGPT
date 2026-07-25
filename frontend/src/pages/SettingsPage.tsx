@@ -13,7 +13,6 @@ import { useI18n } from "@/lib/i18n-context";
 import { Button } from "@/components/ui/button";
 import { Save } from "lucide-react";
 import Settings from "@/pages/Settings";
-import MailboxResources from "@/pages/MailboxResources";
 
 /* ------------------------------------------------------------------ */
 /*  Tab definitions                                                    */
@@ -258,7 +257,7 @@ export default function SettingsPage({
   const { t } = useI18n();
   const [searchParams] = useSearchParams();
   const requestedTab = searchParams.get("tab") || "general";
-  const tab = ["general", "mailbox", "mailboxResources", "sms"].includes(requestedTab)
+  const tab = ["general", "mailbox", "sms"].includes(requestedTab)
     ? requestedTab
     : "general";
 
@@ -269,7 +268,6 @@ export default function SettingsPage({
   const titles: Record<string, string> = {
     general: t("settings.title.general"),
     mailbox: t("settings.title.mailbox"),
-    mailboxResources: t("settings.title.mailboxResources"),
     sms: t("settings.title.sms"),
   };
 
@@ -280,7 +278,6 @@ export default function SettingsPage({
       </h1>
 
       {tab === "general" && <GeneralTab theme={theme} setTheme={setTheme} />}
-      {tab === "mailboxResources" && <MailboxResources />}
       {isConfigTab && <Settings providerType={tab as "mailbox" | "sms"} />}
     </div>
   );

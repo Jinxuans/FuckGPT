@@ -1,16 +1,9 @@
-import { useEffect, useMemo, useState } from "react";
-import {
-  Link2,
-  MailPlus,
-  Plus,
-  RefreshCw,
-  Save,
-  Trash2,
-  Unlink,
-} from "lucide-react";
-import { apiFetch, cn } from "@/lib/utils";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
+import { RefreshCw, X } from "lucide-react";
+import { apiFetch } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
-import { Badge } from "@/components/ui/badge";
+import { Card } from "@/components/ui/card";
 
 type MailboxAccount = {
   id: string;
@@ -49,120 +42,437 @@ type AccountMailboxLink = {
   created_at?: string;
 };
 
+type MailboxResource = {
+  id: string;
+  resource_kind: "address";
+  mailbox_account_id: string;
+  mailbox_address_id: string;
+  address: string;
+  address_type?: string;
+  provider: string;
+  parent_email?: string;
+  login_account?: string;
+  status: string;
+  mailbox_status?: string;
+  reserved?: boolean;
+  reserved_for?: Record<string, any>;
+  usage?: Record<string, any>;
+  chatgpt_account_id?: number | null;
+  chatgpt_account_email?: string;
+  link_id?: string;
+  updated_at?: string;
+  created_at?: string;
+};
+
+type MailMessage = {
+  id?: string;
+  subject?: string;
+  from?: string;
+  to?: string[];
+  received_at?: string;
+  preview?: string;
+  code?: string;
+  link?: string;
+  folder?: string;
+  provider?: string;
+};
+
 type MailboxPayload = {
+  resources: MailboxResource[];
   accounts: MailboxAccount[];
   addresses: MailboxAddress[];
   links: AccountMailboxLink[];
   paths?: Record<string, string>;
 };
 
-type AccountForm = {
-  provider: string;
-  email: string;
-  login_account: string;
-  status: string;
-  credentialsText: string;
-  metadataText: string;
-};
+const statusOptions = [
+  { value: "all", label: "全部状态" },
+  { value: "available", label: "空闲" },
+  { value: "allocated", label: "已分配" },
+  { value: "registered", label: "已注册" },
+  { value: "disabled", label: "禁用" },
+];
 
-const emptyForm: AccountForm = {
-  provider: "local_ms_pool",
-  email: "",
-  login_account: "",
-  status: "active",
-  credentialsText: "{}",
-  metadataText: "{}",
-};
-
-function parseJsonObject(text: string, label: string) {
-  const trimmed = text.trim();
-  if (!trimmed) return {};
-  const parsed = JSON.parse(trimmed);
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-    throw new Error(`${label} 必须是 JSON object`);
-  }
-  return parsed;
-}
-
-function formatJson(value: any) {
-  return JSON.stringify(value && typeof value === "object" ? value : {}, null, 2);
-}
-
-function statusVariant(status?: string) {
+function statusLabel(status?: string) {
   const normalized = String(status || "").toLowerCase();
-  if (normalized === "active") return "success" as const;
-  if (normalized === "disabled" || normalized === "inactive") return "secondary" as const;
-  return "default" as const;
+  if (normalized === "registered") return "已注册";
+  if (normalized === "allocated") return "已分配";
+  if (normalized === "available") return "空闲";
+  if (normalized === "disabled" || normalized === "inactive") return "禁用";
+  if (normalized === "error") return "异常";
+  return status || "未知";
 }
 
-function Section({
-  title,
-  desc,
-  children,
-}: {
-  title: string;
-  desc?: string;
-  children: React.ReactNode;
-}) {
+function statusPillClass(status?: string) {
+  const normalized = String(status || "").toLowerCase();
+  if (normalized === "registered") return "bg-emerald-500/10 text-emerald-500 ring-emerald-500/20";
+  if (normalized === "allocated") return "bg-amber-500/10 text-amber-500 ring-amber-500/20";
+  if (normalized === "disabled" || normalized === "inactive" || normalized === "error") return "bg-red-500/10 text-red-500 ring-red-500/20";
+  if (normalized === "available") return "bg-blue-500/10 text-blue-500 ring-blue-500/20";
+  return "bg-[var(--text-primary)]/5 text-[var(--text-secondary)] ring-[var(--border)]";
+}
+
+function statusDotClass(status?: string) {
+  const normalized = String(status || "").toLowerCase();
+  if (normalized === "registered") return "bg-emerald-500 shadow-[0_0_4px_rgba(16,185,129,0.6)]";
+  if (normalized === "allocated") return "bg-amber-500 shadow-[0_0_4px_rgba(245,158,11,0.6)]";
+  if (normalized === "disabled" || normalized === "inactive" || normalized === "error") return "bg-red-500 shadow-[0_0_4px_rgba(239,68,68,0.6)]";
+  if (normalized === "available") return "bg-blue-500";
+  return "bg-gray-400";
+}
+
+function providerLabel(provider?: string) {
+  if (provider === "local_ms_pool") return "local_ms";
+  return provider || "-";
+}
+
+function formatTime(value?: string) {
+  if (!value) return "-";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return date.toLocaleString();
+}
+
+function formatCompactTime(value?: string) {
+  if (!value) return "-";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return new Intl.DateTimeFormat(undefined, {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).format(date);
+}
+
+function jsonBlock(value: unknown) {
+  return JSON.stringify(value ?? {}, null, 2);
+}
+
+function StatusPill({ status }: { status?: string }) {
   return (
-    <section className="space-y-3">
-      <div>
-        <h2 className="text-[15px] font-semibold text-[var(--text-primary)]">{title}</h2>
-        {desc ? <p className="mt-0.5 text-[13px] text-[var(--text-muted)]">{desc}</p> : null}
-      </div>
-      {children}
-    </section>
+    <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ring-1 ring-inset ${statusPillClass(status)}`}>
+      <span className={`mr-1 h-1 w-1 rounded-full ${statusDotClass(status)}`} />
+      {statusLabel(status)}
+    </span>
   );
 }
 
-function Field({
-  label,
-  children,
-  className,
+function ActionMenu({
+  resource,
+  onDetail,
+  onAction,
 }: {
-  label: string;
-  children: React.ReactNode;
-  className?: string;
+  resource: MailboxResource;
+  onDetail: () => void;
+  onAction: (resource: MailboxResource, action: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [menuPosition, setMenuPosition] = useState({ top: 0, left: 0, maxHeight: 320 });
+  const triggerRef = useRef<HTMLButtonElement | null>(null);
+  const menuRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const update = () => {
+      const rect = triggerRef.current?.getBoundingClientRect();
+      if (!rect) return;
+      const width = 180;
+      const gap = 6;
+      const desiredHeight = 260;
+      const spaceBelow = window.innerHeight - rect.bottom - 16;
+      const spaceAbove = rect.top - 16;
+      const openUp = spaceBelow < desiredHeight && spaceAbove > spaceBelow;
+      const maxHeight = Math.max(160, Math.min(desiredHeight, openUp ? spaceAbove : spaceBelow));
+      setMenuPosition({
+        top: openUp ? Math.max(8, rect.top - maxHeight - gap) : rect.bottom + gap,
+        left: Math.max(8, Math.min(rect.right - width, window.innerWidth - width - 8)),
+        maxHeight,
+      });
+    };
+    const close = (event: MouseEvent) => {
+      const target = event.target as Node;
+      if (triggerRef.current?.contains(target) || menuRef.current?.contains(target)) return;
+      setOpen(false);
+    };
+    update();
+    window.addEventListener("resize", update);
+    window.addEventListener("scroll", update, true);
+    document.addEventListener("mousedown", close);
+    return () => {
+      window.removeEventListener("resize", update);
+      window.removeEventListener("scroll", update, true);
+      document.removeEventListener("mousedown", close);
+    };
+  }, [open]);
+
+  const run = (action: string) => {
+    setOpen(false);
+    onAction(resource, action);
+  };
+
+  return (
+    <div className="flex items-center justify-end gap-2">
+      <button onClick={onDetail} className="table-action-btn">详情</button>
+      <button ref={triggerRef} onClick={() => setOpen((value) => !value)} className="table-action-btn">更多 ▾</button>
+      {open && typeof document !== "undefined" && createPortal(
+        <div
+          ref={menuRef}
+          className="fixed z-[9999] w-[180px] overflow-y-auto rounded-2xl border border-[var(--border)] bg-[var(--bg-card)]/96 py-1.5 shadow-[var(--shadow-soft)]"
+          style={{ top: menuPosition.top, left: menuPosition.left, maxHeight: menuPosition.maxHeight }}
+        >
+          <button onClick={() => run("copy")} className="w-full px-3 py-2 text-left text-xs text-[var(--text-secondary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]">
+            复制邮箱
+          </button>
+          <button onClick={() => run("messages")} className="w-full px-3 py-2 text-left text-xs text-[var(--text-secondary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]">
+            获取邮件
+          </button>
+          <button
+            onClick={() => run("bind")}
+            disabled={Boolean(resource.chatgpt_account_id)}
+            className="w-full px-3 py-2 text-left text-xs text-[var(--text-secondary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)] disabled:opacity-40"
+          >
+            绑定账号
+          </button>
+          <button
+            onClick={() => run("unlink")}
+            disabled={!resource.chatgpt_account_id}
+            className="w-full px-3 py-2 text-left text-xs text-[var(--text-secondary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)] disabled:opacity-40"
+          >
+            解绑账号
+          </button>
+          <button
+            onClick={() => run("release")}
+            disabled={!resource.reserved || resource.status === "registered"}
+            className="w-full px-3 py-2 text-left text-xs text-[var(--text-secondary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)] disabled:opacity-40"
+          >
+            释放邮箱
+          </button>
+          <button onClick={() => run("disable")} className="w-full px-3 py-2 text-left text-xs text-[var(--text-secondary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]">
+            禁用邮箱
+          </button>
+          <div className="my-1 border-t border-[var(--border)]/70" />
+          <button onClick={() => run("delete")} className="w-full px-3 py-2 text-left text-xs text-[#f0b0b0] transition-colors hover:bg-[rgba(239,68,68,0.08)] hover:text-[#ffd5d5]">
+            删除记录
+          </button>
+        </div>,
+        document.body,
+      )}
+    </div>
+  );
+}
+
+function MailMessagesModal({
+  resource,
+  messages,
+  loading,
+  error,
+  onRefresh,
+  onClose,
+}: {
+  resource: MailboxResource;
+  messages: MailMessage[];
+  loading: boolean;
+  error: string;
+  onRefresh: () => void;
+  onClose: () => void;
 }) {
   return (
-    <label className={cn("space-y-1.5 text-[12px] font-medium text-[var(--text-secondary)]", className)}>
-      <span>{label}</span>
-      {children}
-    </label>
+    <div className="dialog-backdrop" onClick={onClose}>
+      <div className="dialog-panel dialog-panel-lg flex flex-col" style={{ maxHeight: "90vh" }} onClick={(event) => event.stopPropagation()}>
+        <div className="flex items-center justify-between border-b border-[var(--border)] px-6 py-4 shrink-0">
+          <div>
+            <h2 className="text-base font-semibold text-[var(--text-primary)]">邮件列表</h2>
+            <p className="mt-0.5 break-all text-xs text-[var(--text-muted)]">{resource.address}</p>
+          </div>
+          <div className="flex items-center gap-2">
+            <Button variant="outline" size="sm" onClick={onRefresh} disabled={loading}>
+              {loading ? "获取中" : "重新获取"}
+            </Button>
+            <button onClick={onClose} className="text-[var(--text-muted)] hover:text-[var(--text-primary)]">
+              <X className="h-4 w-4" />
+            </button>
+          </div>
+        </div>
+        <div className="min-h-0 flex-1 overflow-y-auto px-6 py-4">
+          {error ? (
+            <div className="rounded-lg border border-red-500/20 bg-red-500/10 px-3 py-2 text-sm text-red-400">
+              {error}
+            </div>
+          ) : null}
+          {!error && loading && messages.length === 0 ? (
+            <div className="empty-state-panel">正在获取邮件...</div>
+          ) : null}
+          {!error && !loading && messages.length === 0 ? (
+            <div className="empty-state-panel">没有获取到邮件。</div>
+          ) : null}
+          {messages.length > 0 ? (
+            <div className="space-y-3">
+              {messages.map((message, index) => (
+                <div key={message.id || index} className="rounded-lg border border-[var(--border)] bg-[var(--bg-hover)] p-3">
+                  <div className="flex flex-wrap items-start justify-between gap-3">
+                    <div className="min-w-0">
+                      <div className="truncate text-sm font-medium text-[var(--text-primary)]" title={message.subject || ""}>
+                        {message.subject || "(无主题)"}
+                      </div>
+                      <div className="mt-1 flex flex-wrap gap-2 text-xs text-[var(--text-muted)]">
+                        <span>{message.from || "未知发件人"}</span>
+                        <span>{formatTime(message.received_at)}</span>
+                        {message.folder ? <span>{message.folder}</span> : null}
+                      </div>
+                    </div>
+                    <div className="flex flex-wrap gap-1">
+                      {message.code ? <span className="rounded border border-emerald-500/20 bg-emerald-500/10 px-2 py-0.5 text-xs text-emerald-500">code {message.code}</span> : null}
+                      {message.link ? <span className="rounded border border-blue-500/20 bg-blue-500/10 px-2 py-0.5 text-xs text-blue-500">link</span> : null}
+                    </div>
+                  </div>
+                  {message.to?.length ? (
+                    <div className="mt-2 truncate text-xs text-[var(--text-muted)]" title={message.to.join(", ")}>
+                      To: {message.to.join(", ")}
+                    </div>
+                  ) : null}
+                  <pre className="mt-2 max-h-48 overflow-auto whitespace-pre-wrap rounded-md border border-[var(--border)] bg-[var(--bg-input)] p-2 text-xs text-[var(--text-secondary)]">
+                    {message.preview || ""}
+                  </pre>
+                </div>
+              ))}
+            </div>
+          ) : null}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function DetailModal({
+  resource,
+  account,
+  address,
+  link,
+  onClose,
+}: {
+  resource: MailboxResource;
+  account: MailboxAccount | null;
+  address: MailboxAddress | null;
+  link: AccountMailboxLink | null;
+  onClose: () => void;
+}) {
+  return (
+    <div className="dialog-backdrop" onClick={onClose}>
+      <div className="dialog-panel dialog-panel-lg flex flex-col" style={{ maxHeight: "90vh" }} onClick={(event) => event.stopPropagation()}>
+        <div className="flex items-center justify-between border-b border-[var(--border)] px-6 py-4 shrink-0">
+          <div>
+            <h2 className="text-base font-semibold text-[var(--text-primary)]">邮箱详情</h2>
+            <p className="mt-0.5 break-all text-xs text-[var(--text-muted)]">{resource.address}</p>
+          </div>
+          <button onClick={onClose} className="text-[var(--text-muted)] hover:text-[var(--text-primary)]">
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+        <div className="min-h-0 flex-1 overflow-y-auto px-6 py-4">
+          <div className="grid gap-4 lg:grid-cols-[0.75fr_1.25fr]">
+            <div className="space-y-4">
+              <div className="rounded-lg border border-[var(--border)] bg-[var(--bg-hover)] p-4">
+                <div className="mb-3 flex items-center justify-between gap-3">
+                  <StatusPill status={resource.status} />
+                  <span className="text-xs text-[var(--text-muted)]">{providerLabel(resource.provider)}</span>
+                </div>
+                <div className="grid gap-3 text-sm">
+                  <div>
+                    <div className="text-xs text-[var(--text-muted)]">邮箱号</div>
+                    <div className="mt-1 break-all font-mono text-[var(--text-primary)]">{resource.address}</div>
+                  </div>
+                  <div>
+                    <div className="text-xs text-[var(--text-muted)]">来源账号</div>
+                    <div className="mt-1 break-all text-[var(--text-primary)]">{resource.parent_email || "-"}</div>
+                  </div>
+                  <div>
+                    <div className="text-xs text-[var(--text-muted)]">登录账号</div>
+                    <div className="mt-1 break-all text-[var(--text-primary)]">{resource.login_account || "-"}</div>
+                  </div>
+                  <div>
+                    <div className="text-xs text-[var(--text-muted)]">ChatGPT 账号</div>
+                    <div className="mt-1 text-[var(--text-primary)]">
+                      {resource.chatgpt_account_id ? `#${resource.chatgpt_account_id}` : "未绑定"}
+                    </div>
+                    {resource.chatgpt_account_email ? (
+                      <div className="mt-1 break-all text-xs text-[var(--text-muted)]">{resource.chatgpt_account_email}</div>
+                    ) : null}
+                  </div>
+                  <div className="grid gap-3 sm:grid-cols-2">
+                    <div>
+                      <div className="text-xs text-[var(--text-muted)]">地址类型</div>
+                      <div className="mt-1 text-[var(--text-primary)]">{resource.address_type || "primary"}</div>
+                    </div>
+                    <div>
+                      <div className="text-xs text-[var(--text-muted)]">更新时间</div>
+                      <div className="mt-1 text-[var(--text-primary)]">{formatTime(resource.updated_at || resource.created_at)}</div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+            <details open className="rounded-lg border border-[var(--border)] bg-[var(--bg-card)]">
+              <summary className="cursor-pointer px-3 py-2 text-sm font-medium text-[var(--text-primary)]">原始数据</summary>
+              <div className="grid gap-3 border-t border-[var(--border)] p-3 md:grid-cols-3">
+                <div>
+                  <div className="mb-1 text-xs text-[var(--text-muted)]">account</div>
+                  <pre className="control-surface control-surface-mono max-h-80 overflow-auto whitespace-pre-wrap">{jsonBlock(account)}</pre>
+                </div>
+                <div>
+                  <div className="mb-1 text-xs text-[var(--text-muted)]">address</div>
+                  <pre className="control-surface control-surface-mono max-h-80 overflow-auto whitespace-pre-wrap">{jsonBlock(address)}</pre>
+                </div>
+                <div>
+                  <div className="mb-1 text-xs text-[var(--text-muted)]">link</div>
+                  <pre className="control-surface control-surface-mono max-h-80 overflow-auto whitespace-pre-wrap">{jsonBlock(link)}</pre>
+                </div>
+              </div>
+            </details>
+          </div>
+        </div>
+      </div>
+    </div>
   );
 }
 
 export default function MailboxResources() {
   const [payload, setPayload] = useState<MailboxPayload>({
+    resources: [],
     accounts: [],
     addresses: [],
     links: [],
   });
-  const [form, setForm] = useState<AccountForm>(emptyForm);
-  const [editingId, setEditingId] = useState("");
-  const [selectedAccountId, setSelectedAccountId] = useState("");
-  const [addressForm, setAddressForm] = useState({
-    mailbox_account_id: "",
-    address: "",
-    alias_index: "",
-  });
-  const [linkForm, setLinkForm] = useState({
-    account_id: "",
-    account_email: "",
-    mailbox_address_id: "",
-    purpose: "verification",
-  });
+  const [statusFilter, setStatusFilter] = useState("all");
+  const [providerFilter, setProviderFilter] = useState("all");
+  const [detail, setDetail] = useState<MailboxResource | null>(null);
+  const [mailDialog, setMailDialog] = useState<{ resource: MailboxResource; messages: MailMessage[]; loading: boolean; error: string } | null>(null);
   const [loading, setLoading] = useState(false);
-  const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
 
-  const accountById = useMemo(() => {
-    return new Map(payload.accounts.map((item) => [item.id, item]));
-  }, [payload.accounts]);
+  const accountById = useMemo(() => new Map(payload.accounts.map((item) => [item.id, item])), [payload.accounts]);
+  const addressById = useMemo(() => new Map(payload.addresses.map((item) => [item.id, item])), [payload.addresses]);
+  const linkByAddressId = useMemo(() => new Map(payload.links.map((item) => [item.mailbox_address_id, item])), [payload.links]);
 
-  const addressById = useMemo(() => {
-    return new Map(payload.addresses.map((item) => [item.id, item]));
-  }, [payload.addresses]);
+  const providers = useMemo(() => {
+    return Array.from(new Set(payload.resources.map((item) => item.provider).filter(Boolean))).sort();
+  }, [payload.resources]);
+
+  const counts = useMemo(() => {
+    return payload.resources.reduce<Record<string, number>>((acc, item) => {
+      acc[item.status] = (acc[item.status] || 0) + 1;
+      return acc;
+    }, {});
+  }, [payload.resources]);
+
+  const visibleResources = useMemo(() => {
+    return payload.resources.filter((item) => {
+      if (statusFilter !== "all" && item.status !== statusFilter) return false;
+      if (providerFilter !== "all" && item.provider !== providerFilter) return false;
+      return true;
+    });
+  }, [payload.resources, providerFilter, statusFilter]);
 
   const load = async () => {
     setLoading(true);
@@ -170,6 +480,7 @@ export default function MailboxResources() {
     try {
       const data = await apiFetch("/mailboxes");
       setPayload({
+        resources: Array.isArray(data?.resources) ? data.resources : [],
         accounts: Array.isArray(data?.accounts) ? data.accounts : [],
         addresses: Array.isArray(data?.addresses) ? data.addresses : [],
         links: Array.isArray(data?.links) ? data.links : [],
@@ -186,121 +497,103 @@ export default function MailboxResources() {
     load();
   }, []);
 
-  const resetForm = () => {
-    setForm(emptyForm);
-    setEditingId("");
+  const copyAddress = async (address: string) => {
+    if (!address || !navigator?.clipboard) return;
+    await navigator.clipboard.writeText(address);
   };
 
-  const editAccount = (account: MailboxAccount) => {
-    setEditingId(account.id);
-    setForm({
-      provider: account.provider || "local_ms_pool",
-      email: account.email || "",
-      login_account: account.login_account || account.email || "",
-      status: account.status || "active",
-      credentialsText: formatJson(account.credentials),
-      metadataText: formatJson(account.metadata),
-    });
-  };
-
-  const saveAccount = async () => {
-    setSaving(true);
-    setError("");
-    try {
-      const body = {
-        provider: form.provider,
-        email: form.email,
-        login_account: form.login_account,
-        status: form.status,
-        credentials: parseJsonObject(form.credentialsText, "credentials"),
-        metadata: parseJsonObject(form.metadataText, "metadata"),
-      };
-      await apiFetch(editingId ? `/mailboxes/accounts/${editingId}` : "/mailboxes/accounts", {
-        method: editingId ? "PATCH" : "POST",
-        body: JSON.stringify(body),
-      });
-      resetForm();
-      await load();
-    } catch (exc: any) {
-      setError(exc?.message || "保存邮箱账号失败");
-    } finally {
-      setSaving(false);
-    }
-  };
-
-  const deleteAccount = async (accountId: string) => {
-    if (!confirm("删除邮箱账号会同时删除该账号下的地址和绑定关系，继续吗？")) return;
-    await apiFetch(`/mailboxes/accounts/${accountId}`, { method: "DELETE" });
+  const releaseAddress = async (resource: MailboxResource) => {
+    if (!resource.mailbox_address_id) return;
+    if (!confirm(`释放邮箱 ${resource.address}？`)) return;
+    await apiFetch(`/mailboxes/addresses/${resource.mailbox_address_id}/release`, { method: "POST" });
     await load();
   };
 
-  const reserveAddress = async () => {
-    setError("");
-    try {
-      await apiFetch("/mailboxes/addresses/reserve", {
-        method: "POST",
-        body: JSON.stringify({
-          mailbox_account_id: addressForm.mailbox_account_id || selectedAccountId,
-          address: addressForm.address,
-          alias_index: Number(addressForm.alias_index || 0),
-        }),
-      });
-      setAddressForm({ mailbox_account_id: addressForm.mailbox_account_id, address: "", alias_index: "" });
-      await load();
-    } catch (exc: any) {
-      setError(exc?.message || "预留邮箱地址失败");
-    }
-  };
-
-  const releaseAddress = async (addressId: string) => {
-    await apiFetch(`/mailboxes/addresses/${addressId}/release`, { method: "POST" });
-    await load();
-  };
-
-  const linkAccount = async () => {
-    setError("");
-    try {
-      await apiFetch("/mailboxes/account-link", {
-        method: "POST",
-        body: JSON.stringify({
-          platform: "chatgpt",
-          account_id: Number(linkForm.account_id || 0),
-          account_email: linkForm.account_email,
-          mailbox_address_id: linkForm.mailbox_address_id,
-          purpose: linkForm.purpose || "verification",
-        }),
-      });
-      setLinkForm({ account_id: "", account_email: "", mailbox_address_id: linkForm.mailbox_address_id, purpose: "verification" });
-      await load();
-    } catch (exc: any) {
-      setError(exc?.message || "绑定账号失败");
-    }
-  };
-
-  const unlinkAccount = async (link: AccountMailboxLink) => {
+  const unlinkResource = async (resource: MailboxResource) => {
+    const link = linkByAddressId.get(resource.mailbox_address_id);
+    if (!link) return;
+    if (!confirm(`解绑 ${resource.address} 与 ChatGPT #${link.account_id}？`)) return;
     await apiFetch(`/mailboxes/accounts/${link.account_id}/link?platform=${encodeURIComponent(link.platform)}&purpose=${encodeURIComponent(link.purpose || "verification")}`, {
       method: "DELETE",
     });
     await load();
   };
 
-  const visibleAddresses = selectedAccountId
-    ? payload.addresses.filter((item) => item.mailbox_account_id === selectedAccountId)
-    : payload.addresses;
+  const bindResource = async (resource: MailboxResource) => {
+    if (!resource.mailbox_address_id) return;
+    const accountId = window.prompt("ChatGPT 账号 ID");
+    if (!accountId) return;
+    const accountEmail = window.prompt("ChatGPT 账号邮箱，可留空") || "";
+    await apiFetch("/mailboxes/account-link", {
+      method: "POST",
+      body: JSON.stringify({
+        platform: "chatgpt",
+        account_id: Number(accountId),
+        account_email: accountEmail,
+        mailbox_address_id: resource.mailbox_address_id,
+        purpose: "verification",
+      }),
+    });
+    await load();
+  };
+
+  const disableMailbox = async (resource: MailboxResource) => {
+    if (!confirm(`禁用邮箱来源 ${resource.parent_email || resource.address}？`)) return;
+    await apiFetch(`/mailboxes/accounts/${resource.mailbox_account_id}`, {
+      method: "PATCH",
+      body: JSON.stringify({ status: "disabled" }),
+    });
+    await load();
+  };
+
+  const deleteMailbox = async (resource: MailboxResource) => {
+    if (!confirm(`删除邮箱来源 ${resource.parent_email || resource.address}？该来源下地址和绑定都会删除。`)) return;
+    await apiFetch(`/mailboxes/accounts/${resource.mailbox_account_id}`, { method: "DELETE" });
+    if (detail?.id === resource.id) setDetail(null);
+    await load();
+  };
+
+  const fetchMessages = async (resource: MailboxResource) => {
+    setMailDialog({ resource, messages: [], loading: true, error: "" });
+    try {
+      const data = await apiFetch(`/mailboxes/addresses/${resource.mailbox_address_id}/messages?limit=10`);
+      setMailDialog({ resource, messages: Array.isArray(data?.items) ? data.items : [], loading: false, error: "" });
+    } catch (exc: any) {
+      setMailDialog({ resource, messages: [], loading: false, error: exc?.message || "获取邮件失败" });
+    }
+  };
+
+  const handleAction = async (resource: MailboxResource, action: string) => {
+    setError("");
+    try {
+      if (action === "copy") await copyAddress(resource.address);
+      if (action === "messages") await fetchMessages(resource);
+      if (action === "bind") await bindResource(resource);
+      if (action === "unlink") await unlinkResource(resource);
+      if (action === "release") await releaseAddress(resource);
+      if (action === "disable") await disableMailbox(resource);
+      if (action === "delete") await deleteMailbox(resource);
+    } catch (exc: any) {
+      setError(exc?.message || "操作失败");
+    }
+  };
+
+  const detailAccount = detail ? accountById.get(detail.mailbox_account_id) || null : null;
+  const detailAddress = detail ? addressById.get(detail.mailbox_address_id) || null : null;
+  const detailLink = detail ? linkByAddressId.get(detail.mailbox_address_id) || null : null;
 
   return (
-    <div className="space-y-8">
+    <div className="flex h-full min-h-0 flex-col gap-3">
       <div className="flex flex-wrap items-center justify-between gap-3">
-        <div className="min-w-0 text-[13px] text-[var(--text-muted)]">
-          {payload.paths?.accounts ? (
-            <span className="break-all">JSON: {payload.paths.accounts}</span>
-          ) : (
-            <span>邮箱账号、可用地址和账号绑定关系会保存到本地 JSON。</span>
-          )}
+        <div className="min-w-0">
+          <h1 className="text-lg font-semibold text-[var(--text-primary)]">邮箱资源</h1>
+          <div className="mt-1 text-[12px] text-[var(--text-muted)]">
+            {payload.paths?.accounts ? <span className="break-all">JSON: {payload.paths.accounts}</span> : "本地邮箱资源"}
+          </div>
         </div>
         <Button variant="outline" size="sm" onClick={load} disabled={loading}>
           <RefreshCw className="mr-2 h-4 w-4" />
-          {loading ? "刷新中" : "刷新"}
+          {loading ? "刷新中" : "刷新列表"}
         </Button>
       </div>
 
@@ -310,310 +603,135 @@ export default function MailboxResources() {
         </div>
       ) : null}
 
-      <Section title="邮箱账号" desc="保存邮箱服务商、登录账号和明文凭据，注册成功后也会自动补充这里。">
-        <div className="rounded-xl border border-[var(--border)] bg-[var(--bg-card)]">
-          <div className="grid gap-3 border-b border-[var(--border)] p-4 md:grid-cols-4">
-            <Field label="Provider">
-              <select
-                className="control-surface control-surface-compact"
-                value={form.provider}
-                onChange={(event) => setForm((prev) => ({ ...prev, provider: event.target.value }))}
-              >
-                <option value="local_ms_pool">local_ms_pool</option>
-                <option value="api_mailbox">api_mailbox</option>
-                <option value="hotmail007">hotmail007</option>
-              </select>
-            </Field>
-            <Field label="邮箱">
-              <input
-                className="control-surface control-surface-compact"
-                value={form.email}
-                onChange={(event) => setForm((prev) => ({ ...prev, email: event.target.value }))}
-                placeholder="user@outlook.com"
-              />
-            </Field>
-            <Field label="登录账号">
-              <input
-                className="control-surface control-surface-compact"
-                value={form.login_account}
-                onChange={(event) => setForm((prev) => ({ ...prev, login_account: event.target.value }))}
-                placeholder="默认同邮箱"
-              />
-            </Field>
-            <Field label="状态">
-              <select
-                className="control-surface control-surface-compact"
-                value={form.status}
-                onChange={(event) => setForm((prev) => ({ ...prev, status: event.target.value }))}
-              >
-                <option value="active">active</option>
-                <option value="inactive">inactive</option>
-                <option value="disabled">disabled</option>
-              </select>
-            </Field>
-            <Field label="credentials JSON" className="md:col-span-2">
-              <textarea
-                className="control-surface control-surface-mono min-h-28"
-                value={form.credentialsText}
-                onChange={(event) => setForm((prev) => ({ ...prev, credentialsText: event.target.value }))}
-              />
-            </Field>
-            <Field label="metadata JSON" className="md:col-span-2">
-              <textarea
-                className="control-surface control-surface-mono min-h-28"
-                value={form.metadataText}
-                onChange={(event) => setForm((prev) => ({ ...prev, metadataText: event.target.value }))}
-              />
-            </Field>
-            <div className="flex gap-2 md:col-span-4">
-              <Button onClick={saveAccount} disabled={saving || !form.email}>
-                {editingId ? <Save className="mr-2 h-4 w-4" /> : <Plus className="mr-2 h-4 w-4" />}
-                {editingId ? "保存邮箱账号" : "新增邮箱账号"}
-              </Button>
-              {editingId ? (
-                <Button variant="outline" onClick={resetForm}>
-                  取消编辑
-                </Button>
-              ) : null}
-            </div>
+      <Card className="shrink-0 bg-[var(--bg-pane)]/40 border border-[var(--border)] shadow-sm">
+        <div className="flex flex-wrap items-center gap-2 p-3">
+          <select className="control-surface control-surface-compact w-auto min-w-28" value={statusFilter} onChange={(event) => setStatusFilter(event.target.value)}>
+            {statusOptions.map((option) => (
+              <option key={option.value} value={option.value}>{option.label}</option>
+            ))}
+          </select>
+          <select className="control-surface control-surface-compact w-auto min-w-32" value={providerFilter} onChange={(event) => setProviderFilter(event.target.value)}>
+            <option value="all">全部 Provider</option>
+            {providers.map((provider) => (
+              <option key={provider} value={provider}>{provider}</option>
+            ))}
+          </select>
+          <div className="flex flex-wrap items-center gap-2 text-xs text-[var(--text-muted)]">
+            <span className="rounded border border-[var(--border)] bg-[var(--bg-card)] px-2 py-1">共 {payload.resources.length}</span>
+            <span className="rounded border border-[var(--border)] bg-[var(--bg-card)] px-2 py-1">已注册 {counts.registered || 0}</span>
+            <span className="rounded border border-[var(--border)] bg-[var(--bg-card)] px-2 py-1">已分配 {counts.allocated || 0}</span>
+            <span className="rounded border border-[var(--border)] bg-[var(--bg-card)] px-2 py-1">空闲 {counts.available || 0}</span>
           </div>
+          <div className="ml-auto text-xs text-[var(--text-muted)]">当前 {visibleResources.length}</div>
+        </div>
+      </Card>
 
-          {payload.accounts.length ? (
-            <div className="glass-table-wrap">
-              <table className="w-full min-w-[760px] text-left text-sm">
-                <thead className="border-b border-[var(--border)] text-[var(--text-muted)]">
-                  <tr>
-                    <th className="px-4 py-3">邮箱</th>
-                    <th className="px-4 py-3">Provider</th>
-                    <th className="px-4 py-3">状态</th>
-                    <th className="px-4 py-3">用量</th>
-                    <th className="px-4 py-3 text-right">操作</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-[var(--border-soft)]">
-                  {payload.accounts.map((account) => (
-                    <tr key={account.id} className="hover:bg-[var(--bg-hover)]">
-                      <td className="px-4 py-3">
-                        <div className="font-medium text-[var(--text-primary)]">{account.email}</div>
-                        <div className="mt-0.5 text-xs text-[var(--text-muted)]">{account.login_account || account.id}</div>
-                      </td>
-                      <td className="px-4 py-3 text-[var(--text-secondary)]">{account.provider}</td>
-                      <td className="px-4 py-3">
-                        <Badge variant={statusVariant(account.status)}>{account.status || "active"}</Badge>
-                      </td>
-                      <td className="px-4 py-3 text-[var(--text-secondary)]">
-                        {account.usage?.used_count ?? 0} / {account.usage?.capacity ?? "-"}
-                      </td>
-                      <td className="px-4 py-3">
-                        <div className="flex justify-end gap-2">
-                          <button className="table-action-btn" onClick={() => {
-                            setSelectedAccountId(account.id);
-                            setAddressForm((prev) => ({ ...prev, mailbox_account_id: account.id }));
-                            editAccount(account);
-                          }}>
-                            编辑
-                          </button>
-                          <button className="table-action-btn table-action-btn-danger" onClick={() => deleteAccount(account.id)}>
-                            <Trash2 className="h-3.5 w-3.5" />
-                          </button>
+      <Card className="min-h-0 flex-1 overflow-hidden p-0 border border-[var(--border)] shadow-sm">
+        <div className="glass-table-wrap h-full min-h-0 overflow-auto">
+          <table className="table-fixed w-full min-w-[900px] text-sm">
+            <colgroup>
+              <col className="w-[38%]" />
+              <col className="w-[11%]" />
+              <col className="w-[11%]" />
+              <col className="w-[18%]" />
+              <col className="w-[10%]" />
+              <col className="w-[12%]" />
+            </colgroup>
+            <thead className="sticky top-0 z-10 bg-[var(--bg-pane)]/80">
+              <tr className="border-b border-[var(--border)] text-xs font-medium uppercase tracking-wider text-[var(--text-muted)]">
+                <th className="px-3 py-2 text-left">邮箱号</th>
+                <th className="px-3 py-2 text-left">状态</th>
+                <th className="px-3 py-2 text-left">Provider</th>
+                <th className="px-3 py-2 text-left">ChatGPT 账号</th>
+                <th className="px-3 py-2 text-left">更新时间</th>
+                <th className="px-3 py-2 text-right">操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              {visibleResources.length === 0 && (
+                <tr>
+                  <td colSpan={6} className="px-4 py-24 text-center">
+                    <div className="flex flex-col items-center justify-center space-y-3">
+                      <div className="flex h-12 w-12 items-center justify-center rounded-full border border-[var(--border)] bg-[var(--bg-pane)] shadow-sm">
+                        <span className="text-lg text-[var(--text-muted)]">@</span>
+                      </div>
+                      <h3 className="text-sm font-medium text-[var(--text-primary)]">暂无邮箱资源</h3>
+                      <p className="max-w-sm text-xs text-[var(--text-muted)]">获取到邮箱后会出现在这里。</p>
+                    </div>
+                  </td>
+                </tr>
+              )}
+              {visibleResources.map((resource) => (
+                <tr
+                  key={resource.id}
+                  className="group cursor-pointer border-b border-[var(--border)]/30 transition-colors hover:bg-[var(--text-primary)]/[0.02]"
+                  onClick={() => setDetail(resource)}
+                >
+                  <td className="px-3 py-2.5 align-top font-mono text-sm text-[var(--text-primary)]">
+                    <div className="min-w-0">
+                      <div className="truncate tracking-tight" title={resource.address}>{resource.address}</div>
+                      <div className="mt-1 truncate text-xs text-[var(--text-muted)]">
+                        {resource.address_type || "primary"}
+                      </div>
+                    </div>
+                  </td>
+                  <td className="px-3 py-2.5 align-top">
+                    <StatusPill status={resource.status} />
+                  </td>
+                  <td className="px-3 py-2.5 align-top text-[var(--text-secondary)]">
+                    <div className="truncate" title={resource.provider}>{providerLabel(resource.provider)}</div>
+                  </td>
+                  <td className="px-3 py-2.5 align-top">
+                    {resource.chatgpt_account_id ? (
+                      <div className="min-w-0">
+                        <div className="font-medium text-[var(--text-primary)]">#{resource.chatgpt_account_id}</div>
+                        <div className="mt-1 truncate text-xs text-[var(--text-muted)]" title={resource.chatgpt_account_email || ""}>
+                          {resource.chatgpt_account_email || "未记录邮箱"}
                         </div>
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          ) : (
-            <div className="empty-state-panel m-4">暂无邮箱账号。新增或完成一次邮箱注册后会出现在这里。</div>
-          )}
+                      </div>
+                    ) : (
+                      <span className="text-xs text-[var(--text-muted)]">未绑定</span>
+                    )}
+                  </td>
+                  <td className="whitespace-nowrap px-3 py-2.5 align-top font-mono text-xs text-[var(--text-muted)]" title={formatTime(resource.updated_at || resource.created_at)}>
+                    {formatCompactTime(resource.updated_at || resource.created_at)}
+                  </td>
+                  <td className="px-3 py-2.5 align-top" onClick={(event) => event.stopPropagation()}>
+                    <div className="flex items-center justify-end opacity-60 transition-opacity group-hover:opacity-100">
+                      <ActionMenu
+                        resource={resource}
+                        onDetail={() => setDetail(resource)}
+                        onAction={handleAction}
+                      />
+                    </div>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
         </div>
-      </Section>
+      </Card>
 
-      <Section title="邮箱地址" desc="主邮箱和别名地址都在这里，Codex OAuth 会优先使用账号绑定的验证邮箱。">
-        <div className="rounded-xl border border-[var(--border)] bg-[var(--bg-card)]">
-          <div className="grid gap-3 border-b border-[var(--border)] p-4 md:grid-cols-[1.4fr_1.4fr_0.8fr_auto]">
-            <Field label="邮箱账号">
-              <select
-                className="control-surface control-surface-compact"
-                value={addressForm.mailbox_account_id || selectedAccountId}
-                onChange={(event) => {
-                  setSelectedAccountId(event.target.value);
-                  setAddressForm((prev) => ({ ...prev, mailbox_account_id: event.target.value }));
-                }}
-              >
-                <option value="">选择邮箱账号</option>
-                {payload.accounts.map((account) => (
-                  <option key={account.id} value={account.id}>
-                    {account.email}
-                  </option>
-                ))}
-              </select>
-            </Field>
-            <Field label="地址">
-              <input
-                className="control-surface control-surface-compact"
-                value={addressForm.address}
-                onChange={(event) => setAddressForm((prev) => ({ ...prev, address: event.target.value }))}
-                placeholder="留空使用主邮箱"
-              />
-            </Field>
-            <Field label="别名序号">
-              <input
-                className="control-surface control-surface-compact"
-                value={addressForm.alias_index}
-                onChange={(event) => setAddressForm((prev) => ({ ...prev, alias_index: event.target.value }))}
-                placeholder="1"
-              />
-            </Field>
-            <div className="flex items-end">
-              <Button onClick={reserveAddress} disabled={!(addressForm.mailbox_account_id || selectedAccountId)}>
-                <MailPlus className="mr-2 h-4 w-4" />
-                预留地址
-              </Button>
-            </div>
-          </div>
+      {detail ? (
+        <DetailModal
+          resource={detail}
+          account={detailAccount}
+          address={detailAddress}
+          link={detailLink}
+          onClose={() => setDetail(null)}
+        />
+      ) : null}
 
-          {visibleAddresses.length ? (
-            <div className="glass-table-wrap">
-              <table className="w-full min-w-[760px] text-left text-sm">
-                <thead className="border-b border-[var(--border)] text-[var(--text-muted)]">
-                  <tr>
-                    <th className="px-4 py-3">地址</th>
-                    <th className="px-4 py-3">归属邮箱</th>
-                    <th className="px-4 py-3">类型</th>
-                    <th className="px-4 py-3">预留</th>
-                    <th className="px-4 py-3 text-right">操作</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-[var(--border-soft)]">
-                  {visibleAddresses.map((address) => {
-                    const account = accountById.get(address.mailbox_account_id);
-                    return (
-                      <tr key={address.id} className="hover:bg-[var(--bg-hover)]">
-                        <td className="px-4 py-3 font-medium text-[var(--text-primary)]">{address.address}</td>
-                        <td className="px-4 py-3 text-[var(--text-secondary)]">{account?.email || address.mailbox_account_id}</td>
-                        <td className="px-4 py-3 text-[var(--text-secondary)]">{address.address_type || "primary"}</td>
-                        <td className="px-4 py-3">
-                          <Badge variant={address.reserved ? "warning" : "secondary"}>
-                            {address.reserved ? "已预留" : "空闲"}
-                          </Badge>
-                        </td>
-                        <td className="px-4 py-3">
-                          <div className="flex justify-end gap-2">
-                            <button
-                              className="table-action-btn"
-                              onClick={() => setLinkForm((prev) => ({ ...prev, mailbox_address_id: address.id }))}
-                            >
-                              绑定
-                            </button>
-                            <button className="table-action-btn" disabled={!address.reserved} onClick={() => releaseAddress(address.id)}>
-                              释放
-                            </button>
-                          </div>
-                        </td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
-            </div>
-          ) : (
-            <div className="empty-state-panel m-4">暂无邮箱地址。选择邮箱账号后可以预留主邮箱或别名。</div>
-          )}
-        </div>
-      </Section>
-
-      <Section title="账号绑定" desc="把 ChatGPT 账号 id 绑定到一个验证邮箱地址，Codex OAuth 邮箱验证码会用这条绑定读取。">
-        <div className="rounded-xl border border-[var(--border)] bg-[var(--bg-card)]">
-          <div className="grid gap-3 border-b border-[var(--border)] p-4 md:grid-cols-[0.8fr_1.2fr_1.4fr_0.8fr_auto]">
-            <Field label="账号 ID">
-              <input
-                className="control-surface control-surface-compact"
-                value={linkForm.account_id}
-                onChange={(event) => setLinkForm((prev) => ({ ...prev, account_id: event.target.value }))}
-                placeholder="123"
-              />
-            </Field>
-            <Field label="账号邮箱">
-              <input
-                className="control-surface control-surface-compact"
-                value={linkForm.account_email}
-                onChange={(event) => setLinkForm((prev) => ({ ...prev, account_email: event.target.value }))}
-                placeholder="account@example.com"
-              />
-            </Field>
-            <Field label="验证邮箱地址">
-              <select
-                className="control-surface control-surface-compact"
-                value={linkForm.mailbox_address_id}
-                onChange={(event) => setLinkForm((prev) => ({ ...prev, mailbox_address_id: event.target.value }))}
-              >
-                <option value="">选择地址</option>
-                {payload.addresses.map((address) => (
-                  <option key={address.id} value={address.id}>
-                    {address.address}
-                  </option>
-                ))}
-              </select>
-            </Field>
-            <Field label="用途">
-              <input
-                className="control-surface control-surface-compact"
-                value={linkForm.purpose}
-                onChange={(event) => setLinkForm((prev) => ({ ...prev, purpose: event.target.value }))}
-              />
-            </Field>
-            <div className="flex items-end">
-              <Button onClick={linkAccount} disabled={!linkForm.account_id || !linkForm.mailbox_address_id}>
-                <Link2 className="mr-2 h-4 w-4" />
-                绑定账号
-              </Button>
-            </div>
-          </div>
-
-          {payload.links.length ? (
-            <div className="glass-table-wrap">
-              <table className="w-full min-w-[760px] text-left text-sm">
-                <thead className="border-b border-[var(--border)] text-[var(--text-muted)]">
-                  <tr>
-                    <th className="px-4 py-3">平台账号</th>
-                    <th className="px-4 py-3">验证邮箱</th>
-                    <th className="px-4 py-3">用途</th>
-                    <th className="px-4 py-3">状态</th>
-                    <th className="px-4 py-3 text-right">操作</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-[var(--border-soft)]">
-                  {payload.links.map((link) => {
-                    const address = addressById.get(link.mailbox_address_id);
-                    return (
-                      <tr key={link.id} className="hover:bg-[var(--bg-hover)]">
-                        <td className="px-4 py-3">
-                          <div className="font-medium text-[var(--text-primary)]">{link.platform} #{link.account_id}</div>
-                          <div className="mt-0.5 text-xs text-[var(--text-muted)]">{link.account_email || "未记录账号邮箱"}</div>
-                        </td>
-                        <td className="px-4 py-3 text-[var(--text-secondary)]">{address?.address || link.mailbox_address_id}</td>
-                        <td className="px-4 py-3 text-[var(--text-secondary)]">{link.purpose || "verification"}</td>
-                        <td className="px-4 py-3">
-                          <Badge variant={statusVariant(link.status)}>{link.status || "active"}</Badge>
-                        </td>
-                        <td className="px-4 py-3 text-right">
-                          <button className="table-action-btn" onClick={() => unlinkAccount(link)}>
-                            <Unlink className="mr-1.5 h-3.5 w-3.5" />
-                            解绑
-                          </button>
-                        </td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
-            </div>
-          ) : (
-            <div className="empty-state-panel m-4">暂无账号绑定。注册成功后会自动创建，也可以在这里手工补绑。</div>
-          )}
-        </div>
-      </Section>
+      {mailDialog ? (
+        <MailMessagesModal
+          resource={mailDialog.resource}
+          messages={mailDialog.messages}
+          loading={mailDialog.loading}
+          error={mailDialog.error}
+          onRefresh={() => fetchMessages(mailDialog.resource)}
+          onClose={() => setMailDialog(null)}
+        />
+      ) : null}
     </div>
   );
 }

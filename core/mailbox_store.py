@@ -84,6 +84,67 @@ class MailboxStore:
         with _LOCK:
             return _read_list(ACCOUNT_MAILBOX_LINKS_FILE)
 
+    def list_resources(self) -> list[dict[str, Any]]:
+        with _LOCK:
+            accounts = _read_list(MAILBOX_ACCOUNTS_FILE)
+            addresses = _read_list(MAILBOX_ADDRESSES_FILE)
+            links = _read_list(ACCOUNT_MAILBOX_LINKS_FILE)
+
+        account_by_id = {str(item.get("id") or ""): item for item in accounts}
+        links_by_address: dict[str, list[dict[str, Any]]] = {}
+        for link in links:
+            links_by_address.setdefault(str(link.get("mailbox_address_id") or ""), []).append(link)
+
+        resources: list[dict[str, Any]] = []
+        def _status(account: dict[str, Any] | None, address: dict[str, Any], link: dict[str, Any] | None) -> str:
+            account_status = _normalize_status((account or {}).get("status"))
+            address_status = _normalize_status(address.get("status"))
+            if account_status in {"disabled", "inactive"} or address_status in {"disabled", "inactive"}:
+                return "disabled"
+            if link:
+                return "registered"
+            if address.get("reserved"):
+                return "allocated"
+            return "available"
+
+        for address in addresses:
+            account_id = str(address.get("mailbox_account_id") or "")
+            account = account_by_id.get(account_id) or {}
+            address_links = links_by_address.get(str(address.get("id") or ""), [])
+            link = next((item for item in address_links if item.get("status", "active") == "active"), None)
+            resources.append(
+                {
+                    "id": str(address.get("id") or ""),
+                    "resource_kind": "address",
+                    "mailbox_account_id": account_id,
+                    "mailbox_address_id": str(address.get("id") or ""),
+                    "address": address.get("address") or account.get("email") or "",
+                    "address_type": address.get("address_type") or "primary",
+                    "provider": account.get("provider") or "",
+                    "parent_email": account.get("email") or "",
+                    "login_account": account.get("login_account") or account.get("email") or "",
+                    "status": _status(account, address, link),
+                    "mailbox_status": account.get("status") or "active",
+                    "reserved": bool(address.get("reserved")),
+                    "reserved_for": dict(address.get("reserved_for") or {}),
+                    "usage": dict(account.get("usage") or {}),
+                    "metadata": {
+                        "account": dict(account.get("metadata") or {}),
+                        "address": dict(address.get("metadata") or {}),
+                    },
+                    "chatgpt_account_id": int(link.get("account_id") or 0) if link else None,
+                    "chatgpt_account_email": link.get("account_email") if link else "",
+                    "link_id": link.get("id") if link else "",
+                    "link_status": link.get("status") if link else "",
+                    "updated_at": address.get("updated_at") or account.get("updated_at") or "",
+                    "created_at": address.get("created_at") or account.get("created_at") or "",
+                }
+            )
+
+        order = {"registered": 0, "allocated": 1, "available": 2, "disabled": 3}
+        resources.sort(key=lambda item: (order.get(str(item.get("status") or ""), 9), str(item.get("updated_at") or ""), str(item.get("address") or "")))
+        return resources
+
     def get_account(self, account_id: str) -> dict[str, Any] | None:
         account_id = _text(account_id)
         return next((item for item in self.list_accounts() if item.get("id") == account_id), None)
@@ -406,6 +467,62 @@ class MailboxStore:
         runtime_extra = {**dict(extra or {}), **credentials}
         mailbox = create_mailbox(provider, runtime_extra, proxy=proxy)
         return mailbox, mailbox_account, {"link": link, "address": address, "account": account}
+
+    def resolve_mailbox_for_address(
+        self,
+        *,
+        mailbox_address_id: str,
+        proxy: str | None = None,
+        extra: dict[str, Any] | None = None,
+    ) -> tuple[Any, MailboxAccount, dict[str, Any]]:
+        address = self.get_address(str(mailbox_address_id or ""))
+        if not address:
+            raise RuntimeError("邮箱地址不存在")
+        account = self.get_account(str(address.get("mailbox_account_id") or ""))
+        if not account:
+            raise RuntimeError("邮箱地址所属账号不存在")
+        provider = _text(account.get("provider"))
+        credentials = dict(account.get("credentials") or {})
+        credentials.setdefault("email", account.get("email") or address.get("address") or "")
+        credentials.setdefault("login_account", account.get("login_account") or account.get("email") or "")
+        mailbox_account = MailboxAccount(
+            email=_text(address.get("address")),
+            account_id=_text(address.get("id")),
+            extra={
+                "provider_account": {
+                    "provider_type": "mailbox",
+                    "provider_name": provider,
+                    "login_identifier": account.get("login_account") or account.get("email") or "",
+                    "display_name": address.get("address") or account.get("email") or "",
+                    "credentials": credentials,
+                    "metadata": {
+                        **dict(account.get("metadata") or {}),
+                        **dict(address.get("metadata") or {}),
+                        "parent_email": account.get("email") or "",
+                    },
+                }
+            },
+        )
+        runtime_extra = {**dict(extra or {}), **credentials}
+        mailbox = create_mailbox(provider, runtime_extra, proxy=proxy)
+        return mailbox, mailbox_account, {"address": address, "account": account}
+
+    def list_messages_for_address(
+        self,
+        *,
+        mailbox_address_id: str,
+        limit: int = 10,
+        proxy: str | None = None,
+        extra: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        mailbox, mailbox_account, _context = self.resolve_mailbox_for_address(
+            mailbox_address_id=mailbox_address_id,
+            proxy=proxy,
+            extra=extra,
+        )
+        if not hasattr(mailbox, "list_messages"):
+            raise RuntimeError(f"{mailbox.__class__.__name__} 暂不支持获取邮件")
+        return list(mailbox.list_messages(mailbox_account, limit=limit) or [])
 
     def _extract_mailbox_material(
         self,

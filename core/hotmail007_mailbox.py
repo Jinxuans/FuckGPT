@@ -445,6 +445,33 @@ class Hotmail007Mailbox(BaseMailbox):
         except Exception:
             return set()
 
+    def list_messages(self, account: MailboxAccount, limit: int = 10) -> list[dict[str, Any]]:
+        limit = max(1, min(int(limit or 10), 50))
+        entry = self._entry_for_account(account)
+        messages: list[dict[str, Any]] = []
+        for mail in self._latest_mails(entry, start_timestamp=self._issued_at(account), log_attempt=True):
+            text = self._mail_text(mail)
+            messages.append(
+                {
+                    "id": self._mail_signature(mail),
+                    "subject": mail.get("subject") or "",
+                    "from": mail.get("from") or "",
+                    "to": [account.email] if account.email else [],
+                    "received_at": mail.get("receivedAt") or mail.get("received_at") or "",
+                    "preview": text[:1000],
+                    "code": ApiMailboxPool._extract_code(
+                        {"subject": mail.get("subject"), "text": mail.get("text"), "html": mail.get("html")},
+                        text,
+                    ),
+                    "link": _extract_verification_link(text, ""),
+                    "folder": mail.get("_folder") or "",
+                    "provider": "hotmail007",
+                }
+            )
+            if len(messages) >= limit:
+                break
+        return messages
+
     def wait_for_code(
         self,
         account: MailboxAccount,

@@ -304,6 +304,30 @@ class ApiMailboxPool(BaseMailbox):
         except Exception:
             return set()
 
+    def list_messages(self, account: MailboxAccount, limit: int = 10) -> list[dict]:
+        del limit
+        payload, raw = self._request(self._entry_for_account(account))
+        code = self._extract_code(payload, raw)
+        link = _extract_verification_link(raw, "")
+        subject = ""
+        received_at = ""
+        if isinstance(payload, dict):
+            subject = str(payload.get("subject") or payload.get("title") or "")
+            received_at = str(payload.get("received_at") or payload.get("receivedAt") or payload.get("created_at") or payload.get("timestamp") or "")
+        return [
+            {
+                "id": next(iter(self._signatures(payload, raw)), ""),
+                "subject": subject or ("验证码" if code else "API 邮箱返回"),
+                "from": "",
+                "to": [account.email] if account.email else [],
+                "received_at": received_at,
+                "preview": raw[:1000],
+                "code": code,
+                "link": link,
+                "provider": "api_mailbox",
+            }
+        ]
+
     def wait_for_code(
         self,
         account: MailboxAccount,

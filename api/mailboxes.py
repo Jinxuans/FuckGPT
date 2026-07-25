@@ -72,11 +72,17 @@ def _paths() -> dict[str, str]:
 def get_mailboxes():
     store = _store()
     return {
+        "resources": store.list_resources(),
         "accounts": store.list_accounts(),
         "addresses": store.list_addresses(),
         "links": store.list_links(),
         "paths": _paths(),
     }
+
+
+@router.get("/resources")
+def list_mailbox_resources():
+    return {"items": _store().list_resources(), "paths": _paths()}
 
 
 @router.get("/accounts")
@@ -130,6 +136,14 @@ def release_mailbox_address(mailbox_address_id: str):
     if not item:
         raise HTTPException(404, "邮箱地址不存在")
     return item
+
+
+@router.get("/addresses/{mailbox_address_id}/messages")
+def list_mailbox_address_messages(mailbox_address_id: str, limit: int = 10):
+    try:
+        return {"items": _store().list_messages_for_address(mailbox_address_id=mailbox_address_id, limit=limit)}
+    except RuntimeError as exc:
+        raise HTTPException(400, str(exc)) from exc
 
 
 @router.get("/links")

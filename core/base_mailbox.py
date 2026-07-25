@@ -37,6 +37,9 @@ class BaseMailbox(ABC):
     def get_current_ids(self, account: MailboxAccount) -> set:
         """返回当前邮件 ID 集合，用于过滤旧邮件。"""
 
+    def list_messages(self, account: MailboxAccount, limit: int = 10) -> list[dict]:
+        raise NotImplementedError(f"{self.__class__.__name__} 暂不支持 list_messages()")
+
     def wait_for_link(
         self,
         account: MailboxAccount,
@@ -79,6 +82,9 @@ class FallbackMailbox(BaseMailbox):
 
     def get_current_ids(self, account: MailboxAccount) -> set:
         return self._resolve(account).get_current_ids(account)
+
+    def list_messages(self, account: MailboxAccount, limit: int = 10) -> list[dict]:
+        return self._resolve(account).list_messages(account, limit=limit)
 
     def wait_for_code(
         self,
