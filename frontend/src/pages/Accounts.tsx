@@ -118,6 +118,39 @@ function getCredentials(acc: any) {
   return Array.isArray(acc?.credentials) ? acc.credentials : []
 }
 
+function getCredentialValue(acc: any, key: string) {
+  const credential = getCredentials(acc).find((item: any) => item?.key === key && item?.value)
+  return credential?.value || ''
+}
+
+function getCodexStatus(acc: any) {
+  const overview = getAccountOverview(acc)
+  const legacy = overview?.legacy_extra && typeof overview.legacy_extra === 'object' ? overview.legacy_extra : {}
+  const accessToken = getCredentialValue(acc, 'codex_access_token') || legacy.codex_access_token || acc?.codex_access_token || ''
+  const authPath = getCredentialValue(acc, 'codex_auth_path') || legacy.codex_auth_path || acc?.codex_auth_path || ''
+  const accountId = getCredentialValue(acc, 'codex_account_id') || legacy.codex_account_id || acc?.codex_account_id || ''
+  const email = getCredentialValue(acc, 'codex_email') || legacy.codex_email || acc?.codex_email || ''
+  const planType = getCredentialValue(acc, 'codex_plan_type') || legacy.codex_plan_type || acc?.codex_plan_type || ''
+  const expiresAt = getCredentialValue(acc, 'codex_expires_at') || legacy.codex_expires_at || acc?.codex_expires_at || ''
+  const authorized = Boolean(accessToken || authPath || accountId)
+  return { authorized, authPath, accountId, email, planType, expiresAt }
+}
+
+function formatOptionalDateTime(value: string, language: Parameters<typeof formatDateTime>[1]) {
+  if (!value) return ''
+  try {
+    return formatDateTime(value, language, {
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: false,
+    })
+  } catch {
+    return value
+  }
+}
+
 function getCashierUrl(acc: any) {
   const overview = getAccountOverview(acc)
   return overview?.cashier_url || acc?.cashier_url || ''
@@ -1810,15 +1843,16 @@ export default function Accounts() {
       <Card className="min-h-0 flex-1 overflow-hidden p-0 border border-[var(--border)] shadow-sm">
         <div className="flex h-full min-h-0 flex-col">
           <div className="glass-table-wrap min-h-0 flex-1 overflow-auto">
-        <table className="table-fixed w-full min-w-[900px] text-sm">
+        <table className="table-fixed w-full min-w-[980px] text-sm">
           <colgroup>
             <col className="w-10" />
-            <col className="w-[30%]" />
+            <col className="w-[27%]" />
             <col className="w-[12%]" />
-            <col className="w-[26%]" />
+            <col className="w-[23%]" />
+            <col className="w-[13%]" />
             <col className="w-[8%]" />
             <col className="w-[12%]" />
-            <col className="w-[12%]" />
+            <col className="w-[5%]" />
           </colgroup>
           <thead className="sticky top-0 z-10  bg-[var(--bg-pane)]/80">
             <tr className="border-b border-[var(--border)] text-xs uppercase tracking-wider font-medium text-[var(--text-muted)]">
@@ -1833,6 +1867,7 @@ export default function Accounts() {
               <th className="px-3 py-2 text-left">{t('common.email')}</th>
               <th className="px-3 py-2 text-left">{t('common.password')}</th>
               <th className="px-3 py-2 text-left">{t('common.status')}</th>
+              <th className="px-3 py-2 text-left">Codex</th>
               <th className="px-3 py-2 text-left">{t('accounts.link')}</th>
               <th className="px-3 py-2 text-left">{t('accounts.registeredAt')}</th>
               <th className="px-3 py-2 text-right">{t('common.actions')}</th>
@@ -1841,7 +1876,7 @@ export default function Accounts() {
           <tbody>
             {accounts.length === 0 && (
               <tr>
-                <td colSpan={7} className="px-4 py-24 text-center">
+                <td colSpan={8} className="px-4 py-24 text-center">
                   <div className="flex flex-col items-center justify-center space-y-3">
                     <div className="flex h-12 w-12 items-center justify-center rounded-full bg-[var(--bg-pane)] border border-[var(--border)] shadow-sm">
                       <svg className="h-6 w-6 text-[var(--text-muted)]" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M20 13V6a2 2 0 00-2-2H6a2 2 0 00-2 2v7m16 0v5a2 2 0 01-2 2H6a2 2 0 01-2-2v-5m16 0h-2.586a1 1 0 00-.707.293l-2.414 2.414a1 1 0 01-.707.293h-3.172a1 1 0 01-.707-.293l-2.414-2.414A1 1 0 006.586 13H4" /></svg>
@@ -1858,6 +1893,7 @@ export default function Accounts() {
                 const verificationMailbox = getVerificationMailbox(acc)
                 const primaryMetrics = getPrimaryMetrics(acc)
                 const displayBadges = getDisplayBadges(acc)
+                const codexStatus = getCodexStatus(acc)
                 return (
               <tr key={acc.id} className="group border-b border-[var(--border)]/30 hover:bg-[var(--text-primary)]/[0.02] transition-colors cursor-pointer"
                   onClick={() => setDetail(acc)}>
@@ -1945,6 +1981,23 @@ export default function Accounts() {
                       </div>
                     )}
                   </div>
+                </td>
+                <td className="px-3 py-2.5 align-top">
+                  {codexStatus.authorized ? (
+                    <div className="min-w-0 space-y-1">
+                      <span className="inline-flex items-center rounded-full bg-violet-500/10 px-2 py-0.5 text-xs font-medium text-violet-500 ring-1 ring-inset ring-violet-500/20">
+                        <span className="mr-1 h-1 w-1 rounded-full bg-violet-500 shadow-[0_0_4px_rgba(139,92,246,0.6)]"></span>
+                        已授权
+                      </span>
+                      <div className="truncate text-xs text-[var(--text-muted)]" title={codexStatus.email || codexStatus.accountId || codexStatus.authPath || ''}>
+                        {codexStatus.planType || 'codex'}{codexStatus.expiresAt ? ` · ${formatOptionalDateTime(codexStatus.expiresAt, language)}` : ''}
+                      </div>
+                    </div>
+                  ) : (
+                    <span className="inline-flex items-center rounded-full bg-[var(--text-primary)]/5 px-2 py-0.5 text-xs font-medium text-[var(--text-muted)] ring-1 ring-inset ring-[var(--border)]">
+                      未授权
+                    </span>
+                  )}
                 </td>
                 <td className="px-3 py-2.5 align-top">
                   {getCashierUrl(acc) ? (
