@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import pytest
+
+from core.base_identity import MailboxIdentityProvider
 from core.base_mailbox import MailboxAccount
 from core.base_platform import Account
 from core.mailbox_store import MailboxStore
@@ -119,6 +122,96 @@ def test_record_registration_link_from_platform_account_metadata(monkeypatch, tm
     assert store.list_accounts()[0]["credentials"]["password"] == "mail-password"
     assert store.list_addresses()[0]["address"] == "parent+reg2@outlook.com"
     assert store.list_addresses()[0]["address_type"] == "alias"
+
+
+def test_record_allocated_mailbox_persists_provider_resource_without_link(monkeypatch, tmp_path):
+    _patch_mailbox_paths(monkeypatch, tmp_path)
+    store = MailboxStore()
+
+    allocation = store.record_allocated_mailbox(
+        platform="chatgpt",
+        mailbox_account=MailboxAccount(
+            email="allocated@hotmail.com",
+            account_id="hm-key",
+            extra={
+                "provider_account": {
+                    "provider_type": "mailbox",
+                    "provider_name": "hotmail007",
+                    "login_identifier": "allocated@hotmail.com",
+                    "credentials": {
+                        "email": "allocated@hotmail.com",
+                        "password": "mail-password",
+                        "refresh_token": "refresh-token",
+                    },
+                    "metadata": {"source": "hotmail007"},
+                },
+                "provider_resource": {
+                    "provider_type": "mailbox",
+                    "provider_name": "hotmail007",
+                    "resource_type": "mailbox",
+                    "resource_identifier": "hm-key",
+                    "handle": "allocated@hotmail.com",
+                    "metadata": {"product_id": "prod-1"},
+                },
+            },
+        ),
+        provider="hotmail007",
+    )
+
+    assert allocation is not None
+    assert store.list_accounts()[0]["provider"] == "hotmail007"
+    assert store.list_accounts()[0]["credentials"]["refresh_token"] == "refresh-token"
+    assert store.list_addresses()[0]["address"] == "allocated@hotmail.com"
+    assert store.list_addresses()[0]["reserved"] is True
+    assert store.list_addresses()[0]["reserved_for"] == {"platform": "chatgpt", "status": "allocated"}
+    assert store.list_links() == []
+
+
+class _FailingCurrentIdsMailbox:
+    def __init__(self, mailbox_account: MailboxAccount):
+        self.mailbox_account = mailbox_account
+
+    def get_email(self):
+        return self.mailbox_account
+
+    def get_current_ids(self, account):
+        raise RuntimeError("ids failed")
+
+
+def test_identity_provider_prerecords_mailbox_before_current_ids_failure(monkeypatch, tmp_path):
+    _patch_mailbox_paths(monkeypatch, tmp_path)
+    mailbox_account = MailboxAccount(
+        email="failed-after-buy@hotmail.com",
+        account_id="hm-key-failed",
+        extra={
+            "provider_account": {
+                "provider_type": "mailbox",
+                "provider_name": "hotmail007",
+                "login_identifier": "failed-after-buy@hotmail.com",
+                "credentials": {"email": "failed-after-buy@hotmail.com", "password": "mail-password"},
+            },
+            "provider_resource": {
+                "provider_type": "mailbox",
+                "provider_name": "hotmail007",
+                "resource_type": "mailbox",
+                "resource_identifier": "hm-key-failed",
+                "handle": "failed-after-buy@hotmail.com",
+            },
+        },
+    )
+    logs = []
+    provider = MailboxIdentityProvider(
+        mailbox=_FailingCurrentIdsMailbox(mailbox_account),
+        extra={"mail_provider": "hotmail007", "_platform_name": "chatgpt", "_log_fn": logs.append},
+    )
+
+    with pytest.raises(RuntimeError, match="ids failed"):
+        provider.resolve()
+
+    assert MailboxStore().list_addresses()[0]["address"] == "failed-after-buy@hotmail.com"
+    assert MailboxStore().list_addresses()[0]["reserved_for"]["status"] == "allocated"
+    assert MailboxStore().list_links() == []
+    assert logs == ["邮箱资源已预记录: failed-after-buy@hotmail.com"]
 
 
 def test_mailbox_api_manages_json_resources(client, monkeypatch, tmp_path):

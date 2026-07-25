@@ -76,12 +76,31 @@ class BaseIdentityProvider(ABC):
 class MailboxIdentityProvider(BaseIdentityProvider):
     identity_provider = "mailbox"
 
+    def _record_allocated_mailbox(self, mailbox_account: Any) -> None:
+        try:
+            from core.mailbox_store import MailboxStore
+
+            result = MailboxStore().record_allocated_mailbox(
+                platform=self.extra.get("_platform_name", "") or "chatgpt",
+                mailbox_account=mailbox_account,
+                provider=self.extra.get("mail_provider", ""),
+            )
+            log_fn = self.extra.get("_log_fn")
+            address = ((result or {}).get("address") or {}).get("address") if result else ""
+            if callable(log_fn) and address:
+                log_fn(f"邮箱资源已预记录: {address}")
+        except Exception as exc:
+            log_fn = self.extra.get("_log_fn")
+            if callable(log_fn):
+                log_fn(f"邮箱资源预记录失败: {exc}")
+
     def resolve(self, requested_email: Optional[str] = None) -> IdentityMaterial:
         requested_email = (requested_email or "").strip()
         if not self.mailbox:
             return IdentityMaterial(identity_provider=self.identity_provider, email=requested_email)
 
         mail_acct = self.mailbox.get_email()
+        self._record_allocated_mailbox(mail_acct)
         email = getattr(mail_acct, "email", "") or ""
         if not requested_email and not email:
             provider_name = getattr(self.mailbox, "__class__", type(self.mailbox)).__name__

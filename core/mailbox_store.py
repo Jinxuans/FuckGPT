@@ -407,12 +407,18 @@ class MailboxStore:
         mailbox = create_mailbox(provider, runtime_extra, proxy=proxy)
         return mailbox, mailbox_account, {"link": link, "address": address, "account": account}
 
-    def record_registration_link(self, *, account_id: int, platform_account: Any) -> dict[str, Any] | None:
-        extra = dict(getattr(platform_account, "extra", {}) or {})
+    def _extract_mailbox_material(
+        self,
+        *,
+        extra: dict[str, Any] | None = None,
+        fallback_email: str = "",
+        fallback_provider: str = "",
+    ) -> dict[str, Any]:
+        extra = dict(extra or {})
         identity = dict(extra.get("identity") or {})
         mailbox_snapshot = dict(identity.get("mailbox") or extra.get("verification_mailbox") or {})
-        provider_account = dict(identity.get("provider_account") or {})
-        provider_resource = dict(identity.get("provider_resource") or {})
+        provider_account = dict(identity.get("provider_account") or extra.get("provider_account") or {})
+        provider_resource = dict(identity.get("provider_resource") or extra.get("provider_resource") or {})
         if not provider_account:
             for item in extra.get("provider_accounts") or []:
                 if isinstance(item, dict) and item.get("provider_type") == "mailbox":
@@ -423,8 +429,13 @@ class MailboxStore:
                 if isinstance(item, dict) and item.get("resource_type") == "mailbox":
                     provider_resource = dict(item)
                     break
-        provider = _text(provider_account.get("provider_name") or provider_resource.get("provider_name") or mailbox_snapshot.get("provider"))
-        address = _text(mailbox_snapshot.get("email") or provider_resource.get("handle") or getattr(platform_account, "email", ""))
+        provider = _text(
+            provider_account.get("provider_name")
+            or provider_resource.get("provider_name")
+            or mailbox_snapshot.get("provider")
+            or fallback_provider
+        )
+        address = _text(mailbox_snapshot.get("email") or provider_resource.get("handle") or fallback_email)
         credentials = dict(provider_account.get("credentials") or {})
         parent_email = _text(
             credentials.get("email")
@@ -432,8 +443,34 @@ class MailboxStore:
             or (provider_resource.get("metadata") or {}).get("parent_email")
             or address
         )
+        return {
+            "provider": provider,
+            "address": address,
+            "credentials": credentials,
+            "parent_email": parent_email,
+            "provider_account": provider_account,
+            "provider_resource": provider_resource,
+        }
+
+    def _upsert_mailbox_resource(
+        self,
+        *,
+        provider: str,
+        address: str,
+        credentials: dict[str, Any] | None = None,
+        parent_email: str = "",
+        provider_account: dict[str, Any] | None = None,
+        provider_resource: dict[str, Any] | None = None,
+        reserved_for: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        provider = _text(provider)
+        address = _text(address)
         if not provider or not address:
             return None
+        credentials = dict(credentials or {})
+        parent_email = _text(parent_email or credentials.get("email") or address)
+        provider_account = dict(provider_account or {})
+        provider_resource = dict(provider_resource or {})
         with _LOCK:
             accounts = _read_list(MAILBOX_ACCOUNTS_FILE)
             mailbox_account = next(
@@ -464,18 +501,76 @@ class MailboxStore:
             address=address,
             address_type="alias" if _parent_address(address) == _parent_address(parent_email) and address.lower() != parent_email.lower() else "primary",
             reserved=True,
+            reserved_for=dict(reserved_for or {}),
+            metadata=dict(provider_resource.get("metadata") or {}),
+        )
+        self._refresh_usage(str(mailbox_account["id"]))
+        return {"account": mailbox_account, "address": address_item}
+
+    def record_allocated_mailbox(
+        self,
+        *,
+        platform: str,
+        mailbox_account: Any,
+        provider: str = "",
+        reserved_for: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        if mailbox_account is None:
+            return None
+        mailbox_extra = dict(getattr(mailbox_account, "extra", {}) or {})
+        material = self._extract_mailbox_material(
+            extra={
+                **mailbox_extra,
+                "identity": {
+                    "mailbox": {
+                        "provider": provider,
+                        "email": getattr(mailbox_account, "email", "") or "",
+                        "account_id": str(getattr(mailbox_account, "account_id", "") or ""),
+                    },
+                    "provider_account": mailbox_extra.get("provider_account"),
+                    "provider_resource": mailbox_extra.get("provider_resource"),
+                },
+            },
+            fallback_email=getattr(mailbox_account, "email", "") or "",
+            fallback_provider=provider,
+        )
+        allocation_reserved_for = {"platform": _text(platform) or "chatgpt", "status": "allocated"}
+        allocation_reserved_for.update(dict(reserved_for or {}))
+        return self._upsert_mailbox_resource(
+            provider=material["provider"],
+            address=material["address"],
+            credentials=material["credentials"],
+            parent_email=material["parent_email"],
+            provider_account=material["provider_account"],
+            provider_resource=material["provider_resource"],
+            reserved_for=allocation_reserved_for,
+        )
+
+    def record_registration_link(self, *, account_id: int, platform_account: Any) -> dict[str, Any] | None:
+        material = self._extract_mailbox_material(
+            extra=dict(getattr(platform_account, "extra", {}) or {}),
+            fallback_email=getattr(platform_account, "email", ""),
+        )
+        resource = self._upsert_mailbox_resource(
+            provider=material["provider"],
+            address=material["address"],
+            credentials=material["credentials"],
+            parent_email=material["parent_email"],
+            provider_account=material["provider_account"],
+            provider_resource=material["provider_resource"],
             reserved_for={
                 "platform": getattr(platform_account, "platform", "chatgpt"),
                 "account_id": int(account_id),
-                "email": getattr(platform_account, "email", "") or address,
+                "email": getattr(platform_account, "email", "") or material["address"],
             },
-            metadata=dict(provider_resource.get("metadata") or {}),
         )
+        if not resource:
+            return None
         return self.link_account(
             platform=getattr(platform_account, "platform", "chatgpt") or "chatgpt",
             account_id=int(account_id),
-            account_email=getattr(platform_account, "email", "") or address,
-            mailbox_address_id=str(address_item["id"]),
+            account_email=getattr(platform_account, "email", "") or material["address"],
+            mailbox_address_id=str(resource["address"]["id"]),
             purpose="verification",
         )
 

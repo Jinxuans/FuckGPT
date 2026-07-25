@@ -476,10 +476,13 @@ class BasePlatform(ABC):
                 f"{self.display_name} 暂不支持 identity_provider='{mode}'，"
                 f"当前支持: {self.supported_identity_modes}"
             )
+        extra = dict(self.config.extra or {})
+        extra.setdefault("_platform_name", self.name or "chatgpt")
+        extra.setdefault("_log_fn", self._log_fn)
         return create_identity_provider(
             mode,
             mailbox=getattr(self, "mailbox", None),
-            extra=self.config.extra,
+            extra=extra,
         )
 
     def _resolve_identity(self, email: str = None, *, require_email: bool = True):
