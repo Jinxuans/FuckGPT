@@ -43,7 +43,12 @@ def create_register_task(body: RegisterTaskRequest):
         }
     extra["identity_provider"] = "mailbox"
     mail_provider = str(extra.get("mail_provider") or "").strip()
+    mailbox_address_id = str(extra.get("mailbox_address_id") or "").strip()
+    if mailbox_address_id and (body.count != 1 or body.concurrency != 1):
+        raise HTTPException(400, "指定邮箱注册只支持单账号任务")
     if body.executor_type == "protocol":
+        if mailbox_address_id:
+            raise HTTPException(400, "指定邮箱注册暂不支持协议模式，请使用 headless/headed")
         pool_text = str(extra.get("local_ms_pool_text") or "").strip()
         pool_file = str(extra.get("local_ms_pool_file") or "").strip()
         if not pool_text and not pool_file:

@@ -538,6 +538,24 @@ def _build_platform_instance(platform_name: str, payload: dict[str, Any], logger
     return platform
 
 
+class _FixedMailbox:
+    def __init__(self, mailbox, mailbox_account):
+        self._mailbox = mailbox
+        self._mailbox_account = mailbox_account
+
+    def get_email(self):
+        return self._mailbox_account
+
+    def get_current_ids(self, account):
+        return self._mailbox.get_current_ids(account)
+
+    def wait_for_code(self, account, **kwargs):
+        return self._mailbox.wait_for_code(account, **kwargs)
+
+    def wait_for_link(self, account, **kwargs):
+        return self._mailbox.wait_for_link(account, **kwargs)
+
+
 def _run_single_account_check(account_id: int, logger: TaskLogger | None = None) -> tuple[bool, dict[str, Any]]:
     with Session(engine) as session:
         model = session.get(AccountModel, account_id)
@@ -702,15 +720,35 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
 
         identity_provider = normalize_identity_provider(extra.get("identity_provider", "mailbox"))
         if identity_provider == "mailbox":
-            if not extra.get("mail_provider"):
-                from infrastructure.provider_settings_repository import ProviderSettingsRepository
+            fixed_mailbox_address_id = str(extra.get("mailbox_address_id") or "").strip()
+            if fixed_mailbox_address_id:
+                from core.mailbox_store import MailboxStore
 
-                extra["mail_provider"] = ProviderSettingsRepository().get_default_provider_key("mailbox")
-            shared_mailbox = create_mailbox(
-                provider=extra.get("mail_provider", ""),
-                extra=extra,
-                proxy=resolved_proxy,
-            )
+                mailbox, mailbox_account, mailbox_context = MailboxStore().resolve_mailbox_for_address(
+                    mailbox_address_id=fixed_mailbox_address_id,
+                    proxy=resolved_proxy,
+                    extra=extra,
+                )
+                provider = str(((mailbox_context.get("account") or {}).get("provider")) or "").strip()
+                if provider:
+                    extra["mail_provider"] = provider
+                    payload["extra"] = extra
+                fixed_email = str(getattr(mailbox_account, "email", "") or "").strip()
+                if fixed_email:
+                    payload["email"] = fixed_email
+                    email = fixed_email
+                shared_mailbox = _FixedMailbox(mailbox, mailbox_account)
+                logger.log(f"使用选中邮箱注册: {fixed_email or fixed_mailbox_address_id}")
+            else:
+                if not extra.get("mail_provider"):
+                    from infrastructure.provider_settings_repository import ProviderSettingsRepository
+
+                    extra["mail_provider"] = ProviderSettingsRepository().get_default_provider_key("mailbox")
+                shared_mailbox = create_mailbox(
+                    provider=extra.get("mail_provider", ""),
+                    extra=extra,
+                    proxy=resolved_proxy,
+                )
     except Exception as exc:
         logger.log(f"邮箱初始化失败: {exc}", level="error")
         logger.finish(TASK_STATUS_FAILED, error=f"邮箱初始化失败: {exc}")

@@ -330,6 +330,126 @@ def test_register_api_allows_six_outlook_child_addresses_per_parent(client, monk
     assert "子邮箱容量 6" in rejected.json()["detail"]
 
 
+def test_register_api_rejects_fixed_mailbox_batch(client):
+    response = client.post(
+        "/api/tasks/register",
+        json={
+            "count": 2,
+            "concurrency": 1,
+            "executor_type": "headless",
+            "extra": {"mailbox_address_id": "addr_1"},
+        },
+    )
+
+    assert response.status_code == 400
+    assert "单账号" in response.json()["detail"]
+
+
+def test_register_api_rejects_fixed_mailbox_protocol(client):
+    response = client.post(
+        "/api/tasks/register",
+        json={
+            "count": 1,
+            "concurrency": 1,
+            "executor_type": "protocol",
+            "extra": {
+                "mailbox_address_id": "addr_1",
+                "local_ms_pool_text": "user@outlook.com----mail-pass----client-id----refresh-token",
+            },
+        },
+    )
+
+    assert response.status_code == 400
+    assert "指定邮箱注册" in response.json()["detail"]
+
+
+def test_register_task_uses_fixed_mailbox_address(monkeypatch):
+    captured = {}
+
+    class FakeMailbox:
+        def get_current_ids(self, account):
+            captured["current_ids_account"] = account
+            return set()
+
+    class FakeStore:
+        def resolve_mailbox_for_address(self, *, mailbox_address_id, proxy=None, extra=None):
+            captured["mailbox_address_id"] = mailbox_address_id
+            captured["proxy"] = proxy
+            captured["extra"] = dict(extra or {})
+            mailbox_account = type(
+                "MailboxAccountStub",
+                (),
+                {"email": "fixed@example.com", "account_id": mailbox_address_id},
+            )()
+            return FakeMailbox(), mailbox_account, {"account": {"provider": "api_mailbox"}}
+
+        def record_registration_link(self, *, account_id, platform_account):
+            captured["linked"] = (account_id, platform_account.email)
+
+    class FakePlatform:
+        def __init__(self, *args, **kwargs):
+            captured["platform_mailbox"] = kwargs.get("mailbox")
+
+        def set_logger(self, logger):
+            self.logger = logger
+
+        def register(self, email=None, password=None):
+            captured["register_email"] = email
+            captured["provided_mailbox_email"] = captured["platform_mailbox"].get_email().email
+            return Account(
+                platform="chatgpt",
+                email=email or "fixed@example.com",
+                password=password or "Secret123!",
+                extra={
+                    "access_token": "access-token",
+                    "provider_accounts": [
+                        {
+                            "provider_type": "mailbox",
+                            "provider_name": "api_mailbox",
+                            "login_identifier": "fixed@example.com",
+                        }
+                    ],
+                },
+            )
+
+    monkeypatch.setattr(tasks_module, "get", lambda platform_name: FakePlatform)
+    monkeypatch.setattr(
+        tasks_module,
+        "_resolve_registration_proxy_for_platform",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        "core.mailbox_store.MailboxStore",
+        lambda: FakeStore(),
+    )
+    monkeypatch.setattr(
+        tasks_module,
+        "save_account",
+        lambda account: type("SavedAccount", (), {"id": 456})(),
+    )
+
+    logger = _FakeLogger()
+    tasks_module._execute_register_task(
+        {
+            "platform": "chatgpt",
+            "count": 1,
+            "concurrency": 1,
+            "executor_type": "headless",
+            "extra": {
+                "identity_provider": "mailbox",
+                "mailbox_address_id": "addr_fixed",
+            },
+        },
+        logger,
+    )
+
+    assert logger.finished == (tasks_module.TASK_STATUS_SUCCEEDED, "")
+    assert captured["mailbox_address_id"] == "addr_fixed"
+    assert captured["register_email"] == "fixed@example.com"
+    assert captured["provided_mailbox_email"] == "fixed@example.com"
+    assert captured["linked"] == (456, "fixed@example.com")
+
+
 def test_register_api_rejects_protocol_without_outlook_pool(client):
     response = client.post(
         "/api/tasks/register",
