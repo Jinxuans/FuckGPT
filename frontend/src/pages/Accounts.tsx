@@ -1811,9 +1811,23 @@ export default function Accounts() {
               onClick={async () => {
                 setBatchRefreshing(true)
                 try {
-                  const res = await apiFetch(`/accounts/check-all?platform=${tab}`, { method: 'POST' })
+                  const hasSelection = selectedIds.size > 0
+                  const targetCount = hasSelection ? selectedIds.size : total
+                  const res = await apiFetch('/accounts/check-all', {
+                    method: 'POST',
+                    body: JSON.stringify({
+                      platform: tab,
+                      ids: hasSelection ? [...selectedIds] : [],
+                      select_all: !hasSelection,
+                      status_filter: !hasSelection ? filterStatus || '' : '',
+                      search_filter: !hasSelection ? debouncedSearch || '' : '',
+                    }),
+                  })
                   if (res?.task_id) {
-                    setBatchTask({ taskId: res.task_id, title: t('accounts.refreshAllCreditsTask', { platform: platformLabel }) })
+                    setBatchTask({
+                      taskId: res.task_id,
+                      title: `${t('accounts.refreshAllCreditsTask', { platform: platformLabel })} (${targetCount})`,
+                    })
                     setBatchTaskStatus(null)
                   }
                 } catch (e) {

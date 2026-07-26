@@ -5,9 +5,12 @@ import base64
 import json
 from datetime import datetime, timedelta, timezone
 
+from sqlmodel import Session
+
 from application.account_exports import AccountExportsService
+from core.account_graph import patch_account_graph
 from core.base_platform import Account
-from core.db import save_account
+from core.db import AccountModel, TaskModel, engine, save_account
 from domain.accounts import AccountExportSelection, AccountQuery
 from infrastructure.accounts_repository import AccountsRepository
 
@@ -122,6 +125,61 @@ def test_account_stats(client):
     _create_account()
     resp = client.get("/api/accounts/stats")
     assert resp.status_code == 200
+
+
+def test_check_all_uses_selected_account_ids(client):
+    first_id = _create_account(email="first-check@test.com")
+    _create_account(email="second-check@test.com")
+    third_id = _create_account(email="third-check@test.com")
+
+    resp = client.post(
+        "/api/accounts/check-all",
+        json={
+            "platform": "chatgpt",
+            "ids": [first_id, third_id],
+            "select_all": False,
+        },
+    )
+
+    assert resp.status_code == 200
+    task_id = resp.json()["task_id"]
+    with Session(engine) as session:
+        task = session.get(TaskModel, task_id)
+        payload = task.get_payload()
+    assert set(payload["account_ids"]) == {first_id, third_id}
+    assert payload["platform"] == "chatgpt"
+
+
+def test_check_all_freezes_filtered_account_ids(client):
+    _create_account(email="target-free@test.com")
+    subscribed_id = _create_account(email="target-plus@test.com")
+    _create_account(email="other-plus@test.com")
+
+    with Session(engine) as session:
+        model = session.get(AccountModel, subscribed_id)
+        patch_account_graph(
+            session,
+            model,
+            summary_updates={"plan": "plus", "plan_state": "subscribed"},
+        )
+        session.commit()
+
+    resp = client.post(
+        "/api/accounts/check-all",
+        json={
+            "platform": "chatgpt",
+            "select_all": True,
+            "search_filter": "target",
+            "status_filter": "subscribed",
+        },
+    )
+
+    assert resp.status_code == 200
+    task_id = resp.json()["task_id"]
+    with Session(engine) as session:
+        task = session.get(TaskModel, task_id)
+        payload = task.get_payload()
+    assert payload["account_ids"] == [subscribed_id]
 
 
 def test_export_any2api_multi_platform(client):

@@ -235,12 +235,22 @@ def create_register_task(payload: dict[str, Any]) -> dict[str, Any]:
     )
 
 
-def create_account_check_all_task(platform: str = "", limit: int = 50) -> dict[str, Any]:
+def create_account_check_all_task(
+    platform: str = "",
+    limit: int = 50,
+    account_ids: list[int] | None = None,
+) -> dict[str, Any]:
+    normalized_ids = [int(item) for item in account_ids or [] if int(item or 0) > 0]
+    payload: dict[str, Any] = {"platform": platform, "limit": int(limit or 50)}
+    progress_total = max(int(limit or 50), 1)
+    if account_ids is not None:
+        payload["account_ids"] = normalized_ids
+        progress_total = len(normalized_ids)
     return create_task(
         task_type=TASK_TYPE_ACCOUNT_CHECK_ALL,
         platform=platform,
-        payload={"platform": platform, "limit": int(limit or 50)},
-        progress_total=max(int(limit or 50), 1),
+        payload=payload,
+        progress_total=progress_total,
     )
 
 
@@ -903,13 +913,25 @@ def _execute_platform_action_task(payload: dict[str, Any], logger: TaskLogger) -
 def _execute_account_check_all_task(payload: dict[str, Any], logger: TaskLogger) -> None:
     platform = str(payload.get("platform", "") or "")
     limit = max(int(payload.get("limit", 50) or 50), 1)
+    account_ids = [
+        int(item)
+        for item in payload.get("account_ids", [])
+        if int(item or 0) > 0
+    ]
 
     with Session(engine) as session:
         q = select(AccountModel)
+        if account_ids:
+            q = q.where(AccountModel.id.in_(account_ids))
+        elif "account_ids" in payload:
+            q = q.where(AccountModel.id == -1)
         if platform:
             q = q.where(AccountModel.platform == platform)
         q = q.order_by(AccountModel.created_at.desc(), AccountModel.id.desc())
-        accounts = session.exec(q.limit(limit)).all()
+        if account_ids or "account_ids" in payload:
+            accounts = session.exec(q).all()
+        else:
+            accounts = session.exec(q.limit(limit)).all()
 
     total = len(accounts)
     logger.set_progress(0, total)
