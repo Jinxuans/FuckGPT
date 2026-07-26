@@ -55,9 +55,11 @@ def build_otp_callback(
     if not mailbox or not mail_acct:
         return None
 
+    before_ids_ref = {"value": getattr(ctx.identity, "before_ids", set())}
+
     def otp_cb():
         ctx.log(wait_message)
-        kwargs = {"keyword": keyword, "before_ids": getattr(ctx.identity, "before_ids", set())}
+        kwargs = {"keyword": keyword, "before_ids": before_ids_ref["value"]}
         if timeout is not None:
             kwargs["timeout"] = timeout
         if code_pattern:
@@ -66,6 +68,12 @@ def build_otp_callback(
         if code:
             ctx.log(f"{success_label}: {code}")
         return code
+
+    def refresh_before_ids():
+        before_ids_ref["value"] = mailbox.get_current_ids(mail_acct)
+        return before_ids_ref["value"]
+
+    otp_cb.refresh_before_ids = refresh_before_ids  # type: ignore[attr-defined]
 
     return otp_cb
 

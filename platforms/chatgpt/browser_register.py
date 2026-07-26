@@ -559,6 +559,9 @@ def _extract_auth_error_text(page) -> str:
         "text=Sorry, we cannot create your account",
         "text=Please try again",
         "text=Invalid code",
+        "text=Incorrect code",
+        "text=验证码错误",
+        "text=验证码无效",
         "text=Enter a valid age to continue",
         "text=doesn't look right",
         "[role='alert']",
@@ -571,6 +574,13 @@ def _extract_auth_error_text(page) -> str:
             text = ""
         if text and "oai_log" not in text and "SSR_HTML" not in text:
             return text
+    try:
+        body_text = str(page.locator("body").inner_text(timeout=350) or "").strip()
+    except Exception:
+        body_text = ""
+    for token in ("Invalid code", "Incorrect code", "验证码错误", "验证码无效"):
+        if token in body_text:
+            return token
     return ""
 
 
@@ -1711,7 +1721,13 @@ def _submit_password_via_page(page, password: str, log) -> dict:
     return {"ok": False, "status": 0, "url": last_url, "data": None, "text": "密码页提交后未跳转"}
 
 
-def _submit_otp_via_page(page, code: str, log) -> dict:
+def _submit_otp_via_page(
+    page,
+    code: str,
+    log,
+    otp_callback: Callable[[], str] | None = None,
+    resend_attempts: int = 0,
+) -> dict:
     otp = str(code or "").strip()
     if not otp:
         return {"ok": False, "status": 400, "url": page.url, "data": None, "text": "验证码为空"}
@@ -1798,6 +1814,58 @@ def _submit_otp_via_page(page, code: str, log) -> dict:
                 continue
 
     if not filled:
+        try:
+            result = page.evaluate(
+                """
+                (otp) => {
+                  const visible = (el) => {
+                    if (!el) return false;
+                    const style = window.getComputedStyle(el);
+                    const rect = el.getBoundingClientRect();
+                    return style && style.display !== 'none' && style.visibility !== 'hidden'
+                      && rect.width > 0 && rect.height > 0;
+                  };
+                  const selectors = [
+                    'input[autocomplete="one-time-code"]',
+                    'input[name="code"]',
+                    'input[name*="code" i]',
+                    'input[id*="code" i]',
+                    'input[inputmode="numeric"]',
+                    'input[type="text"]',
+                  ];
+                  let input = null;
+                  let selector = '';
+                  for (const candidate of selectors) {
+                    input = Array.from(document.querySelectorAll(candidate))
+                      .find((el) => visible(el) && !el.disabled && !el.readOnly);
+                    if (input) {
+                      selector = candidate;
+                      break;
+                    }
+                  }
+                  if (!input) return { ok: false, reason: 'no-input' };
+                  input.focus();
+                  const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
+                  if (setter) setter.call(input, '');
+                  else input.value = '';
+                  input.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'deleteContentBackward', data: null }));
+                  if (setter) setter.call(input, otp);
+                  else input.value = otp;
+                  input.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: otp }));
+                  input.dispatchEvent(new Event('change', { bubbles: true }));
+                  input.dispatchEvent(new Event('blur', { bubbles: true }));
+                  return { ok: String(input.value || '').trim() === String(otp), selector, value: String(input.value || '') };
+                }
+                """,
+                otp,
+            )
+            if isinstance(result, dict) and result.get("ok"):
+                filled = True
+                log(f"验证码页已使用 DOM fallback 填写输入框: {result.get('selector') or '-'}")
+        except Exception as exc:
+            log(f"验证码页 DOM fallback 填写失败: {exc}")
+
+    if not filled:
         return {"ok": False, "status": 0, "url": page.url, "data": None, "text": "验证码页未找到可填写输入框"}
 
     _browser_pause(page)
@@ -1834,10 +1902,42 @@ def _submit_otp_via_page(page, code: str, log) -> dict:
             return {"ok": True, "status": 200, "url": current_url, "data": None, "text": ""}
         if "consent" in current_url or "sign-in-with-chatgpt" in current_url or "workspace" in current_url or "organization" in current_url:
             return {"ok": True, "status": 200, "url": current_url, "data": None, "text": ""}
-        try:
-            error_text = page.locator("text=Invalid code").first.text_content(timeout=400)
-        except Exception:
-            error_text = ""
+        error_text = _extract_auth_error_text(page)
+        normalized_error = str(error_text or "").lower()
+        incorrect_code = any(token in normalized_error for token in ("invalid code", "incorrect code", "验证码错误", "验证码无效"))
+        if incorrect_code and callable(otp_callback) and resend_attempts < 2:
+            resend_attempts += 1
+            refresh_before_ids = getattr(otp_callback, "refresh_before_ids", None)
+            if callable(refresh_before_ids):
+                try:
+                    refresh_before_ids()
+                except Exception as exc:
+                    log(f"验证码页刷新邮件基线失败: {exc}")
+            resend_selector = _click_first(
+                page,
+                [
+                    'button[type="submit"][name="intent"][value="resend"]',
+                    'button:has-text("Resend email")',
+                    'button:has-text("Resend")',
+                    'button:has-text("重新发送")',
+                    'button:has-text("重发")',
+                ],
+                timeout=5,
+            )
+            if not resend_selector:
+                return {"ok": False, "status": 400, "url": current_url, "data": None, "text": error_text}
+            log(f"验证码错误，已重发邮件 ({resend_attempts}/2): {resend_selector}")
+            time.sleep(1)
+            new_code = str(otp_callback() or "").strip()
+            if not new_code:
+                return {"ok": False, "status": 400, "url": current_url, "data": None, "text": "重发验证码后未获取到新验证码"}
+            return _submit_otp_via_page(
+                page,
+                new_code,
+                log,
+                otp_callback=otp_callback,
+                resend_attempts=resend_attempts,
+            )
         if error_text:
             return {"ok": False, "status": 400, "url": current_url, "data": None, "text": error_text}
         time.sleep(0.5)
@@ -2241,6 +2341,36 @@ def _submit_about_you_via_page(page, log) -> dict:
     def _fill_segmented_date(mm: str, dd: str, yyyy: str) -> bool:
         """处理 MM / DD / YYYY 分段日期输入框（React DateField 样式）。
         特征：一个 Birthday label 下有多个小 input 或 div[data-type] 段。"""
+        def _clear_focused_segment() -> None:
+            for shortcut in ("Control+A", "Meta+A"):
+                try:
+                    page.keyboard.press(shortcut)
+                    page.keyboard.press("Backspace")
+                    time.sleep(0.1)
+                    return
+                except Exception:
+                    continue
+
+        def _typed_year_is_four_digits() -> bool:
+            try:
+                return bool(
+                    page.evaluate(
+                        """
+                        (expectedYear) => {
+                          const text = String(document.body?.innerText || '');
+                          const active = document.activeElement;
+                          const activeText = String(active?.value || active?.textContent || '').trim();
+                          const yearNodes = Array.from(document.querySelectorAll('[data-type="year"], input[placeholder*="YYYY" i], input[aria-label*="year" i]'));
+                          const yearText = yearNodes.map((node) => String(node.value || node.textContent || '').trim()).join(' ');
+                          return activeText.includes(expectedYear) || yearText.includes(expectedYear) || text.includes(expectedYear);
+                        }
+                        """,
+                        yyyy,
+                    )
+                )
+            except Exception:
+                return False
+
         try:
             # 方式1: div[data-type] 段 (React Aria DateField)
             month_seg = page.locator('div[data-type="month"], input[data-type="month"]')
@@ -2248,14 +2378,19 @@ def _submit_about_you_via_page(page, log) -> dict:
             year_seg = page.locator('div[data-type="year"], input[data-type="year"]')
             if month_seg.count() > 0 and day_seg.count() > 0 and year_seg.count() > 0:
                 month_seg.first.click(force=True)
+                _clear_focused_segment()
                 page.keyboard.type(mm, delay=50)
                 time.sleep(0.3)
                 day_seg.first.click(force=True)
+                _clear_focused_segment()
                 page.keyboard.type(dd, delay=50)
                 time.sleep(0.3)
                 year_seg.first.click(force=True)
+                _clear_focused_segment()
                 page.keyboard.type(yyyy, delay=50)
-                return True
+                time.sleep(0.3)
+                if _typed_year_is_four_digits():
+                    return True
 
             # 方式2: 单个 date input 里有 MM/DD/YYYY 占位符
             # 点击输入框，然后按顺序输入 MM DD YYYY（Tab 切换段）
@@ -2263,20 +2398,24 @@ def _submit_about_you_via_page(page, log) -> dict:
             if date_input.count() > 0:
                 date_input.first.click(force=True)
                 time.sleep(0.2)
-                page.keyboard.type(mm, delay=50)
-                page.keyboard.type(dd, delay=50)
-                page.keyboard.type(yyyy, delay=50)
-                return True
+                page.keyboard.press("Control+A")
+                page.keyboard.press("Backspace")
+                page.keyboard.type(f"{mm}/{dd}/{yyyy}", delay=50)
+                time.sleep(0.3)
+                if _typed_year_is_four_digits():
+                    return True
 
             # 方式3: Birthday label 下的第二个可见 input，直接点击后按数字键输入
             birthday_input = page.get_by_label(re.compile(r"birthday|birth", re.IGNORECASE))
             if birthday_input.count() > 0:
                 birthday_input.first.click(force=True)
                 time.sleep(0.2)
-                page.keyboard.type(mm, delay=50)
-                page.keyboard.type(dd, delay=50)
-                page.keyboard.type(yyyy, delay=50)
-                return True
+                page.keyboard.press("Control+A")
+                page.keyboard.press("Backspace")
+                page.keyboard.type(f"{mm}/{dd}/{yyyy}", delay=50)
+                time.sleep(0.3)
+                if _typed_year_is_four_digits():
+                    return True
 
             # 方式4: 第二个可见 input（name 是第一个）
             inputs = page.locator("input:visible:not([type='hidden']):not([disabled])")
@@ -2289,15 +2428,11 @@ def _submit_about_you_via_page(page, log) -> dict:
                 page.keyboard.press("Backspace")
                 time.sleep(0.1)
                 # 输入 MM，Tab 到 DD，Tab 到 YYYY
-                page.keyboard.type(mm, delay=80)
-                time.sleep(0.3)
-                page.keyboard.type(dd, delay=80)
-                time.sleep(0.3)
-                page.keyboard.type(yyyy, delay=80)
+                page.keyboard.type(f"{mm}/{dd}/{yyyy}", delay=80)
                 time.sleep(0.3)
                 # 验证是否填入了正确的值
                 val = str(target.input_value() or "").strip()
-                if val and val != target.get_attribute("placeholder"):
+                if yyyy in val:
                     return True
                 # 如果直接输入不行，试 Tab 切换
                 target.click(force=True)
@@ -2309,7 +2444,8 @@ def _submit_about_you_via_page(page, log) -> dict:
                     if i < 2:
                         page.keyboard.press("Tab")
                         time.sleep(0.2)
-                return True
+                time.sleep(0.3)
+                return _typed_year_is_four_digits()
         except Exception:
             pass
         return False
@@ -2582,7 +2718,7 @@ def _browser_registration_flow(page, email: str, password: str, otp_callback, lo
             code = otp_callback()
             if not code:
                 raise RuntimeError("未获取到验证码")
-            otp_resp = _submit_otp_via_page(page, code, log)
+            otp_resp = _submit_otp_via_page(page, code, log, otp_callback=otp_callback)
             log(f"验证码页提交状态: {otp_resp.get('status', 0)}")
             if not otp_resp.get("ok"):
                 raise RuntimeError(f"验证码校验失败: {(otp_resp.get('text') or '')[:300]}")
