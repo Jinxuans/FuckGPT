@@ -51,6 +51,7 @@ FuckGPT 是一个面向本地自用的 ChatGPT/Codex 账号注册、管理、邮
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
+python scripts/bootstrap_browser_assets.py
 
 cd frontend
 npm install
@@ -68,6 +69,7 @@ python -m uvicorn main:app --host 0.0.0.0 --port 8000
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+python scripts/bootstrap_browser_assets.py
 
 cd frontend
 npm install
@@ -106,10 +108,10 @@ APP_PASSWORD=change-me
 ACCOUNT_MANAGER_DATABASE_URL=sqlite:///./data/account_manager.db
 ```
 
-本地浏览器自动化相关能力需要安装浏览器运行时：
+本地浏览器自动化相关能力需要安装浏览器运行时和 GeoIP 数据库：
 
 ```bash
-python -m playwright install chromium
+python scripts/bootstrap_browser_assets.py
 ```
 
 ## 项目结构

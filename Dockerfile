@@ -28,13 +28,14 @@ WORKDIR /app
 # 安装 Python 依赖（包含 Solver 依赖：patchright, quart, rich）
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
+COPY scripts/bootstrap_browser_assets.py ./scripts/bootstrap_browser_assets.py
 
 # 安装 patchright/playwright 浏览器（Solver 使用）
 ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 RUN playwright install --with-deps chromium
 
-# 安装 camoufox 浏览器（Solver 的 camoufox 模式使用）
-RUN python -m camoufox fetch
+# 安装 camoufox 浏览器和 GeoIP 数据库（避免任务运行中首次下载）
+RUN python scripts/bootstrap_browser_assets.py --skip-playwright
 
 # 复制后端代码
 ARG APP_VERSION=dev
