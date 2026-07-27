@@ -9,6 +9,12 @@ from core.base_platform import RegisterConfig
 from core.account_graph import patch_account_graph
 from core.db import AccountModel, engine
 from core.platform_accounts import build_platform_account
+from core.proxy_resolution import (
+    PROXY_MODE_DIRECT,
+    mask_proxy_url,
+    normalize_proxy_mode,
+    resolve_proxy_by_mode,
+)
 from core.registry import get, list_platforms, load_all
 from domain.actions import (
     ActionExecutionCommand,
@@ -301,9 +307,35 @@ class PlatformRuntime:
                 return ActionExecutionResult(ok=False, error="账号不存在")
 
             platform_cls = get(command.platform)
-            instance = platform_cls(config=RegisterConfig())
+            params = dict(command.params or {})
+            proxy_mode = normalize_proxy_mode(
+                str(params.get("platform_proxy_mode") or "").strip(),
+                default=PROXY_MODE_DIRECT,
+            )
+            proxy_value = str(params.get("platform_proxy_value") or "").strip()
+            try:
+                from core.proxy_pool import proxy_pool
+
+                action_proxy = resolve_proxy_by_mode(
+                    proxy_mode,
+                    manual_proxy=proxy_value,
+                    proxy_getter=proxy_pool.get_next,
+                )
+            except Exception:
+                action_proxy = None
+            instance = platform_cls(
+                config=RegisterConfig(
+                    proxy=action_proxy,
+                    extra={"disable_proxy_pool": proxy_mode == PROXY_MODE_DIRECT},
+                )
+            )
             if log_fn:
                 instance.set_logger(log_fn)
+                if params.get("platform_proxy_mode") or action_proxy:
+                    log_fn(
+                        f"ChatGPT/Codex 代理: {mask_proxy_url(action_proxy) if action_proxy else '直连'}"
+                        f"（{proxy_mode}）"
+                    )
             if callable(cancel_check):
                 if hasattr(instance, "set_cancel_checker"):
                     instance.set_cancel_checker(cancel_check)

@@ -152,6 +152,29 @@ def test_check_all_uses_selected_account_ids(client):
     assert payload["platform"] == "chatgpt"
 
 
+def test_check_all_persists_platform_proxy_strategy(client):
+    account_id = _create_account(email="proxy-check@test.com")
+
+    resp = client.post(
+        "/api/accounts/check-all",
+        json={
+            "platform": "chatgpt",
+            "ids": [account_id],
+            "select_all": False,
+            "platform_proxy_mode": "manual",
+            "platform_proxy_value": "socks5://user:pass@proxy.example:1080",
+        },
+    )
+
+    assert resp.status_code == 200
+    task_id = resp.json()["task_id"]
+    with Session(engine) as session:
+        task = session.get(TaskModel, task_id)
+        payload = task.get_payload()
+    assert payload["platform_proxy_mode"] == "manual"
+    assert payload["platform_proxy_value"] == "socks5://user:pass@proxy.example:1080"
+
+
 def test_check_all_freezes_filtered_account_ids(client):
     _create_account(email="target-free@test.com")
     subscribed_id = _create_account(email="target-plus@test.com")

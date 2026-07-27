@@ -200,10 +200,11 @@ class ChatGPTPlatform(BasePlatform):
 
             region = str(getattr(account, "region", "") or extra.get("region", "") or "").strip()
             configured_proxy = self.config.proxy if self.config else None
+            disable_proxy_pool = _truthy((self.config.extra or {}).get("disable_proxy_pool")) if self.config else False
             proxy_candidates: list[tuple[str | None, bool]] = []
             if configured_proxy:
                 proxy_candidates.append((configured_proxy, False))
-            else:
+            elif not disable_proxy_pool:
                 pooled_proxy = proxy_pool.get_next(region=region)
                 if pooled_proxy:
                     proxy_candidates.append((pooled_proxy, True))
@@ -365,14 +366,19 @@ class ChatGPTPlatform(BasePlatform):
         )
 
     def get_platform_actions(self) -> list:
+        proxy_params = [
+            {"key": "platform_proxy_mode", "label": "ChatGPT/Codex 代理", "type": "select", "options": ["direct", "manual", "proxy_service"]},
+            {"key": "platform_proxy_value", "label": "手动代理 URL", "type": "text"},
+        ]
         return [
             {"id": "switch_account", "label": "切换到 Codex 桌面端", "params": []},
             {"id": "codex_oauth_authorize", "label": "Codex OAuth 授权",
              "params": [
-                 {"key": "browser_mode", "label": "浏览器模式", "type": "text", "options": ["headed", "headless"]},
+                 {"key": "browser_mode", "label": "浏览器模式", "type": "select", "options": ["headless", "headed"]},
                  {"key": "keep_browser_open", "label": "完成后保留浏览器窗口", "type": "select", "options": ["false", "true"]},
+                 *proxy_params,
              ]},
-            {"id": "get_account_state", "label": "查询账号状态/订阅", "params": []},
+            {"id": "get_account_state", "label": "查询账号状态/订阅", "params": proxy_params},
             {"id": "upload_cpa", "label": "上传 CPA",
              "params": [
                  {"key": "api_url", "label": "CPA API URL", "type": "text"},
@@ -403,6 +409,7 @@ class ChatGPTPlatform(BasePlatform):
     def _execute_platform_action(self, action_id: str, account: Account, params: dict) -> dict:
         """Handle ChatGPT-specific actions."""
         proxy = self.config.proxy if self.config else None
+        mailbox_proxy = str((self.config.extra or {}).get("mailbox_proxy") or "").strip() if self.config else ""
         extra = account.extra or {}
 
         class _A: pass
@@ -427,7 +434,7 @@ class ChatGPTPlatform(BasePlatform):
                 return {"ok": False, "error": "Codex OAuth 授权需要账号密码"}
             browser_mode = str(params.get("browser_mode") or "").strip().lower()
             if not browser_mode:
-                browser_mode = str((self.config.extra or {}).get("codex_oauth_browser_mode") or "headed").strip().lower()
+                browser_mode = str((self.config.extra or {}).get("codex_oauth_browser_mode") or "headless").strip().lower()
             headless = browser_mode in {"headless", "true", "1", "yes", "后台", "后台浏览器"}
             keep_browser_open = _truthy(params.get("keep_browser_open") or (self.config.extra or {}).get("codex_oauth_keep_browser_open"))
             otp_callback = None
@@ -437,7 +444,7 @@ class ChatGPTPlatform(BasePlatform):
                 mailbox, mailbox_account, _mailbox_context = MailboxStore().resolve_mailbox_for_account(
                     platform="chatgpt",
                     account_id=int(getattr(account, "id", 0) or 0) if getattr(account, "id", None) else 0,
-                    proxy=proxy,
+                    proxy=mailbox_proxy or None,
                     extra=self.config.extra if self.config else {},
                 )
                 before_ids = mailbox.get_current_ids(mailbox_account)

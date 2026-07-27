@@ -15,6 +15,8 @@ class AccountCheckAllRequest(BaseModel):
     select_all: bool | None = None
     status_filter: str = ""
     search_filter: str = ""
+    platform_proxy_mode: str = ""
+    platform_proxy_value: str = ""
 
 
 @router.post("/check-all")
@@ -27,4 +29,6 @@ def check_all_accounts(body: AccountCheckAllRequest | None = None, platform: str
         select_all=body.select_all,
         status_filter=body.status_filter,
         search_filter=body.search_filter,
+        platform_proxy_mode=body.platform_proxy_mode,
+        platform_proxy_value=body.platform_proxy_value,
     )

@@ -21,6 +21,15 @@ from core.base_platform import AccountStatus, RegisterConfig
 from core.datetime_utils import format_local_clock, serialize_datetime
 from core.db import AccountModel, TaskEventModel, TaskModel, engine, save_account
 from core.platform_accounts import build_platform_account
+from core.proxy_resolution import (
+    PROXY_MODE_DIRECT,
+    PROXY_MODE_FOLLOW_PLATFORM,
+    PROXY_MODE_MANUAL,
+    PROXY_MODE_PROXY_SERVICE,
+    mask_proxy_url,
+    normalize_proxy_mode,
+    resolve_proxy_by_mode,
+)
 from core.registry import get
 from infrastructure.platform_runtime import PlatformRuntime
 
@@ -240,9 +249,15 @@ def create_account_check_all_task(
     platform: str = "",
     limit: int = 50,
     account_ids: list[int] | None = None,
+    platform_proxy_mode: str = "",
+    platform_proxy_value: str = "",
 ) -> dict[str, Any]:
     normalized_ids = [int(item) for item in account_ids or [] if int(item or 0) > 0]
     payload: dict[str, Any] = {"platform": platform, "limit": int(limit or 50)}
+    if platform_proxy_mode:
+        payload["platform_proxy_mode"] = platform_proxy_mode
+    if platform_proxy_value:
+        payload["platform_proxy_value"] = platform_proxy_value
     progress_total = max(int(limit or 50), 1)
     if account_ids is not None:
         payload["account_ids"] = normalized_ids
@@ -598,7 +613,14 @@ class TaskLogger:
         )
 
 
-def _build_platform_instance(platform_name: str, payload: dict[str, Any], logger: TaskLogger, resolved_proxy: str | None = None, shared_mailbox=None):
+def _build_platform_instance(
+    platform_name: str,
+    payload: dict[str, Any],
+    logger: TaskLogger,
+    platform_proxy: str | None = None,
+    mailbox_proxy: str | None = None,
+    shared_mailbox=None,
+):
     from core.base_identity import normalize_identity_provider
     from core.base_mailbox import create_mailbox
 
@@ -606,10 +628,11 @@ def _build_platform_instance(platform_name: str, payload: dict[str, Any], logger
     captcha_solver = str(payload.get("captcha_solver", "auto") or "auto")
     extra = dict(payload.get("extra") or {})
     extra["_log_fn"] = logger.log
+    extra["mailbox_proxy"] = mailbox_proxy or ""
     config = RegisterConfig(
         executor_type=executor_type,
         captcha_solver=captcha_solver,
-        proxy=resolved_proxy,
+        proxy=platform_proxy,
         extra=extra,
     )
     identity_provider = normalize_identity_provider(extra.get("identity_provider", "mailbox"))
@@ -622,7 +645,7 @@ def _build_platform_instance(platform_name: str, payload: dict[str, Any], logger
         mailbox = create_mailbox(
             provider=extra.get("mail_provider", ""),
             extra=extra,
-            proxy=resolved_proxy,
+            proxy=mailbox_proxy,
         )
 
     platform_cls = get(platform_name)
@@ -652,12 +675,23 @@ class _FixedMailbox:
         return self._mailbox.wait_for_link(account, **kwargs)
 
 
-def _run_single_account_check(account_id: int, logger: TaskLogger | None = None) -> tuple[bool, dict[str, Any]]:
+def _run_single_account_check(
+    account_id: int,
+    logger: TaskLogger | None = None,
+    *,
+    proxy: str | None = None,
+    disable_proxy_pool: bool = False,
+) -> tuple[bool, dict[str, Any]]:
     with Session(engine) as session:
         model = session.get(AccountModel, account_id)
         if not model:
             raise ValueError("账号不存在")
-        plugin = get(model.platform)(config=RegisterConfig())
+        plugin = get(model.platform)(
+            config=RegisterConfig(
+                proxy=proxy,
+                extra={"disable_proxy_pool": bool(disable_proxy_pool)},
+            )
+        )
         account = build_platform_account(session, model)
 
     valid = plugin.check_valid(account)
@@ -743,6 +777,51 @@ def _resolve_registration_proxy_for_platform(
     return normalized_explicit_proxy or proxy_getter()
 
 
+def _registration_platform_proxy(payload: dict[str, Any], proxy_getter: Callable[[], str | None]) -> tuple[str | None, str]:
+    explicit_proxy = str(payload.get("proxy") or "").strip() or None
+    mode = normalize_proxy_mode(
+        str(payload.get("platform_proxy_mode") or "").strip(),
+        default=PROXY_MODE_MANUAL if explicit_proxy else PROXY_MODE_DIRECT,
+    )
+    proxy = resolve_proxy_by_mode(
+        mode,
+        manual_proxy=str(payload.get("platform_proxy_value") or "").strip() or explicit_proxy,
+        proxy_getter=proxy_getter,
+    )
+    return proxy, mode
+
+
+def _registration_mailbox_proxy(
+    payload: dict[str, Any],
+    *,
+    platform_proxy: str | None,
+    proxy_getter: Callable[[], str | None],
+) -> tuple[str | None, str]:
+    legacy_explicit_proxy = str(payload.get("proxy") or "").strip() or None
+    default_mode = PROXY_MODE_FOLLOW_PLATFORM if legacy_explicit_proxy and not payload.get("mailbox_proxy_mode") else PROXY_MODE_DIRECT
+    mode = normalize_proxy_mode(str(payload.get("mailbox_proxy_mode") or "").strip(), default=default_mode)
+    proxy = resolve_proxy_by_mode(
+        mode,
+        manual_proxy=str(payload.get("mailbox_proxy_value") or "").strip(),
+        follow_proxy=platform_proxy,
+        proxy_getter=proxy_getter,
+    )
+    return proxy, mode
+
+
+def _check_task_proxy(payload: dict[str, Any], proxy_getter: Callable[[], str | None]) -> tuple[str | None, str, bool]:
+    mode = normalize_proxy_mode(
+        str(payload.get("platform_proxy_mode") or "").strip(),
+        default=PROXY_MODE_PROXY_SERVICE,
+    )
+    proxy = resolve_proxy_by_mode(
+        mode,
+        manual_proxy=str(payload.get("platform_proxy_value") or payload.get("proxy") or "").strip(),
+        proxy_getter=proxy_getter,
+    )
+    return proxy, mode, mode == PROXY_MODE_DIRECT
+
+
 def _registration_concurrency(requested: Any, count: int) -> int:
     return min(
         max(int(requested or 1), 1),
@@ -780,7 +859,6 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
     platform_name = "chatgpt"
     email = payload.get("email") or None
     password = payload.get("password") or None
-    explicit_proxy = str(payload.get("proxy") or "").strip() or None
     extra = dict(payload.get("extra") or {})
     extra["_log_fn"] = logger.log
     task_id = str(getattr(logger, "task_id", "") or "")
@@ -790,11 +868,14 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
         if sub2api_upload_enabled and task_id
         else None
     )
-    resolved_proxy = _resolve_registration_proxy_for_platform(
-        platform_name,
-        explicit_proxy=explicit_proxy,
+    platform_proxy, platform_proxy_mode = _registration_platform_proxy(payload, proxy_pool.get_next)
+    mailbox_proxy, mailbox_proxy_mode = _registration_mailbox_proxy(
+        payload,
+        platform_proxy=platform_proxy,
         proxy_getter=proxy_pool.get_next,
     )
+    extra["mailbox_proxy"] = mailbox_proxy or ""
+    payload["extra"] = extra
 
     logger.set_progress(0, count)
     if sub2api_upload_enabled and not sub2api_upload_config:
@@ -822,7 +903,7 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
 
                 mailbox, mailbox_account, mailbox_context = MailboxStore().resolve_mailbox_for_address(
                     mailbox_address_id=fixed_mailbox_address_id,
-                    proxy=resolved_proxy,
+                    proxy=mailbox_proxy,
                     extra=extra,
                 )
                 provider = str(((mailbox_context.get("account") or {}).get("provider")) or "").strip()
@@ -843,7 +924,7 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
                 shared_mailbox = create_mailbox(
                     provider=extra.get("mail_provider", ""),
                     extra=extra,
-                    proxy=resolved_proxy,
+                    proxy=mailbox_proxy,
                 )
     except Exception as exc:
         logger.log(f"邮箱初始化失败: {exc}", level="error")
@@ -864,12 +945,19 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
                 platform_name,
                 payload,
                 logger,
-                resolved_proxy=resolved_proxy,
+                platform_proxy=platform_proxy,
+                mailbox_proxy=mailbox_proxy,
                 shared_mailbox=shared_mailbox,
             )
             logger.log(f"开始注册第 {index + 1}/{count} 个账号")
-            if resolved_proxy:
-                logger.log(f"使用代理: {resolved_proxy}")
+            logger.log(
+                f"ChatGPT/Codex 代理: {mask_proxy_url(platform_proxy) if platform_proxy else '直连'}"
+                f"（{platform_proxy_mode}）"
+            )
+            logger.log(
+                f"邮箱 API 代理: {mask_proxy_url(mailbox_proxy) if mailbox_proxy else '直连'}"
+                f"（{mailbox_proxy_mode}）"
+            )
             account = platform.register(email=email, password=password)
             saved_account = save_account(account)
             saved_account_id = int(saved_account.id)
@@ -882,8 +970,10 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
                 )
             except Exception as mailbox_link_exc:
                 logger.log(f"邮箱资源绑定记录失败: {mailbox_link_exc}", level="warning")
-            if resolved_proxy:
-                proxy_pool.report_success(resolved_proxy)
+            if platform_proxy and platform_proxy_mode == PROXY_MODE_PROXY_SERVICE:
+                proxy_pool.report_success(platform_proxy)
+            if mailbox_proxy and mailbox_proxy_mode == PROXY_MODE_PROXY_SERVICE and mailbox_proxy != platform_proxy:
+                proxy_pool.report_success(mailbox_proxy)
             post_codex_oauth = dict((account.extra or {}).get("post_codex_oauth") or {})
             auto_codex_oauth_enabled = str(extra.get("auto_codex_oauth_after_register") or "").strip().lower() in {
                 "1",
@@ -954,8 +1044,10 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
                 item["codex_oauth"] = post_codex_oauth or {"ok": False, "skipped": True}
             return item
         except Exception as exc:
-            if resolved_proxy:
-                proxy_pool.report_fail(resolved_proxy)
+            if platform_proxy and platform_proxy_mode == PROXY_MODE_PROXY_SERVICE:
+                proxy_pool.report_fail(platform_proxy)
+            if mailbox_proxy and mailbox_proxy_mode == PROXY_MODE_PROXY_SERVICE and mailbox_proxy != platform_proxy:
+                proxy_pool.report_fail(mailbox_proxy)
             error = str(exc)
             logger.record_error(error)
             logger.log(f"注册失败: {error}", level="error")
@@ -1045,6 +1137,8 @@ def _execute_platform_action_task(payload: dict[str, Any], logger: TaskLogger) -
 
 
 def _execute_account_check_all_task(payload: dict[str, Any], logger: TaskLogger) -> None:
+    from core.proxy_pool import proxy_pool
+
     platform = str(payload.get("platform", "") or "")
     limit = max(int(payload.get("limit", 50) or 50), 1)
     account_ids = [
@@ -1076,12 +1170,22 @@ def _execute_account_check_all_task(payload: dict[str, Any], logger: TaskLogger)
 
     results = {"valid": 0, "invalid": 0, "error": 0}
     completed = 0
+    task_proxy, proxy_mode, disable_proxy_pool = _check_task_proxy(payload, proxy_pool.get_next)
+    logger.log(
+        f"账号检测代理: {mask_proxy_url(task_proxy) if task_proxy else '直连'}"
+        f"（{proxy_mode}）"
+    )
     for model in accounts:
         if logger.is_cancel_requested():
             logger.finish(TASK_STATUS_CANCELLED, error="任务已取消")
             return
         try:
-            valid, _ = _run_single_account_check(int(model.id or 0), logger)
+            valid, _ = _run_single_account_check(
+                int(model.id or 0),
+                logger,
+                proxy=task_proxy,
+                disable_proxy_pool=disable_proxy_pool,
+            )
             if valid:
                 results["valid"] += 1
             else:

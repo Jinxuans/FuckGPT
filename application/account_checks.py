@@ -18,16 +18,27 @@ class AccountChecksService:
         select_all: bool | None = None,
         status_filter: str = "",
         search_filter: str = "",
+        platform_proxy_mode: str = "",
+        platform_proxy_value: str = "",
     ) -> dict:
         platform = platform or "chatgpt"
         if select_all is None and ids is None and not status_filter and not search_filter:
-            task = create_account_check_all_task(platform)
+            task = create_account_check_all_task(
+                platform,
+                platform_proxy_mode=platform_proxy_mode,
+                platform_proxy_value=platform_proxy_value,
+            )
             task_runtime.wake_up()
             return task
 
         normalized_ids = [int(item) for item in ids or [] if int(item or 0) > 0]
         if not select_all and not normalized_ids:
-            task = create_account_check_all_task(platform, account_ids=[])
+            task = create_account_check_all_task(
+                platform,
+                account_ids=[],
+                platform_proxy_mode=platform_proxy_mode,
+                platform_proxy_value=platform_proxy_value,
+            )
             task_runtime.wake_up()
             return task
 
@@ -43,6 +54,8 @@ class AccountChecksService:
         task = create_account_check_all_task(
             platform,
             account_ids=[item.id for item in records],
+            platform_proxy_mode=platform_proxy_mode,
+            platform_proxy_value=platform_proxy_value,
         )
         task_runtime.wake_up()
         return task

@@ -211,6 +211,26 @@ function buildActionParamDraft(action: any, acc: any) {
   return draft
 }
 
+function getActionOptionLabel(paramKey: string, value: string) {
+  const labels: Record<string, Record<string, string>> = {
+    browser_mode: {
+      headless: '后台浏览器',
+      headed: '可视浏览器',
+    },
+    keep_browser_open: {
+      false: '否',
+      true: '是',
+    },
+    platform_proxy_mode: {
+      direct: '直连',
+      manual: '手动填写',
+      proxy_service: '使用代理服务',
+      follow_platform: '跟随 ChatGPT/Codex',
+    },
+  }
+  return labels[paramKey]?.[value] || value
+}
+
 // ── 注册弹框 ────────────────────────────────────────────────
 function RegisterModal({
   platformMeta,
@@ -234,11 +254,12 @@ function RegisterModal({
   const [configLoading, setConfigLoading] = useState(true)
   const [regCount, setRegCount] = useState(1)
   const [concurrency, setConcurrency] = useState(1)
-  const [dynamicProxy, setDynamicProxy] = useState('')
+  const [platformProxyMode, setPlatformProxyMode] = useState('direct')
+  const [platformProxyValue, setPlatformProxyValue] = useState('')
   const [outlookPoolText, setOutlookPoolText] = useState('')
   const [autoUploadSub2Api, setAutoUploadSub2Api] = useState(false)
   const [autoCodexOAuth, setAutoCodexOAuth] = useState(false)
-  const [codexOAuthBrowserMode, setCodexOAuthBrowserMode] = useState('headed')
+  const [codexOAuthBrowserMode, setCodexOAuthBrowserMode] = useState('headless')
   const [keepCodexBrowserOpen, setKeepCodexBrowserOpen] = useState(false)
   const [sub2ApiConfigOpen, setSub2ApiConfigOpen] = useState(false)
   const [sub2ApiUrl, setSub2ApiUrl] = useState('http://127.0.0.1:8080')
@@ -380,7 +401,11 @@ function RegisterModal({
           count: regCount, concurrency,
           executor_type: selection.executorType,
           captcha_solver: 'auto',
-          proxy: dynamicProxy.trim() || null,
+          proxy: platformProxyMode === 'manual' ? platformProxyValue.trim() || null : null,
+          platform_proxy_mode: platformProxyMode,
+          platform_proxy_value: platformProxyValue.trim(),
+          mailbox_proxy_mode: 'follow_platform',
+          mailbox_proxy_value: '',
           sub2api_url: autoUploadSub2Api ? sub2ApiUrl.trim() : null,
           sub2api_api_key: autoUploadSub2Api ? sub2ApiApiKey.trim() : null,
           extra,
@@ -587,18 +612,31 @@ function RegisterModal({
                   </div>
                 </div>
 
-                  <div>
-                    <label className="text-xs text-[var(--text-muted)] block mb-1">动态 IP 代理（可选）</label>
-                    <input
-                      type="text"
-                      value={dynamicProxy}
-                      onChange={(e) => setDynamicProxy(e.target.value)}
-                      placeholder="http://user:pass@host:port"
-                      spellCheck={false}
-                      className="control-surface control-surface-compact w-full font-mono text-xs"
-                    />
-                    <div className="mt-1 text-xs text-[var(--text-muted)]">
-                      填写后本次注册使用该动态 IP 代理；留空时使用本地网络直连。
+                  <div className="rounded-lg border border-[var(--border)] bg-[var(--bg-hover)]/40 p-3">
+                    <div>
+                      <label className="text-xs text-[var(--text-muted)] block mb-1">ChatGPT/Codex 代理</label>
+                      <select
+                        value={platformProxyMode}
+                        onChange={(e) => setPlatformProxyMode(e.target.value)}
+                        className="control-surface control-surface-compact appearance-none"
+                      >
+                        <option value="direct">直连</option>
+                        <option value="proxy_service">使用代理服务</option>
+                        <option value="manual">手动填写</option>
+                      </select>
+                      {platformProxyMode === 'manual' ? (
+                        <input
+                          type="text"
+                          value={platformProxyValue}
+                          onChange={(e) => setPlatformProxyValue(e.target.value)}
+                          placeholder="socks5://user:pass@host:port"
+                          spellCheck={false}
+                          className="control-surface control-surface-compact mt-2 w-full font-mono text-xs"
+                        />
+                      ) : null}
+                    </div>
+                    <div className="mt-2 text-xs text-[var(--text-muted)]">
+                      邮箱 API 默认跟随 ChatGPT/Codex 代理，不再单独配置。
                     </div>
                   </div>
 
@@ -960,6 +998,9 @@ function ActionParamsModal({
         </div>
         <div className="px-6 py-4 space-y-4">
           {params.map((param: any) => {
+            if (param.key === 'platform_proxy_value' && form.platform_proxy_mode !== 'manual') {
+              return null
+            }
             const value = form[param.key] ?? ''
             if (Array.isArray(param.options) && param.options.length > 0) {
               return (
@@ -971,7 +1012,7 @@ function ActionParamsModal({
                     className="w-full rounded-xl border border-[var(--border)] bg-[var(--bg-hover)] px-3 py-2 text-sm outline-none focus:border-[var(--text-accent)]"
                   >
                     {param.options.map((option: string) => (
-                      <option key={option} value={option}>{option}</option>
+                      <option key={option} value={option}>{getActionOptionLabel(param.key, option)}</option>
                     ))}
                   </select>
                 </label>
@@ -1612,6 +1653,8 @@ export default function Accounts() {
   const [batchRefreshing, setBatchRefreshing] = useState(false)
   const [batchTask, setBatchTask] = useState<{ taskId: string; title: string } | null>(null)
   const [batchTaskStatus, setBatchTaskStatus] = useState<string | null>(null)
+  const [batchProxyMode, setBatchProxyMode] = useState('proxy_service')
+  const [batchProxyValue, setBatchProxyValue] = useState('')
 
   useEffect(() => {
     getPlatforms().then((list: any[]) => {
@@ -1803,6 +1846,25 @@ export default function Accounts() {
           </div>
           
           <div className="flex items-center gap-2">
+            <select
+              value={batchProxyMode}
+              onChange={e => setBatchProxyMode(e.target.value)}
+              className="h-7 rounded-md border border-[var(--border)] bg-transparent px-2 text-xs text-[var(--text-secondary)] outline-none focus:border-[var(--text-primary)]"
+              title="批量刷新代理"
+            >
+              <option value="proxy_service">代理服务</option>
+              <option value="direct">直连</option>
+              <option value="manual">手动代理</option>
+            </select>
+            {batchProxyMode === 'manual' ? (
+              <input
+                value={batchProxyValue}
+                onChange={e => setBatchProxyValue(e.target.value)}
+                placeholder="socks5://user:pass@host:port"
+                spellCheck={false}
+                className="h-7 w-56 rounded-md border border-[var(--border)] bg-transparent px-2 font-mono text-xs text-[var(--text-secondary)] outline-none focus:border-[var(--text-primary)]"
+              />
+            ) : null}
             <Button
               variant="ghost"
               size="sm"
@@ -1822,6 +1884,8 @@ export default function Accounts() {
                       select_all: !hasSelection,
                       status_filter: !hasSelection ? filterStatus || '' : '',
                       search_filter: !hasSelection ? debouncedSearch || '' : '',
+                      platform_proxy_mode: batchProxyMode,
+                      platform_proxy_value: batchProxyValue.trim(),
                     }),
                   })
                   if (res?.task_id) {

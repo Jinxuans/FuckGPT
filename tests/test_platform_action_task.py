@@ -232,6 +232,59 @@ def test_register_task_uploads_each_saved_account_immediately(monkeypatch):
     }
 
 
+def test_register_task_separates_platform_and_mailbox_proxies(monkeypatch):
+    captured = {}
+
+    class FakePlatform:
+        def register(self, email=None, password=None):
+            return Account(
+                platform="chatgpt",
+                email=email or "registered@example.com",
+                password=password or "Secret123!",
+                user_id="acct_123",
+                extra={"access_token": "access-token"},
+            )
+
+    def fake_create_mailbox(*, provider, extra, proxy):
+        captured["mailbox_factory_proxy"] = proxy
+        return object()
+
+    def fake_build_platform_instance(*args, **kwargs):
+        captured["platform_proxy"] = kwargs.get("platform_proxy")
+        captured["mailbox_proxy"] = kwargs.get("mailbox_proxy")
+        return FakePlatform()
+
+    monkeypatch.setattr(tasks_module, "get", lambda platform_name: object)
+    monkeypatch.setattr(tasks_module, "_build_platform_instance", fake_build_platform_instance)
+    monkeypatch.setattr(
+        tasks_module,
+        "save_account",
+        lambda account: type("SavedAccount", (), {"id": 123})(),
+    )
+    monkeypatch.setattr("core.base_mailbox.create_mailbox", fake_create_mailbox)
+
+    logger = _FakeLogger()
+    tasks_module._execute_register_task(
+        {
+            "platform": "chatgpt",
+            "count": 1,
+            "concurrency": 1,
+            "email": "registered@example.com",
+            "password": "Secret123!",
+            "platform_proxy_mode": "manual",
+            "platform_proxy_value": "socks5://user:pass@proxy.example:1080",
+            "mailbox_proxy_mode": "direct",
+            "extra": {"identity_provider": "mailbox"},
+        },
+        logger,
+    )
+
+    assert logger.finished == (tasks_module.TASK_STATUS_SUCCEEDED, "")
+    assert captured["platform_proxy"] == "socks5://user:pass@proxy.example:1080"
+    assert captured["mailbox_proxy"] is None
+    assert captured["mailbox_factory_proxy"] is None
+
+
 def test_register_api_preserves_protocol_outlook_pool(client, monkeypatch):
     captured = {}
 
@@ -566,3 +619,54 @@ def test_platform_runtime_wires_log_fn_to_platform(monkeypatch):
     assert result.ok is True
     assert logs == ["runtime platform log"]
     assert seen["cancel_check"]() is False
+
+
+def test_platform_runtime_resolves_action_proxy_service(monkeypatch):
+    seen = {}
+
+    class FakeSession:
+        def __init__(self, engine):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def get(self, model_cls, account_id):
+            return type("Model", (), {"id": account_id, "platform": "chatgpt"})()
+
+        def add(self, model):
+            pass
+
+        def commit(self):
+            pass
+
+    class FakePlatform:
+        def __init__(self, config=None):
+            seen["proxy"] = config.proxy
+            seen["extra"] = dict(config.extra or {})
+
+        def execute_action(self, action_id, account, params):
+            return {"ok": True, "data": {"message": "ok"}}
+
+    monkeypatch.setattr(runtime_module, "Session", FakeSession)
+    monkeypatch.setattr(runtime_module, "load_all", lambda: None)
+    monkeypatch.setattr(runtime_module, "get", lambda platform: FakePlatform)
+    monkeypatch.setattr(runtime_module, "build_platform_account", lambda session, model: object())
+    monkeypatch.setattr(runtime_module, "patch_account_graph", lambda *args, **kwargs: None)
+    monkeypatch.setattr("core.proxy_pool.proxy_pool.get_next", lambda: "http://pool-proxy:8080")
+
+    result = runtime_module.PlatformRuntime().execute_action(
+        ActionExecutionCommand(
+            platform="chatgpt",
+            account_id=123,
+            action_id="query_state",
+            params={"platform_proxy_mode": "proxy_service"},
+        )
+    )
+
+    assert result.ok is True
+    assert seen["proxy"] == "http://pool-proxy:8080"
+    assert seen["extra"]["disable_proxy_pool"] is False

@@ -20,6 +20,10 @@ class RegisterTaskRequest(BaseModel):
     count: int = 1
     concurrency: int = 1
     proxy: Optional[str] = None
+    platform_proxy_mode: str = ""
+    platform_proxy_value: str = ""
+    mailbox_proxy_mode: str = ""
+    mailbox_proxy_value: str = ""
     executor_type: Literal["protocol", "headless", "headed"] = "headless"
     captcha_solver: str = "auto"
     sub2api_url: Optional[str] = None
