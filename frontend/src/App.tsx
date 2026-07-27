@@ -12,6 +12,7 @@ import type { TranslationKey } from "@/lib/i18n";
 import Dashboard from "@/pages/Dashboard";
 import Accounts from "@/pages/Accounts";
 import MailboxResources from "@/pages/MailboxResources";
+import TaskHistory from "@/pages/TaskHistory";
 import SettingsPage from "@/pages/SettingsPage";
 import UpdateBanner from "@/components/UpdateBanner";
 import WelcomeDialog from "@/components/WelcomeDialog";
@@ -24,6 +25,7 @@ import {
   Languages,
   Users,
   Mail,
+  ListChecks,
   PanelLeftClose,
   PanelLeft,
 } from "lucide-react";
@@ -44,12 +46,14 @@ const SETTINGS_NAV_ITEMS: { labelKey: TranslationKey; hash: string }[] = [
   { labelKey: "nav.settings.general", hash: "general" },
   { labelKey: "nav.settings.mailbox", hash: "mailbox" },
   { labelKey: "nav.settings.sms", hash: "sms" },
+  { labelKey: "nav.settings.proxy", hash: "proxy" },
 ];
 
 const NAV_ITEMS: NavItem[] = [
   { path: "/", labelKey: "nav.dashboard", icon: LayoutDashboard, exact: true },
   { path: "/accounts/chatgpt", label: "chatgpt free", icon: Users },
   { path: "/mailboxes", labelKey: "nav.mailboxResources", icon: Mail },
+  { path: "/tasks", labelKey: "nav.tasks", icon: ListChecks },
   { path: "/settings", labelKey: "nav.settings", icon: SettingsIcon },
 ];
 
@@ -250,12 +254,13 @@ function Shell({
         setCollapsed={setCollapsed}
       />
       <main className="flex-1 overflow-y-auto">
-        <div className={cn("mx-auto px-6 py-6 lg:px-8", location.pathname === "/mailboxes" ? "max-w-7xl" : "max-w-6xl")}>
+        <div className={cn("mx-auto px-6 py-6 lg:px-8", ["/mailboxes", "/tasks"].includes(location.pathname) ? "max-w-7xl" : "max-w-6xl")}>
           <UpdateBanner />
           <Routes>
             <Route path="/" element={<Dashboard />} />
             <Route path="/accounts/chatgpt" element={<Accounts />} />
             <Route path="/mailboxes" element={<MailboxResources />} />
+            <Route path="/tasks" element={<TaskHistory />} />
             <Route
               path="/settings"
               element={<SettingsPage theme={theme} setTheme={setTheme} />}

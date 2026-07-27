@@ -1,15 +1,14 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-import { ChevronDown, ChevronRight } from "lucide-react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { ChevronDown, ChevronRight, Square } from "lucide-react";
 
 import { API_BASE, apiFetch } from "@/lib/utils";
-import { getTaskStatusText, isTerminalTaskStatus } from "@/lib/tasks";
+import {
+  getTaskStatusText,
+  isCancellableTaskStatus,
+  isTerminalTaskStatus,
+} from "@/lib/tasks";
 import { useI18n } from "@/lib/i18n-context";
 
-/**
- * 单条日志事件。`subtaskId` 来自后端 ``serialize_event(...).detail.subtask_id``——
- * ``TaskLogger.log`` 在每个并发 worker 进入时通过 thread-local 自动注入。前端
- * 按这个字段分组折叠展示；空字符串表示主任务（任务级状态、汇总日志等）。
- */
 type LogEvent = {
   id: number;
   line: string;
@@ -24,12 +23,25 @@ type LogGroup = {
 };
 
 const MAIN_GROUP_ID = "__main__";
+const INITIAL_EVENT_LIMIT = 1000;
+const LOAD_OLDER_LIMIT = 500;
 
 function classifyLine(line: string): string {
   if (line.includes("✓") || line.includes("成功")) return "text-emerald-400";
   if (line.includes("✗") || line.includes("失败") || line.includes("错误"))
     return "text-red-400";
   return "text-[var(--text-secondary)]";
+}
+
+function toLogEvent(payload: any, fallbackId: number): LogEvent | null {
+  if (!payload?.line) return null;
+  const detail = payload?.detail || {};
+  return {
+    id: Number(payload?.id || 0) || fallbackId,
+    line: String(payload.line),
+    subtaskId: String(detail?.subtask_id || ""),
+    subtaskLabel: String(detail?.subtask_label || ""),
+  };
 }
 
 export function TaskLogPanel({
@@ -43,123 +55,203 @@ export function TaskLogPanel({
   const [events, setEvents] = useState<LogEvent[]>([]);
   const [task, setTask] = useState<any | null>(null);
   const [doneStatus, setDoneStatus] = useState<string | null>(null);
-  // 折叠状态：默认全展开（undefined / false 都视为展开）
+  const [stopping, setStopping] = useState(false);
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
+  const [loadingHistory, setLoadingHistory] = useState(false);
+  const [loadingOlder, setLoadingOlder] = useState(false);
+  const [hasMoreBefore, setHasMoreBefore] = useState(false);
+  const [followLive, setFollowLive] = useState(true);
+  const [loadError, setLoadError] = useState("");
+
   const seenEventIdsRef = useRef<Set<number>>(new Set());
   const cursorRef = useRef(0);
+  const oldestEventIdRef = useRef(0);
   const doneRef = useRef(false);
+  const followLiveRef = useRef(true);
   const onDoneRef = useRef(onDone);
   const sseHealthyRef = useRef(false);
   const eventSourceRef = useRef<EventSource | null>(null);
+  const logViewportRef = useRef<HTMLDivElement | null>(null);
+  const restoreScrollRef = useRef<{ top: number; height: number } | null>(null);
 
   useEffect(() => {
     onDoneRef.current = onDone;
   }, [onDone]);
 
   useEffect(() => {
-    if (!taskId) return;
-    seenEventIdsRef.current = new Set();
-    cursorRef.current = 0;
-    doneRef.current = false;
-    sseHealthyRef.current = false;
-    setEvents([]);
-    setTask(null);
-    setDoneStatus(null);
-    setCollapsed({});
+    followLiveRef.current = followLive;
+  }, [followLive]);
 
-    const pushEvent = (payload: any) => {
+  const mergeEvents = (
+    payloads: any[],
+    placement: "append" | "prepend" | "replace" = "append",
+  ) => {
+    const normalized: LogEvent[] = [];
+    for (const payload of payloads) {
       const eventId = Number(payload?.id || 0);
-      if (eventId && seenEventIdsRef.current.has(eventId)) return;
+      if (eventId && seenEventIdsRef.current.has(eventId)) continue;
+      const event = toLogEvent(payload, eventId || normalized.length + 1);
+      if (!event) continue;
       if (eventId) {
         seenEventIdsRef.current.add(eventId);
         cursorRef.current = Math.max(cursorRef.current, eventId);
+        oldestEventIdRef.current =
+          oldestEventIdRef.current > 0
+            ? Math.min(oldestEventIdRef.current, eventId)
+            : eventId;
       }
-      if (payload?.line) {
-        const detail = payload?.detail || {};
-        setEvents((prev) => [
-          ...prev,
-          {
-            id: eventId || prev.length + 1,
-            line: String(payload.line),
-            subtaskId: String(detail?.subtask_id || ""),
-            subtaskLabel: String(detail?.subtask_label || ""),
-          },
-        ]);
-      }
-      if (payload?.done && !doneRef.current) {
-        doneRef.current = true;
-        sseHealthyRef.current = false;
-        eventSourceRef.current?.close();
-        eventSourceRef.current = null;
-        const nextStatus = payload.status || "succeeded";
-        setDoneStatus(nextStatus);
-        onDoneRef.current(nextStatus);
-      }
+      normalized.push(event);
+    }
+    if (normalized.length === 0) return;
+    setEvents((prev) => {
+      if (placement === "replace") return normalized;
+      if (placement === "prepend") return [...normalized, ...prev];
+      return [...prev, ...normalized];
+    });
+  };
+
+  useEffect(() => {
+    if (!taskId) return;
+
+    let disposed = false;
+    let progressPoll = 0;
+    let fallbackPoll = 0;
+
+    seenEventIdsRef.current = new Set();
+    cursorRef.current = 0;
+    oldestEventIdRef.current = 0;
+    doneRef.current = false;
+    sseHealthyRef.current = false;
+    followLiveRef.current = true;
+    setEvents([]);
+    setTask(null);
+    setDoneStatus(null);
+    setStopping(false);
+    setCollapsed({});
+    setHasMoreBefore(false);
+    setFollowLive(true);
+    setLoadError("");
+    setLoadingHistory(true);
+
+    const markDone = (status: string) => {
+      if (doneRef.current) return;
+      doneRef.current = true;
+      sseHealthyRef.current = false;
+      eventSourceRef.current?.close();
+      eventSourceRef.current = null;
+      setDoneStatus(status);
+      onDoneRef.current(status);
     };
 
     const syncTask = async () => {
       const latest = await apiFetch(`/tasks/${taskId}`);
+      if (disposed) return latest;
       setTask(latest);
-      if (isTerminalTaskStatus(latest.status) && !doneRef.current) {
-        pushEvent({ done: true, status: latest.status });
+      if (isTerminalTaskStatus(latest.status)) {
+        markDone(latest.status);
       }
+      return latest;
     };
 
-    const es = new EventSource(`${API_BASE}/tasks/${taskId}/logs/stream`);
-    eventSourceRef.current = es;
-    es.onopen = () => {
-      sseHealthyRef.current = true;
-    };
-    es.onmessage = (e) => {
-      sseHealthyRef.current = true;
-      pushEvent(JSON.parse(e.data));
-    };
-    es.onerror = () => {
-      if (doneRef.current) {
-        es.close();
-        if (eventSourceRef.current === es) {
-          eventSourceRef.current = null;
-        }
-        return;
-      }
-      sseHealthyRef.current = false;
-    };
-
-    syncTask().catch(() => {});
-
-    // 进度需要持续轮询：SSE 只发 events，progress 在 task model 上，
-    // 必须主动 GET /tasks/{id} 拿。原实现里只在 SSE 不健康时轮询，导致
-    // SSE 正常时进度从来不更新。
-    const progressPoll = window.setInterval(() => {
-      if (doneRef.current) return;
-      syncTask().catch(() => {});
-    }, 1500);
-
-    const fallbackPoll = window.setInterval(async () => {
-      if (doneRef.current || sseHealthyRef.current) return;
+    const loadInitial = async () => {
       try {
-        const data = await apiFetch(
-          `/tasks/${taskId}/events?since=${cursorRef.current}`,
-        );
-        for (const item of data.items || []) {
-          pushEvent(item);
+        const [latest, history] = await Promise.all([
+          apiFetch(`/tasks/${taskId}`),
+          apiFetch(`/tasks/${taskId}/events?latest=true&limit=${INITIAL_EVENT_LIMIT}`),
+        ]);
+        if (disposed) return;
+        setTask(latest);
+        setHasMoreBefore(Boolean(history.has_more_before));
+        if (Number(history.before || 0) > 0) {
+          oldestEventIdRef.current = Number(history.before || 0);
         }
-      } catch {
-        // passive
+        mergeEvents(history.items || [], "replace");
+        if (isTerminalTaskStatus(latest.status)) {
+          markDone(latest.status);
+          return;
+        }
+
+        const es = new EventSource(
+          `${API_BASE}/tasks/${taskId}/logs/stream?since=${cursorRef.current}`,
+        );
+        eventSourceRef.current = es;
+        es.onopen = () => {
+          sseHealthyRef.current = true;
+        };
+        es.onmessage = (event) => {
+          sseHealthyRef.current = true;
+          const payload = JSON.parse(event.data);
+          mergeEvents([payload], "append");
+          if (payload?.done) {
+            markDone(payload.status || "succeeded");
+          }
+        };
+        es.onerror = () => {
+          if (doneRef.current) {
+            es.close();
+            if (eventSourceRef.current === es) {
+              eventSourceRef.current = null;
+            }
+            return;
+          }
+          sseHealthyRef.current = false;
+        };
+
+        progressPoll = window.setInterval(() => {
+          if (doneRef.current) return;
+          syncTask().catch(() => {});
+        }, 1500);
+
+        fallbackPoll = window.setInterval(async () => {
+          if (doneRef.current || sseHealthyRef.current) return;
+          try {
+            const data = await apiFetch(
+              `/tasks/${taskId}/events?since=${cursorRef.current}&limit=500`,
+            );
+            mergeEvents(data.items || [], "append");
+          } catch {
+            // passive
+          }
+        }, 1000);
+      } catch (exc: any) {
+        if (!disposed) {
+          setLoadError(exc?.message || t("taskLog.loadFailed"));
+        }
+      } finally {
+        if (!disposed) setLoadingHistory(false);
       }
-    }, 1000);
+    };
+
+    loadInitial();
 
     return () => {
+      disposed = true;
       sseHealthyRef.current = false;
       eventSourceRef.current?.close();
       eventSourceRef.current = null;
       window.clearInterval(progressPoll);
       window.clearInterval(fallbackPoll);
     };
-  }, [taskId]);
+  }, [taskId, t]);
 
-  // 按 subtaskId 把事件切成分组：主任务 + 每个 worker。
-  // 顺序按"首次出现"排，保证 worker 折叠面板顺序稳定（worker_1 / worker_2…）。
+  useLayoutEffect(() => {
+    const viewport = logViewportRef.current;
+    if (!viewport) return;
+    const restore = restoreScrollRef.current;
+    if (restore) {
+      restoreScrollRef.current = null;
+      viewport.scrollTop = viewport.scrollHeight - restore.height + restore.top;
+      return;
+    }
+    if (followLiveRef.current) {
+      viewport.scrollTop = viewport.scrollHeight;
+      requestAnimationFrame(() => {
+        if (!followLiveRef.current) return;
+        viewport.scrollTop = viewport.scrollHeight;
+      });
+    }
+  }, [events.length]);
+
   const groups: LogGroup[] = useMemo(() => {
     const map = new Map<string, LogGroup>();
     map.set(MAIN_GROUP_ID, {
@@ -189,7 +281,56 @@ export function TaskLogPanel({
     setCollapsed((prev) => ({ ...prev, [id]: !prev[id] }));
   };
 
+  const handleLogScroll = () => {
+    const viewport = logViewportRef.current;
+    if (!viewport) return;
+    const distanceFromBottom =
+      viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight;
+    const nextFollow = distanceFromBottom < 48;
+    if (nextFollow !== followLiveRef.current) {
+      followLiveRef.current = nextFollow;
+      setFollowLive(nextFollow);
+    }
+  };
+
+  const jumpToLatest = () => {
+    const viewport = logViewportRef.current;
+    followLiveRef.current = true;
+    setFollowLive(true);
+    if (viewport) {
+      viewport.scrollTop = viewport.scrollHeight;
+      requestAnimationFrame(() => {
+        viewport.scrollTop = viewport.scrollHeight;
+      });
+    }
+  };
+
+  const loadOlder = async () => {
+    if (loadingOlder || !hasMoreBefore || oldestEventIdRef.current <= 0) return;
+    const viewport = logViewportRef.current;
+    if (viewport) {
+      restoreScrollRef.current = {
+        top: viewport.scrollTop,
+        height: viewport.scrollHeight,
+      };
+    }
+    setLoadingOlder(true);
+    try {
+      const data = await apiFetch(
+        `/tasks/${taskId}/events?before=${oldestEventIdRef.current}&limit=${LOAD_OLDER_LIMIT}`,
+      );
+      setHasMoreBefore(Boolean(data.has_more_before));
+      if (Number(data.before || 0) > 0) {
+        oldestEventIdRef.current = Number(data.before || 0);
+      }
+      mergeEvents(data.items || [], "prepend");
+    } finally {
+      setLoadingOlder(false);
+    }
+  };
+
   const currentStatus = doneStatus || task?.status || "running";
+  const canStop = Boolean(task?.cancellable || isCancellableTaskStatus(currentStatus));
   const progress = task?.progress_detail || {};
   const progressTotal = Number(progress.total || 0);
   const progressCurrent = Number(progress.current || 0);
@@ -214,8 +355,19 @@ export function TaskLogPanel({
       .catch(() => {});
   };
 
+  const stopTask = async () => {
+    if (!taskId || stopping || isTerminalTaskStatus(currentStatus)) return;
+    setStopping(true);
+    try {
+      const latest = await apiFetch(`/tasks/${taskId}/cancel`, { method: "POST" });
+      setTask(latest);
+    } finally {
+      setStopping(false);
+    }
+  };
+
   return (
-    <div className="flex h-full flex-col gap-4">
+    <div className="flex min-h-0 flex-col gap-4">
       <div className="grid gap-3 md:grid-cols-3">
         <div className={`rounded-2xl border px-4 py-3 ${statusTone}`}>
           <div className="text-[11px] uppercase tracking-[0.18em] opacity-70">
@@ -267,7 +419,7 @@ export function TaskLogPanel({
         </div>
       ) : null}
 
-      <div className="flex items-center justify-between gap-3">
+      <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
           <div className="text-[11px] uppercase tracking-[0.18em] text-[var(--text-muted)]">
             {t("taskLog.liveLog")}
@@ -276,19 +428,64 @@ export function TaskLogPanel({
             {t("taskLog.liveTitle")}
           </div>
         </div>
-        <button
-          type="button"
-          onClick={copyLogs}
-          className="rounded-full border border-[var(--border)] bg-[var(--bg-hover)] px-3 py-1.5 text-xs text-[var(--text-secondary)] hover:text-[var(--text-primary)]"
-        >
-          {t("taskLog.copyLogs")}
-        </button>
+        <div className="flex flex-wrap items-center justify-end gap-2">
+          {!followLive && (
+            <button
+              type="button"
+              onClick={jumpToLatest}
+              className="rounded-full border border-[var(--accent-edge)] bg-[var(--accent-soft)] px-3 py-1.5 text-xs text-[var(--accent)] hover:text-[var(--accent-strong)]"
+            >
+              {t("taskLog.jumpLatest")}
+            </button>
+          )}
+          {canStop && !isTerminalTaskStatus(currentStatus) ? (
+            <button
+              type="button"
+              onClick={stopTask}
+              disabled={stopping || currentStatus === "cancel_requested"}
+              className="inline-flex items-center rounded-full border border-amber-400/30 bg-amber-500/10 px-3 py-1.5 text-xs text-amber-300 hover:text-amber-200 disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              <Square className="mr-1 h-3.5 w-3.5" />
+              {stopping || currentStatus === "cancel_requested"
+                ? t("taskLog.stopping")
+                : t("taskLog.stopTask")}
+            </button>
+          ) : null}
+          <button
+            type="button"
+            onClick={copyLogs}
+            className="rounded-full border border-[var(--border)] bg-[var(--bg-hover)] px-3 py-1.5 text-xs text-[var(--text-secondary)] hover:text-[var(--text-primary)]"
+          >
+            {t("taskLog.copyLogs")}
+          </button>
+        </div>
       </div>
 
-      <div className="min-h-[260px] flex-1 overflow-y-auto rounded-xl border border-[var(--border)] bg-[var(--bg-input)] p-3 font-mono text-xs">
+      <div
+        ref={logViewportRef}
+        onScroll={handleLogScroll}
+        className="h-[min(52vh,560px)] min-h-[260px] overflow-y-auto rounded-xl border border-[var(--border)] bg-[var(--bg-input)] p-3 font-mono text-xs"
+      >
+        {loadError ? (
+          <div className="rounded-lg border border-red-400/30 bg-red-500/10 px-3 py-2 text-red-300">
+            {loadError}
+          </div>
+        ) : null}
+        {hasMoreBefore ? (
+          <div className="mb-2 flex justify-center">
+            <button
+              type="button"
+              onClick={loadOlder}
+              disabled={loadingOlder}
+              className="rounded-full border border-[var(--border)] bg-[var(--bg-hover)] px-3 py-1.5 text-xs text-[var(--text-secondary)] hover:text-[var(--text-primary)] disabled:opacity-60"
+            >
+              {loadingOlder ? t("taskLog.loadingOlder") : t("taskLog.loadOlder")}
+            </button>
+          </div>
+        ) : null}
         {events.length === 0 ? (
           <div className="flex h-full min-h-[180px] items-center justify-center rounded-2xl border border-dashed border-[var(--border)] text-[var(--text-muted)]">
-            {t("taskLog.waiting")}
+            {loadingHistory ? t("taskLog.loadingHistory") : t("taskLog.waiting")}
           </div>
         ) : (
           <div className="flex flex-col gap-2">
@@ -313,17 +510,6 @@ export function TaskLogPanel({
   );
 }
 
-/**
- * 单个分组（主任务或一个 worker）。
- *
- * 用 React 自身的虚拟 DOM diff 渲染日志列表，关键点：
- *   - 每条事件用稳定的 ``id`` 当 key（避免 React 整列重渲），
- *   - 折叠时 events 被卸载，DOM 不留滞；展开时按 100 条上限做软裁剪
- *     （单 worker 一般 50~80 条事件，超过 100 条只显示最近的 100 条，
- *     底部加提示让用户知道历史被截断），保护极端长任务不挂死浏览器。
- */
-const MAX_VISIBLE_PER_GROUP = 200;
-
 function LogGroupView({
   group,
   collapsed,
@@ -336,18 +522,6 @@ function LogGroupView({
   onToggle: () => void;
 }) {
   const { t } = useI18n();
-  const total = group.events.length;
-  const truncated = total > MAX_VISIBLE_PER_GROUP;
-  const visible = truncated
-    ? group.events.slice(total - MAX_VISIBLE_PER_GROUP)
-    : group.events;
-  const bottomRef = useRef<HTMLDivElement>(null);
-
-  // 展开时新事件到来自动滚到底部
-  useEffect(() => {
-    if (collapsed) return;
-    bottomRef.current?.scrollIntoView({ behavior: "auto", block: "end" });
-  }, [collapsed, total]);
 
   return (
     <div className="overflow-hidden rounded-lg border border-[var(--border)] bg-[var(--bg-pane)]/40">
@@ -365,21 +539,13 @@ function LogGroupView({
           {isMain ? t("taskLog.mainGroup") : group.label}
         </span>
         <span className="ml-auto text-[10px] text-[var(--text-muted)]">
-          {t("taskLog.logCount", { count: total })}
+          {t("taskLog.logCount", { count: group.events.length })}
         </span>
       </button>
       {!collapsed && (
-        <div className="max-h-[280px] overflow-y-auto px-2 py-2">
-          {truncated && (
-            <div className="mb-2 rounded border border-amber-400/30 bg-amber-400/10 px-2 py-1 text-[10px] text-amber-200">
-              {t("taskLog.truncatedHint", {
-                shown: MAX_VISIBLE_PER_GROUP,
-                total,
-              })}
-            </div>
-          )}
+        <div className="px-2 py-2">
           <div className="space-y-1">
-            {visible.map((ev) => (
+            {group.events.map((ev) => (
               <div
                 key={ev.id}
                 className={`rounded-md border border-white/5 bg-white/[0.025] px-3 py-1.5 leading-5 ${classifyLine(ev.line)}`}
@@ -387,7 +553,6 @@ function LogGroupView({
                 {ev.line}
               </div>
             ))}
-            <div ref={bottomRef} />
           </div>
         </div>
       )}

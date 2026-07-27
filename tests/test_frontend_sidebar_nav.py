@@ -11,14 +11,18 @@ def _nav_items_block() -> str:
     return source[start:end]
 
 
-def test_sidebar_top_level_nav_keeps_dashboard_chatgpt_and_settings():
+def test_sidebar_top_level_nav_keeps_public_entries():
     block = _nav_items_block()
 
-    assert block.count("path:") == 3
+    assert block.count("path:") == 5
     assert 'path: "/"' in block
     assert 'labelKey: "nav.dashboard"' in block
     assert 'path: "/accounts/chatgpt"' in block
     assert 'label: "chatgpt free"' in block
+    assert 'path: "/mailboxes"' in block
+    assert 'labelKey: "nav.mailboxResources"' in block
+    assert 'path: "/tasks"' in block
+    assert 'labelKey: "nav.tasks"' in block
     assert 'path: "/settings"' in block
     assert 'labelKey: "nav.settings"' in block
 
@@ -32,10 +36,9 @@ def test_sidebar_hides_accounts_menu_and_other_business_links():
     assert "nav.ctfGptPlus" not in source
     assert "nav.gopayGptPlus" not in source
     assert "nav.plusManager" not in source
-    assert "nav.tasks" not in source
 
 
-def test_sidebar_keeps_general_mailbox_resources_and_sms_settings_submenu_items():
+def test_sidebar_keeps_general_mailbox_sms_and_proxy_settings_submenu_items():
     source = APP_TSX.read_text(encoding="utf-8")
 
     start = source.index("const SETTINGS_NAV_ITEMS:")
@@ -45,8 +48,8 @@ def test_sidebar_keeps_general_mailbox_resources_and_sms_settings_submenu_items(
     assert block.count('hash: "') == 4
     assert 'labelKey: "nav.settings.general", hash: "general"' in block
     assert 'labelKey: "nav.settings.mailbox", hash: "mailbox"' in block
-    assert 'labelKey: "nav.settings.mailboxResources", hash: "mailboxResources"' in block
     assert 'labelKey: "nav.settings.sms", hash: "sms"' in block
+    assert 'labelKey: "nav.settings.proxy", hash: "proxy"' in block
 
     assert "currentTab" in source
     assert "/settings?tab=${item.hash}" in source

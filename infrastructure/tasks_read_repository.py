@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from application.tasks import get_task, list_task_events
+from application.tasks import get_task, list_task_events_page, list_tasks
 from core.datetime_utils import ensure_utc_datetime
 from domain.tasks import TaskEvent, TaskProgress, TaskSummary
 
@@ -44,9 +44,44 @@ def _to_event(data: dict) -> TaskEvent:
 
 
 class TasksReadRepository:
+    def list(
+        self,
+        *,
+        limit: int = 50,
+        offset: int = 0,
+        status: str = "",
+        platform: str = "",
+        task_type: str = "",
+    ) -> dict:
+        data = list_tasks(
+            limit=limit,
+            offset=offset,
+            status=status,
+            platform=platform,
+            task_type=task_type,
+        )
+        data["items"] = [_to_task_summary(item) for item in data.get("items", [])]
+        return data
+
     def get(self, task_id: str) -> TaskSummary | None:
         data = get_task(task_id)
         return _to_task_summary(data) if data else None
 
-    def list_events(self, task_id: str, *, since: int = 0, limit: int = 200) -> list[TaskEvent]:
-        return [_to_event(item) for item in list_task_events(task_id, since=since, limit=limit)]
+    def list_events(
+        self,
+        task_id: str,
+        *,
+        since: int = 0,
+        before: int = 0,
+        limit: int = 200,
+        latest: bool = False,
+    ) -> dict:
+        data = list_task_events_page(
+            task_id,
+            since=since,
+            before=before,
+            limit=limit,
+            latest=latest,
+        )
+        data["items"] = [_to_event(item) for item in data.get("items", [])]
+        return data

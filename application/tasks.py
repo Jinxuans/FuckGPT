@@ -9,6 +9,7 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 
+from sqlalchemy import func
 from sqlmodel import Session, select
 
 from core.account_graph import (
@@ -269,18 +270,112 @@ def get_task(task_id: str) -> Optional[dict[str, Any]]:
         return serialize_task(task) if task else None
 
 
-def list_task_events(task_id: str, *, since: int = 0, limit: int = 200) -> list[dict[str, Any]]:
-    limit = min(max(limit, 1), 500)
+def list_tasks(
+    *,
+    limit: int = 50,
+    offset: int = 0,
+    status: str = "",
+    platform: str = "",
+    task_type: str = "",
+) -> dict[str, Any]:
+    limit = min(max(int(limit or 50), 1), 100)
+    offset = max(int(offset or 0), 0)
+    status = str(status or "").strip()
+    platform = str(platform or "").strip()
+    task_type = str(task_type or "").strip()
+
+    conditions = []
+    if status:
+        conditions.append(TaskModel.status == status)
+    if platform:
+        conditions.append(TaskModel.platform == platform)
+    if task_type:
+        conditions.append(TaskModel.type == task_type)
+
     with Session(engine) as session:
-        q = (
-            select(TaskEventModel)
-            .where(TaskEventModel.task_id == task_id)
-            .where(TaskEventModel.id > since)
-            .order_by(TaskEventModel.id)
+        q = select(TaskModel)
+        count_q = select(func.count()).select_from(TaskModel)
+        for condition in conditions:
+            q = q.where(condition)
+            count_q = count_q.where(condition)
+        items = session.exec(
+            q.order_by(TaskModel.created_at.desc(), TaskModel.id.desc())
+            .offset(offset)
             .limit(limit)
+        ).all()
+        total = int(session.exec(count_q).one() or 0)
+        running = int(
+            session.exec(
+                select(func.count())
+                .select_from(TaskModel)
+                .where(TaskModel.status.in_(list(ACTIVE_TASK_STATUSES)))
+            ).one()
+            or 0
         )
-        items = session.exec(q).all()
-    return [serialize_event(item) for item in items]
+
+    return {
+        "items": [serialize_task(item) for item in items],
+        "total": total,
+        "running": running,
+        "limit": limit,
+        "offset": offset,
+    }
+
+
+def list_task_events(task_id: str, *, since: int = 0, limit: int = 200) -> list[dict[str, Any]]:
+    return list_task_events_page(task_id, since=since, limit=limit)["items"]
+
+
+def list_task_events_page(
+    task_id: str,
+    *,
+    since: int = 0,
+    before: int = 0,
+    limit: int = 200,
+    latest: bool = False,
+) -> dict[str, Any]:
+    limit = min(max(limit, 1), 1000)
+    since = max(int(since or 0), 0)
+    before = max(int(before or 0), 0)
+    with Session(engine) as session:
+        if before:
+            q = (
+                select(TaskEventModel)
+                .where(TaskEventModel.task_id == task_id)
+                .where(TaskEventModel.id < before)
+                .order_by(TaskEventModel.id.desc())
+                .limit(limit + 1)
+            )
+            raw_items = session.exec(q).all()
+            has_more_before = len(raw_items) > limit
+            items = list(reversed(raw_items[:limit]))
+        elif latest:
+            q = (
+                select(TaskEventModel)
+                .where(TaskEventModel.task_id == task_id)
+                .order_by(TaskEventModel.id.desc())
+                .limit(limit + 1)
+            )
+            raw_items = session.exec(q).all()
+            has_more_before = len(raw_items) > limit
+            items = list(reversed(raw_items[:limit]))
+        else:
+            q = (
+                select(TaskEventModel)
+                .where(TaskEventModel.task_id == task_id)
+                .where(TaskEventModel.id > since)
+                .order_by(TaskEventModel.id)
+                .limit(limit)
+            )
+            items = session.exec(q).all()
+            has_more_before = False
+        serialized = [serialize_event(item) for item in items]
+    return {
+        "items": serialized,
+        "cursor": max([int(item["id"] or 0) for item in serialized] or [since]),
+        "before": min([int(item["id"] or 0) for item in serialized] or [before]),
+        "has_more_before": has_more_before,
+    }
 
 
 def append_task_event(task_id: str, message: str, *, event_type: str = "log", level: str = "info", detail: dict | None = None) -> dict[str, Any]:
@@ -346,11 +441,11 @@ def _request_cancel_mutation(task: TaskModel) -> None:
 
 def claim_next_runnable_task(
     *,
-    running_platform_counts: dict[str, int] | None = None,
+    running_scope_counts: dict[str, int] | None = None,
     busy_account_keys: set[str] | None = None,
-    max_parallel_per_platform: int = 1,
+    max_parallel_per_scope: int = 1,
 ) -> Optional[dict[str, Any]]:
-    running_platform_counts = dict(running_platform_counts or {})
+    running_scope_counts = dict(running_scope_counts or {})
     busy_account_keys = set(busy_account_keys or set())
     with Session(engine) as session:
         tasks = session.exec(
@@ -362,7 +457,8 @@ def claim_next_runnable_task(
             payload = task.get_payload()
             platform = task.platform or str(payload.get("platform", "") or "")
             account_keys = _task_account_keys(task.type, payload)
-            if platform and running_platform_counts.get(platform, 0) >= max_parallel_per_platform:
+            scope = f"{platform}:{task.type}"
+            if scope and running_scope_counts.get(scope, 0) >= max_parallel_per_scope:
                 continue
             if account_keys and busy_account_keys.intersection(account_keys):
                 continue
@@ -371,7 +467,7 @@ def claim_next_runnable_task(
             task.updated_at = _utcnow()
             session.add(task)
             session.commit()
-            return {"id": task.id, "platform": platform, "account_keys": account_keys}
+            return {"id": task.id, "platform": platform, "type": task.type, "scope": scope, "account_keys": account_keys}
     return None
 
 
