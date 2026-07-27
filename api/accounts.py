@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import io
-from typing import Optional
+from typing import Any, Optional
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
@@ -9,7 +9,10 @@ from pydantic import BaseModel, Field
 
 from application.account_exports import AccountExportsService, ExportArtifact
 from application.accounts import AccountsService
+from application.tasks import create_codex_oauth_batch_task
+from services.task_runtime import task_runtime
 from domain.accounts import AccountExportSelection, AccountQuery, AccountUpdateCommand
+from infrastructure.accounts_repository import AccountsRepository
 
 router = APIRouter(prefix="/accounts", tags=["accounts"])
 service = AccountsService()
@@ -49,6 +52,11 @@ class BatchExportRequest(BaseModel):
 class Sub2ApiAgentIdentityUploadRequest(BatchExportRequest):
     sub2api_url: str = Field(min_length=1)
     api_key: str = Field(min_length=1)
+
+
+class CodexOAuthBatchRequest(BatchExportRequest):
+    params: dict[str, Any] = Field(default_factory=dict)
+    concurrency: int = 1
 
 
 def _stream_artifact(artifact: ExportArtifact) -> StreamingResponse:
@@ -216,6 +224,30 @@ def export_accounts_any2api(body: BatchExportRequest):
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
     return _stream_artifact(artifact)
+
+
+@router.post("/codex-oauth/authorize")
+def authorize_codex_oauth_batch(body: CodexOAuthBatchRequest):
+    try:
+        records = AccountsRepository().select_for_export(
+            AccountExportSelection(
+                platform=body.platform or "chatgpt",
+                ids=body.ids,
+                select_all=body.select_all,
+                status_filter=body.status_filter or "",
+                search_filter=body.search_filter or "",
+            )
+        )
+        task = create_codex_oauth_batch_task(
+            platform=body.platform or "chatgpt",
+            account_ids=[int(item.id or 0) for item in records],
+            params=body.params,
+            concurrency=body.concurrency,
+        )
+        task_runtime.wake_up()
+        return task
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
 
 
 @router.post("/import")

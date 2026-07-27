@@ -34,6 +34,15 @@ def _truthy(value) -> bool:
     return str(value or "").strip().lower() in {"1", "true", "yes", "on", "是", "开启", "启用"}
 
 
+def _mask_phone_number(value) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if len(text) <= 8:
+        return "***"
+    return f"{text[:4]}****{text[-4:]}"
+
+
 def _int_setting(value, default: int, *, minimum: int = 1) -> int:
     try:
         result = int(float(value if value not in (None, "") else default))
@@ -240,6 +249,15 @@ class ChatGPTPlatform(BasePlatform):
                         "chips": chips,
                         "check_source": details.get("source"),
                     }
+                    me = details.get("me")
+                    if isinstance(me, dict):
+                        phone_number = _mask_phone_number(me.get("phone_number"))
+                        overview["phone_bound"] = bool(phone_number)
+                        if phone_number:
+                            overview["phone_number_masked"] = phone_number
+                            overview["chips"].append("已绑手机")
+                        if me.get("email"):
+                            overview["remote_email"] = str(me.get("email") or "")
                     if isinstance(details.get("usage"), dict):
                         overview["chatgpt_usage"] = details["usage"]
                     self._last_check_overview = overview
@@ -434,7 +452,7 @@ class ChatGPTPlatform(BasePlatform):
                 return {"ok": False, "error": "Codex OAuth 授权需要账号密码"}
             browser_mode = str(params.get("browser_mode") or "").strip().lower()
             if not browser_mode:
-                browser_mode = str((self.config.extra or {}).get("codex_oauth_browser_mode") or "headless").strip().lower()
+                browser_mode = str((self.config.extra or {}).get("codex_oauth_browser_mode") or "headed").strip().lower()
             headless = browser_mode in {"headless", "true", "1", "yes", "后台", "后台浏览器"}
             keep_browser_open = _truthy(params.get("keep_browser_open") or (self.config.extra or {}).get("codex_oauth_keep_browser_open"))
             otp_callback = None

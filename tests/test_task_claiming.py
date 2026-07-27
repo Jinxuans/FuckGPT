@@ -2,6 +2,7 @@ import threading
 
 from application.tasks import (
     TASK_TYPE_ACCOUNT_CHECK_ALL,
+    TASK_TYPE_PLATFORM_ACTION,
     TASK_TYPE_REGISTER,
     claim_next_runnable_task,
     create_task,
@@ -41,6 +42,32 @@ def test_claim_allows_different_task_types_on_same_platform():
     assert next_claimed["id"] == account_check["id"]
     assert next_claimed["id"] != blocked_register["id"]
     assert next_claimed["scope"] == "chatgpt:account_check_all"
+
+
+def test_claim_allows_codex_oauth_actions_for_different_accounts():
+    first = create_task(
+        task_type=TASK_TYPE_PLATFORM_ACTION,
+        platform="chatgpt",
+        payload={"platform": "chatgpt", "account_id": 101, "action_id": "codex_oauth_authorize"},
+        progress_total=1,
+    )
+    second = create_task(
+        task_type=TASK_TYPE_PLATFORM_ACTION,
+        platform="chatgpt",
+        payload={"platform": "chatgpt", "account_id": 102, "action_id": "codex_oauth_authorize"},
+        progress_total=1,
+    )
+
+    claimed = claim_next_runnable_task()
+    assert claimed["id"] == first["id"]
+    next_claimed = claim_next_runnable_task(
+        running_scope_counts={claimed["scope"]: 1},
+        busy_account_keys=set(claimed["account_keys"]),
+        max_parallel_per_scope=1,
+    )
+
+    assert next_claimed["id"] == second["id"]
+    assert next_claimed["scope"] != claimed["scope"]
 
 
 def test_cancel_requested_worker_does_not_block_runtime_slots():

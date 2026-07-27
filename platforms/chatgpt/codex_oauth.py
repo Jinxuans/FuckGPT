@@ -368,11 +368,61 @@ def codex_credential_filename(email: str, plan_type: str, account_id: str) -> st
 
 
 class _OAuthCallbackServer:
-    def __init__(self, *, port: int = CODEX_CALLBACK_PORT):
+    def __init__(self, *, port: int = CODEX_CALLBACK_PORT, state: str = ""):
         self.port = int(port)
         self.event = threading.Event()
         self.result: dict[str, str] = {}
-        owner = self
+        self.state = str(state or "")
+
+    def __enter__(self) -> "_OAuthCallbackServer":
+        _oauth_callback_broker.register(self)
+        return self
+
+    def __exit__(self, _exc_type, _exc, _tb) -> None:
+        _oauth_callback_broker.unregister(self)
+
+    def wait(self, timeout: int) -> dict[str, str]:
+        if not self.event.wait(max(int(timeout), 1)):
+            raise RuntimeError("等待 Codex OAuth 回调超时")
+        return dict(self.result)
+
+
+class _OAuthCallbackBroker:
+    def __init__(self, *, port: int = CODEX_CALLBACK_PORT):
+        self.port = int(port)
+        self._lock = threading.RLock()
+        self._waiters: dict[str, _OAuthCallbackServer] = {}
+        self._httpd: ThreadingHTTPServer | None = None
+        self._thread: threading.Thread | None = None
+
+    def register(self, waiter: _OAuthCallbackServer) -> None:
+        if not waiter.state:
+            waiter.state = secrets.token_urlsafe(16)
+        with self._lock:
+            self._ensure_started()
+            self._waiters[waiter.state] = waiter
+
+    def unregister(self, waiter: _OAuthCallbackServer) -> None:
+        with self._lock:
+            if self._waiters.get(waiter.state) is waiter:
+                self._waiters.pop(waiter.state, None)
+
+    def deliver(self, result: dict[str, str]) -> bool:
+        state = str(result.get("state") or "")
+        with self._lock:
+            waiter = self._waiters.get(state)
+            if not waiter and len(self._waiters) == 1:
+                waiter = next(iter(self._waiters.values()))
+            if not waiter:
+                return False
+            waiter.result = dict(result)
+            waiter.event.set()
+            return True
+
+    def _ensure_started(self) -> None:
+        if self._httpd and self._thread and self._thread.is_alive():
+            return
+        broker = self
 
         class Handler(BaseHTTPRequestHandler):
             def log_message(self, _format: str, *_args: Any) -> None:
@@ -392,33 +442,23 @@ class _OAuthCallbackServer:
                     self.send_error(404)
                     return
                 query = parse_qs(parsed.query)
-                owner.result = {
+                result = {
                     "code": (query.get("code") or [""])[0],
                     "state": (query.get("state") or [""])[0],
                     "error": (query.get("error") or [""])[0],
                     "error_description": (query.get("error_description") or [""])[0],
                 }
-                owner.event.set()
+                broker.deliver(result)
                 self.send_response(302)
                 self.send_header("Location", "/success")
                 self.end_headers()
 
-        self.httpd = ThreadingHTTPServer(("127.0.0.1", self.port), Handler)
-        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        self._httpd = ThreadingHTTPServer(("127.0.0.1", self.port), Handler)
+        self._thread = threading.Thread(target=self._httpd.serve_forever, daemon=True, name="codex-oauth-callback")
+        self._thread.start()
 
-    def __enter__(self) -> "_OAuthCallbackServer":
-        self.thread.start()
-        return self
 
-    def __exit__(self, _exc_type, _exc, _tb) -> None:
-        self.httpd.shutdown()
-        self.httpd.server_close()
-        self.thread.join(timeout=2)
-
-    def wait(self, timeout: int) -> dict[str, str]:
-        if not self.event.wait(max(int(timeout), 1)):
-            raise RuntimeError("等待 Codex OAuth 回调超时")
-        return dict(self.result)
+_oauth_callback_broker = _OAuthCallbackBroker(port=CODEX_CALLBACK_PORT)
 
 
 def _exchange_code_for_tokens(
@@ -1307,7 +1347,7 @@ def perform_codex_oauth_login_on_page(
     auth_url = build_codex_authorize_url(state, pkce)
     log("Codex OAuth 授权链接已生成，复用当前浏览器窗口")
 
-    with _OAuthCallbackServer(port=CODEX_CALLBACK_PORT) as callback_server:
+    with _OAuthCallbackServer(port=CODEX_CALLBACK_PORT, state=state) as callback_server:
         callback = _drive_codex_oauth_page(
             page,
             auth_url=auth_url,
@@ -1367,7 +1407,7 @@ def perform_codex_oauth_login(
             launch_opts["geoip"] = True
     _apply_camoufox_visible_window_limit(launch_opts, browser_config)
 
-    with _OAuthCallbackServer(port=CODEX_CALLBACK_PORT) as callback_server:
+    with _OAuthCallbackServer(port=CODEX_CALLBACK_PORT, state=state) as callback_server:
         browser_context = open_browser_backend(
             launch_opts=launch_opts,
             config=browser_config,

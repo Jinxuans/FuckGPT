@@ -154,6 +154,13 @@ def test_register_task_honors_twenty_worker_concurrency_limit():
     assert tasks_module._registration_concurrency(20, 6) == 6
 
 
+def test_codex_oauth_batch_concurrency_is_capped():
+    assert tasks_module._codex_oauth_batch_concurrency(1, 10) == 1
+    assert tasks_module._codex_oauth_batch_concurrency(3, 10) == 3
+    assert tasks_module._codex_oauth_batch_concurrency(99, 10) == 5
+    assert tasks_module._codex_oauth_batch_concurrency(5, 2) == 2
+
+
 def test_register_task_uploads_each_saved_account_immediately(monkeypatch):
     events = []
 

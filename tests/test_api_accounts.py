@@ -207,6 +207,39 @@ def test_check_all_freezes_filtered_account_ids(client):
     assert payload["account_ids"] == [subscribed_id]
 
 
+def test_codex_oauth_batch_freezes_selected_account_ids_and_params(client):
+    first_id = _create_account(email="first-codex@test.com")
+    _create_account(email="second-codex@test.com")
+    third_id = _create_account(email="third-codex@test.com")
+
+    resp = client.post(
+        "/api/accounts/codex-oauth/authorize",
+        json={
+            "platform": "chatgpt",
+            "ids": [first_id, third_id],
+            "select_all": False,
+            "concurrency": 3,
+            "params": {
+                "browser_mode": "headless",
+                "keep_browser_open": "false",
+                "platform_proxy_mode": "manual",
+                "platform_proxy_value": "socks5://user:pass@proxy.example:1080",
+            },
+        },
+    )
+
+    assert resp.status_code == 200
+    task_id = resp.json()["task_id"]
+    with Session(engine) as session:
+        task = session.get(TaskModel, task_id)
+        payload = task.get_payload()
+    assert task.type == "codex_oauth_batch"
+    assert set(payload["account_ids"]) == {first_id, third_id}
+    assert payload["action_id"] == "codex_oauth_authorize"
+    assert payload["concurrency"] == 3
+    assert payload["params"]["platform_proxy_mode"] == "manual"
+
+
 def test_export_any2api_multi_platform(client):
     _create_account(platform="kiro", email="k@test.com", password="")
     _create_account(platform="grok", email="g@test.com", password="")

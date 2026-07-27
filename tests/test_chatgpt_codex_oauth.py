@@ -15,6 +15,8 @@ from platforms.chatgpt.codex_oauth import (
     CODEX_REDIRECT_URI,
     CODEX_SCOPE,
     PKCECodes,
+    _OAuthCallbackBroker,
+    _OAuthCallbackServer,
     _detect_codex_next_step_from_dom,
     build_codex_authorize_url,
     _drive_codex_oauth_page,
@@ -25,6 +27,19 @@ from platforms.chatgpt.codex_oauth import (
     _select_text_message_delivery,
 )
 from platforms.chatgpt.plugin import ChatGPTPlatform, _CodexSmsPhoneCallback
+
+
+def test_codex_oauth_callback_broker_routes_by_state():
+    broker = _OAuthCallbackBroker(port=0)
+    first = _OAuthCallbackServer(port=0, state="state-one")
+    second = _OAuthCallbackServer(port=0, state="state-two")
+    broker._waiters = {"state-one": first, "state-two": second}
+
+    assert broker.deliver({"code": "code-two", "state": "state-two"}) is True
+
+    assert not first.event.is_set()
+    assert second.event.is_set()
+    assert second.wait(1)["code"] == "code-two"
 
 
 def test_codex_oauth_authorize_url_matches_cli_proxy_api_flow():

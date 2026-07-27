@@ -36,6 +36,7 @@ from infrastructure.platform_runtime import PlatformRuntime
 TASK_TYPE_REGISTER = "register"
 TASK_TYPE_ACCOUNT_CHECK_ALL = "account_check_all"
 TASK_TYPE_PLATFORM_ACTION = "platform_action"
+TASK_TYPE_CODEX_OAUTH_BATCH = "codex_oauth_batch"
 
 TASK_STATUS_PENDING = "pending"
 TASK_STATUS_CLAIMED = "claimed"
@@ -50,6 +51,7 @@ TASK_STATUS_CANCELLED = "cancelled"
 # backend contract; anything larger is deliberately bounded to avoid an
 # accidental unbounded thread pool.
 MAX_REGISTER_CONCURRENCY = 20
+MAX_CODEX_OAUTH_BATCH_CONCURRENCY = 5
 
 TERMINAL_TASK_STATUSES = {
     TASK_STATUS_SUCCEEDED,
@@ -159,7 +161,21 @@ def _task_account_keys(task_type: str, payload: dict[str, Any]) -> list[str]:
         account_id = int(payload.get("account_id", 0) or 0)
         if account_id > 0:
             return [f"account:{account_id}"]
+    if task_type == TASK_TYPE_CODEX_OAUTH_BATCH:
+        return [
+            f"account:{int(item)}"
+            for item in payload.get("account_ids", [])
+            if int(item or 0) > 0
+        ]
     return []
+
+
+def _task_scope(task_type: str, platform: str, payload: dict[str, Any]) -> str:
+    if task_type == TASK_TYPE_PLATFORM_ACTION and str(payload.get("action_id") or "") == "codex_oauth_authorize":
+        account_id = int(payload.get("account_id", 0) or 0)
+        if account_id > 0:
+            return f"{platform}:{task_type}:codex_oauth_authorize:{account_id}"
+    return f"{platform}:{task_type}"
 
 
 def serialize_task(task: TaskModel) -> dict[str, Any]:
@@ -276,6 +292,28 @@ def create_platform_action_task(payload: dict[str, Any]) -> dict[str, Any]:
         platform=str(payload.get("platform", "")),
         payload=payload,
         progress_total=1,
+    )
+
+
+def create_codex_oauth_batch_task(
+    *,
+    platform: str,
+    account_ids: list[int],
+    params: dict[str, Any] | None = None,
+    concurrency: int = 1,
+) -> dict[str, Any]:
+    normalized_ids = [int(item) for item in account_ids or [] if int(item or 0) > 0]
+    return create_task(
+        task_type=TASK_TYPE_CODEX_OAUTH_BATCH,
+        platform=platform or "chatgpt",
+        payload={
+            "platform": platform or "chatgpt",
+            "account_ids": normalized_ids,
+            "action_id": "codex_oauth_authorize",
+            "params": dict(params or {}),
+            "concurrency": int(concurrency or 1),
+        },
+        progress_total=len(normalized_ids),
     )
 
 
@@ -472,7 +510,7 @@ def claim_next_runnable_task(
             payload = task.get_payload()
             platform = task.platform or str(payload.get("platform", "") or "")
             account_keys = _task_account_keys(task.type, payload)
-            scope = f"{platform}:{task.type}"
+            scope = _task_scope(task.type, platform, payload)
             if scope and running_scope_counts.get(scope, 0) >= max_parallel_per_scope:
                 continue
             if account_keys and busy_account_keys.intersection(account_keys):
@@ -751,6 +789,7 @@ def execute_task(task_id: str) -> None:
         TASK_TYPE_REGISTER: _execute_register_task,
         TASK_TYPE_ACCOUNT_CHECK_ALL: _execute_account_check_all_task,
         TASK_TYPE_PLATFORM_ACTION: _execute_platform_action_task,
+        TASK_TYPE_CODEX_OAUTH_BATCH: _execute_codex_oauth_batch_task,
     }
     handler = handlers.get(task_type)
     if not handler:
@@ -827,6 +866,18 @@ def _registration_concurrency(requested: Any, count: int) -> int:
         max(int(requested or 1), 1),
         max(int(count or 1), 1),
         MAX_REGISTER_CONCURRENCY,
+    )
+
+
+def _codex_oauth_batch_concurrency(requested: Any, count: int) -> int:
+    try:
+        value = int(requested or 1)
+    except Exception:
+        value = 1
+    return min(
+        max(value, 1),
+        max(int(count or 1), 1),
+        MAX_CODEX_OAUTH_BATCH_CONCURRENCY,
     )
 
 
@@ -1134,6 +1185,110 @@ def _execute_platform_action_task(payload: dict[str, Any], logger: TaskLogger) -
         logger.log(message, event_type="summary")
     logger.set_progress(1, 1)
     logger.finish(TASK_STATUS_SUCCEEDED)
+
+
+def _execute_codex_oauth_batch_task(payload: dict[str, Any], logger: TaskLogger) -> None:
+    platform = str(payload.get("platform") or "chatgpt")
+    account_ids = [
+        int(item)
+        for item in payload.get("account_ids", [])
+        if int(item or 0) > 0
+    ]
+    params = dict(payload.get("params") or {})
+    if not params.get("browser_mode"):
+        params["browser_mode"] = "headless"
+    if not params.get("keep_browser_open"):
+        params["keep_browser_open"] = "false"
+    concurrency = _codex_oauth_batch_concurrency(payload.get("concurrency", 1), len(account_ids))
+
+    with Session(engine) as session:
+        records = session.exec(
+            select(AccountModel)
+            .where(AccountModel.id.in_(account_ids))
+            .where(AccountModel.platform == platform)
+        ).all() if account_ids else []
+        by_id = {int(item.id or 0): item for item in records}
+
+    accounts = [by_id[item] for item in account_ids if item in by_id]
+    total = len(accounts)
+    logger.set_progress(0, total)
+    logger.log(f"Codex OAuth 批量授权: {total} 个账号，并发 {concurrency}")
+    if total == 0:
+        logger.set_result_data({"success": 0, "fail": 0, "accounts": []})
+        logger.finish(TASK_STATUS_SUCCEEDED)
+        return
+
+    def _do_one(model: AccountModel) -> dict[str, Any]:
+        account_id = int(model.id or 0)
+        email = str(model.email or "")
+        logger.set_subtask(f"account_{account_id}", email or f"账号 {account_id}")
+        try:
+            if logger.is_cancel_requested():
+                return {"account_id": account_id, "email": email, "cancelled": True}
+            logger.log(f"{email}: 开始 Codex OAuth 授权")
+            runtime = PlatformRuntime()
+            result = runtime.execute_action(
+                type("Command", (), {
+                    "platform": platform,
+                    "account_id": account_id,
+                    "action_id": "codex_oauth_authorize",
+                    "params": params,
+                })(),
+                log_fn=logger.log,
+                cancel_check=logger.is_cancel_requested,
+            )
+            if logger.is_cancel_requested() or str(result.error or "") == "任务已取消":
+                return {"account_id": account_id, "email": email, "cancelled": True}
+            if not result.ok:
+                error = str(result.error or "Codex OAuth 授权失败")
+                logger.record_error(error)
+                logger.log(f"{email}: Codex OAuth 授权失败: {error}", level="error")
+                return {"account_id": account_id, "email": email, "ok": False, "error": error}
+            logger.record_success()
+            logger.log(f"{email}: Codex OAuth 授权完成")
+            return {"account_id": account_id, "email": email, "ok": True, "data": result.data}
+        except Exception as exc:
+            error = str(exc)
+            logger.record_error(error)
+            logger.log(f"{email}: Codex OAuth 授权异常: {error}", level="error")
+            return {"account_id": account_id, "email": email, "ok": False, "error": error}
+        finally:
+            logger.clear_subtask()
+
+    completed = 0
+    success = 0
+    errors: list[str] = []
+    results: list[dict[str, Any]] = []
+    with ThreadPoolExecutor(max_workers=concurrency) as pool:
+        pending = {pool.submit(_do_one, model) for model in accounts}
+        while pending:
+            done, pending = wait(pending, return_when=FIRST_COMPLETED)
+            for future in done:
+                result = future.result()
+                if result.get("cancelled"):
+                    logger.finish(TASK_STATUS_CANCELLED, error="任务已取消")
+                    return
+                completed += 1
+                if result.get("ok"):
+                    success += 1
+                else:
+                    errors.append(str(result.get("error") or "unknown"))
+                results.append(result)
+                logger.set_progress(completed, total)
+            if logger.is_cancel_requested():
+                logger.finish(TASK_STATUS_CANCELLED, error="任务已取消")
+                return
+
+    result_data = {
+        "success": success,
+        "fail": len(errors),
+        "account_ids": [item["account_id"] for item in results if item.get("ok")],
+        "accounts": results,
+    }
+    logger.set_result_data(result_data)
+    logger.log(f"Codex OAuth 批量授权完成: 成功 {success} 个, 失败 {len(errors)} 个", event_type="summary")
+    final_status = TASK_STATUS_FAILED if errors and success == 0 else TASK_STATUS_SUCCEEDED
+    logger.finish(final_status, error=errors[0] if final_status == TASK_STATUS_FAILED else "")
 
 
 def _execute_account_check_all_task(payload: dict[str, Any], logger: TaskLogger) -> None:

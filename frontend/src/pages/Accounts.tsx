@@ -12,7 +12,7 @@ import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
 import { getTaskStatusText, TASK_STATUS_VARIANTS } from '@/lib/tasks'
-import { RefreshCw, Copy, ExternalLink, Download, Upload, Plus, X, Mail, Trash2, Zap } from 'lucide-react'
+import { RefreshCw, Copy, ExternalLink, Download, Upload, Plus, X, Mail, Trash2, Zap, ShieldCheck } from 'lucide-react'
 
 const STATUS_VARIANT: Record<string, any> = {
   registered: 'default', trial: 'success', subscribed: 'success',
@@ -1651,10 +1651,12 @@ export default function Accounts() {
   const [actionResult, setActionResult] = useState<{ title: string; payload: any } | null>(null)
   const [bulkDeleting, setBulkDeleting] = useState(false)
   const [batchRefreshing, setBatchRefreshing] = useState(false)
+  const [batchCodexAuthorizing, setBatchCodexAuthorizing] = useState(false)
   const [batchTask, setBatchTask] = useState<{ taskId: string; title: string } | null>(null)
   const [batchTaskStatus, setBatchTaskStatus] = useState<string | null>(null)
-  const [batchProxyMode, setBatchProxyMode] = useState('proxy_service')
+  const [batchProxyMode, setBatchProxyMode] = useState('direct')
   const [batchProxyValue, setBatchProxyValue] = useState('')
+  const [batchCodexConcurrency, setBatchCodexConcurrency] = useState(2)
 
   useEffect(() => {
     getPlatforms().then((list: any[]) => {
@@ -1762,11 +1764,13 @@ export default function Accounts() {
             setBatchTask(null)
             setBatchTaskStatus(null)
             setBatchRefreshing(false)
+            setBatchCodexAuthorizing(false)
             load()
           }}
           onDone={(status) => {
             setBatchTaskStatus(status)
             setBatchRefreshing(false)
+            setBatchCodexAuthorizing(false)
             load()
           }}
         />
@@ -1852,8 +1856,8 @@ export default function Accounts() {
               className="h-7 rounded-md border border-[var(--border)] bg-transparent px-2 text-xs text-[var(--text-secondary)] outline-none focus:border-[var(--text-primary)]"
               title="批量刷新代理"
             >
-              <option value="proxy_service">代理服务</option>
               <option value="direct">直连</option>
+              <option value="proxy_service">代理服务</option>
               <option value="manual">手动代理</option>
             </select>
             {batchProxyMode === 'manual' ? (
@@ -1865,10 +1869,67 @@ export default function Accounts() {
                 className="h-7 w-56 rounded-md border border-[var(--border)] bg-transparent px-2 font-mono text-xs text-[var(--text-secondary)] outline-none focus:border-[var(--text-primary)]"
               />
             ) : null}
+            {tab === 'chatgpt' && selectedCount > 0 ? (
+              <>
+                <select
+                  value={batchCodexConcurrency}
+                  onChange={e => setBatchCodexConcurrency(Number(e.target.value) || 1)}
+                  className="h-7 rounded-md border border-[var(--border)] bg-transparent px-2 text-xs text-[var(--text-secondary)] outline-none focus:border-[var(--text-primary)]"
+                  title="Codex OAuth 并发数"
+                >
+                  {[1, 2, 3, 4, 5].map(value => (
+                    <option key={value} value={value}>并发 {value}</option>
+                  ))}
+                </select>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  disabled={batchCodexAuthorizing || batchRefreshing || loading}
+                  className="h-7 px-2.5 text-[var(--text-muted)] hover:text-violet-500 hover:bg-violet-500/10"
+                  title="为勾选账号批量执行 Codex OAuth 授权"
+                  onClick={async () => {
+                    setBatchCodexAuthorizing(true)
+                    try {
+                      const ids = [...selectedIds]
+                      const res = await apiFetch('/accounts/codex-oauth/authorize', {
+                        method: 'POST',
+                        body: JSON.stringify({
+                          platform: tab,
+                          ids,
+                          select_all: false,
+                          platform_proxy_mode: batchProxyMode,
+                          platform_proxy_value: batchProxyValue.trim(),
+                          concurrency: batchCodexConcurrency,
+                          params: {
+                            browser_mode: 'headless',
+                            keep_browser_open: 'false',
+                            platform_proxy_mode: batchProxyMode,
+                            platform_proxy_value: batchProxyValue.trim(),
+                          },
+                        }),
+                      })
+                      if (res?.task_id) {
+                        setBatchTask({
+                          taskId: res.task_id,
+                          title: `Codex OAuth 批量授权 (${ids.length})`,
+                        })
+                        setBatchTaskStatus(null)
+                      }
+                    } catch (e) {
+                      console.error(e)
+                      setBatchCodexAuthorizing(false)
+                    }
+                  }}
+                >
+                  <ShieldCheck className={`mr-1 h-3.5 w-3.5 ${batchCodexAuthorizing ? 'animate-pulse' : ''}`} />
+                  {batchCodexAuthorizing ? '授权中...' : `Codex授权(${selectedCount})`}
+                </Button>
+              </>
+            ) : null}
             <Button
               variant="ghost"
               size="sm"
-              disabled={batchRefreshing || loading}
+              disabled={batchRefreshing || batchCodexAuthorizing || loading}
               className="h-7 px-2.5 text-[var(--text-muted)] hover:text-amber-500 hover:bg-amber-500/10"
               title={t('accounts.refreshCreditsTitle')}
               onClick={async () => {
