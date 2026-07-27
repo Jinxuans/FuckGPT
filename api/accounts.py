@@ -184,6 +184,23 @@ def export_accounts_cpa(body: BatchExportRequest):
     return _stream_artifact(artifact)
 
 
+@router.post("/export/codex")
+def export_accounts_codex(body: BatchExportRequest):
+    try:
+        artifact = exports_service.export_chatgpt_codex(
+            AccountExportSelection(
+                platform=body.platform,
+                ids=body.ids,
+                select_all=body.select_all,
+                status_filter=body.status_filter or "",
+                search_filter=body.search_filter or "",
+            )
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return _stream_artifact(artifact)
+
+
 @router.post("/export/any2api")
 def export_accounts_any2api(body: BatchExportRequest):
     try:

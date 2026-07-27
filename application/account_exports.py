@@ -60,6 +60,17 @@ def _credential_value(item: AccountRecord, *keys: str) -> str:
     return ""
 
 
+def _legacy_extra_value(item: AccountRecord, *keys: str) -> str:
+    legacy_extra = (item.overview or {}).get("legacy_extra")
+    if not isinstance(legacy_extra, dict):
+        return ""
+    for key in keys:
+        value = legacy_extra.get(key)
+        if value not in (None, ""):
+            return str(value)
+    return ""
+
+
 def _mailbox_provider_name(item: AccountRecord) -> str:
     for resource in item.provider_resources or []:
         if resource.get("resource_type") == "mailbox" and resource.get("provider_name"):
@@ -279,16 +290,59 @@ def _sub2api_codex_import_url(base_url: str) -> str:
 
 
 def _make_cockpit_token(item: AccountRecord) -> dict:
-    payload = _chatgpt_export_payload(item)
+    chatgpt_payload = _chatgpt_export_payload(item)
+    access_token = (
+        _credential_value(item, "codex_access_token")
+        or _legacy_extra_value(item, "codex_access_token")
+        or chatgpt_payload["access_token"]
+    )
+    refresh_token = (
+        _credential_value(item, "codex_refresh_token")
+        or _legacy_extra_value(item, "codex_refresh_token")
+        or chatgpt_payload["refresh_token"]
+    )
+    id_token = (
+        _credential_value(item, "codex_id_token")
+        or _legacy_extra_value(item, "codex_id_token")
+        or chatgpt_payload["id_token"]
+    )
+    auth_info = _chatgpt_auth_info(access_token, id_token)
+    account_id = (
+        _credential_value(item, "codex_account_id")
+        or _legacy_extra_value(item, "codex_account_id")
+        or str(auth_info.get("chatgpt_account_id", "") or auth_info.get("account_id", "") or "")
+        or chatgpt_payload["account_id"]
+    )
+    email = (
+        _credential_value(item, "codex_email")
+        or _legacy_extra_value(item, "codex_email")
+        or chatgpt_payload["email"]
+    )
+    last_refresh = (
+        _credential_value(item, "codex_last_refresh")
+        or _legacy_extra_value(item, "codex_last_refresh")
+        or chatgpt_payload["last_refresh"]
+        or ""
+    )
+    expired = (
+        _credential_value(item, "codex_expires_at")
+        or _legacy_extra_value(item, "codex_expires_at")
+        or ""
+    )
+    if not expired and access_token:
+        payload = _decode_jwt_payload(access_token)
+        exp_timestamp = payload.get("exp")
+        if isinstance(exp_timestamp, int) and exp_timestamp > 0:
+            expired = _isoformat(datetime.fromtimestamp(exp_timestamp, tz=timezone.utc)) or ""
     return {
         "type": "codex",
-        "id_token": payload["id_token"],
-        "access_token": payload["access_token"],
-        "refresh_token": payload["refresh_token"],
-        "account_id": payload["account_id"],
-        "last_refresh": payload["last_refresh"] or "",
-        "email": payload["email"],
-        "expired": payload["expires_at"] or "",
+        "id_token": id_token,
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "account_id": account_id,
+        "last_refresh": last_refresh,
+        "email": email,
+        "expired": expired,
         "account_note": "",
     }
 
@@ -638,6 +692,31 @@ class AccountExportsService:
         buffer.seek(0)
         return ExportArtifact(
             filename=_timestamp_name("cpa_tokens", "zip"),
+            media_type="application/zip",
+            content=buffer,
+        )
+
+    def export_chatgpt_codex(self, selection: AccountExportSelection) -> ExportArtifact:
+        items = self._load_chatgpt_items(selection)
+        if len(items) == 1:
+            item = items[0]
+            content = json.dumps(_make_cockpit_token(item), ensure_ascii=False, indent=2)
+            return ExportArtifact(
+                filename=f"{item.email}_codex.json",
+                media_type="application/json",
+                content=content,
+            )
+
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+            for item in items:
+                archive.writestr(
+                    f"{item.email}_codex.json",
+                    json.dumps(_make_cockpit_token(item), ensure_ascii=False, indent=2),
+                )
+        buffer.seek(0)
+        return ExportArtifact(
+            filename=_timestamp_name("codex_tokens", "zip"),
             media_type="application/zip",
             content=buffer,
         )

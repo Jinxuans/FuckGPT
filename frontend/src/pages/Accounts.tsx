@@ -1555,6 +1555,7 @@ function ExportMenu({
     { key: 'any2api', label: '导出 Any2Api' },
     { key: 'sub2api', label: '导出 Sub2Api' },
     { key: 'sub2api-agent-identity', label: '导出 Agent Identity (Sub2Api)' },
+    { key: 'codex', label: '导出 Codex' },
     { key: 'cpa', label: '导出 CPA' },
   ]
 

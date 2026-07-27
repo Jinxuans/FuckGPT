@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import base64
+import io
 import json
+import zipfile
 from datetime import datetime, timedelta, timezone
 
 from sqlmodel import Session
@@ -265,6 +267,76 @@ def test_export_cpa_falls_back_to_stored_user_id_for_account_id():
     payload = json.loads(artifact.content)
     assert payload["account_id"] == "acct-from-user-id"
     assert payload["refresh_token"] == "rt_fallback"
+
+
+def test_export_codex_prefers_codex_oauth_credentials():
+    access_token = _make_jwt({
+        "exp": 1777166030,
+        "https://api.openai.com/auth": {
+            "chatgpt_account_id": "acct-chatgpt",
+        },
+    })
+    codex_access_token = _make_jwt({
+        "exp": 1777169999,
+        "https://api.openai.com/auth": {
+            "chatgpt_account_id": "acct-codex",
+        },
+    })
+    save_account(
+        Account(
+            platform="chatgpt",
+            email="codex@test.com",
+            password="TestPass123!",
+            extra={
+                "access_token": access_token,
+                "refresh_token": "rt_chatgpt",
+                "id_token": "id_chatgpt",
+                "codex_access_token": codex_access_token,
+                "codex_refresh_token": "rt_codex",
+                "codex_id_token": "id_codex",
+                "codex_account_id": "acct-codex-stored",
+                "codex_email": "codex-login@test.com",
+                "codex_expires_at": "2026-01-02T03:04:05Z",
+                "codex_last_refresh": "2026-01-01T00:00:00Z",
+            },
+        )
+    )
+
+    artifact = AccountExportsService(AccountsRepository()).export_chatgpt_codex(
+        AccountExportSelection(platform="chatgpt", select_all=True)
+    )
+    payload = json.loads(artifact.content)
+
+    assert artifact.filename == "codex@test.com_codex.json"
+    assert payload == {
+        "type": "codex",
+        "id_token": "id_codex",
+        "access_token": codex_access_token,
+        "refresh_token": "rt_codex",
+        "account_id": "acct-codex-stored",
+        "last_refresh": "2026-01-01T00:00:00Z",
+        "email": "codex-login@test.com",
+        "expired": "2026-01-02T03:04:05Z",
+        "account_note": "",
+    }
+
+
+def test_export_codex_endpoint_batches_as_zip(client):
+    first_id = _create_account(email="first-codex@test.com")
+    second_id = _create_account(email="second-codex@test.com")
+
+    resp = client.post(
+        "/api/accounts/export/codex",
+        json={"platform": "chatgpt", "ids": [first_id, second_id]},
+    )
+
+    assert resp.status_code == 200
+    assert "codex_tokens" in resp.headers.get("content-disposition", "")
+    with zipfile.ZipFile(io.BytesIO(resp.content)) as archive:
+        assert sorted(archive.namelist()) == [
+            "first-codex@test.com_codex.json",
+            "second-codex@test.com_codex.json",
+        ]
 
 
 def test_export_agent_identity_sub2api_registers_from_stored_tokens(monkeypatch):
