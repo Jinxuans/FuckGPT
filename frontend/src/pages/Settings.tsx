@@ -4,12 +4,12 @@ import { getConfigOptions } from '@/lib/app-data'
 import type { ProviderOption, ProviderSetting } from '@/lib/config-options'
 import { useI18n } from '@/lib/i18n-context'
 
-type ProviderSettingsTab = 'mailbox' | 'sms'
+type ProviderSettingsTab = 'mailbox' | 'sms' | 'proxy'
 
 const TAB_COPY: Record<ProviderSettingsTab, {
-  catalogKey: 'mailbox_providers' | 'sms_providers'
-  settingsKey: 'mailbox_settings' | 'sms_settings'
-  usageKey: 'settings.provider.mailboxUsage' | 'settings.provider.smsUsage'
+  catalogKey: 'mailbox_providers' | 'sms_providers' | 'proxy_providers'
+  settingsKey: 'mailbox_settings' | 'sms_settings' | 'proxy_settings'
+  usageKey: 'settings.provider.mailboxUsage' | 'settings.provider.smsUsage' | 'settings.provider.proxyUsage'
 }> = {
   mailbox: {
     catalogKey: 'mailbox_providers',
@@ -20,6 +20,11 @@ const TAB_COPY: Record<ProviderSettingsTab, {
     catalogKey: 'sms_providers',
     settingsKey: 'sms_settings',
     usageKey: 'settings.provider.smsUsage',
+  },
+  proxy: {
+    catalogKey: 'proxy_providers',
+    settingsKey: 'proxy_settings',
+    usageKey: 'settings.provider.proxyUsage',
   },
 }
 

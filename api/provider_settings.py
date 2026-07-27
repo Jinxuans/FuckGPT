@@ -77,6 +77,8 @@ def test_provider(body: ProviderTestRequest):
         return {"ok": True, "message": "验证码服务暂不支持在线测试，请在注册任务中验证"}
     elif body.provider_type == "sms":
         return _test_sms(definition.driver_type or body.provider_key, extra)
+    elif body.provider_type == "proxy":
+        return _test_proxy(definition.driver_type or body.provider_key, extra)
     return {"ok": False, "error": f"不支持测试的 provider 类型: {body.provider_type}"}
 
 
@@ -135,3 +137,55 @@ def _test_sms(driver_type: str, extra: dict) -> dict:
         }
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "error": f"SMSBower 连接失败: {str(exc)}"}
+
+
+def _mask_proxy(proxy_url: str) -> str:
+    from urllib.parse import urlsplit, urlunsplit
+
+    text = str(proxy_url or "").strip()
+    if not text:
+        return ""
+    try:
+        parsed = urlsplit(text)
+        if not parsed.username and not parsed.password:
+            return text
+        host = parsed.hostname or ""
+        port = f":{parsed.port}" if parsed.port else ""
+        return urlunsplit((parsed.scheme, f"***:***@{host}{port}", parsed.path, parsed.query, parsed.fragment))
+    except Exception:
+        return text
+
+
+def _test_proxy(driver_type: str, extra: dict) -> dict:
+    """Validate proxy provider config by resolving one proxy and probing httpbin."""
+    import requests
+    from core.proxy_providers import create_proxy_provider
+
+    try:
+        provider = create_proxy_provider(driver_type, extra)
+        proxy = provider.get_proxy()
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": f"代理配置无效: {str(exc)}"}
+
+    if not proxy:
+        return {"ok": False, "error": "代理服务未返回可用代理"}
+
+    try:
+        response = requests.get(
+            "https://httpbin.org/ip",
+            proxies={"http": proxy, "https": proxy},
+            timeout=12,
+        )
+        response.raise_for_status()
+        return {
+            "ok": True,
+            "message": f"代理连接成功：{_mask_proxy(proxy)}",
+            "proxy": _mask_proxy(proxy),
+            "origin": response.json().get("origin", ""),
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "ok": False,
+            "error": f"代理连接失败: {str(exc)}",
+            "proxy": _mask_proxy(proxy),
+        }

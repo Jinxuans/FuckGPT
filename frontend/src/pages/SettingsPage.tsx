@@ -257,11 +257,11 @@ export default function SettingsPage({
   const { t } = useI18n();
   const [searchParams] = useSearchParams();
   const requestedTab = searchParams.get("tab") || "general";
-  const tab = ["general", "mailbox", "sms"].includes(requestedTab)
+  const tab = ["general", "mailbox", "sms", "proxy"].includes(requestedTab)
     ? requestedTab
     : "general";
 
-  const configTabs = ["mailbox", "sms"];
+  const configTabs = ["mailbox", "sms", "proxy"];
   const isConfigTab = configTabs.includes(tab);
 
   // Page title mapping
@@ -269,6 +269,7 @@ export default function SettingsPage({
     general: t("settings.title.general"),
     mailbox: t("settings.title.mailbox"),
     sms: t("settings.title.sms"),
+    proxy: t("settings.title.proxy"),
   };
 
   return (
@@ -278,7 +279,7 @@ export default function SettingsPage({
       </h1>
 
       {tab === "general" && <GeneralTab theme={theme} setTheme={setTheme} />}
-      {isConfigTab && <Settings providerType={tab as "mailbox" | "sms"} />}
+      {isConfigTab && <Settings providerType={tab as "mailbox" | "sms" | "proxy"} />}
     </div>
   );
 }
