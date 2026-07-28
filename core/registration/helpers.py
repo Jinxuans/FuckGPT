@@ -58,6 +58,7 @@ def build_otp_callback(
     before_ids_ref = {"value": getattr(ctx.identity, "before_ids", set())}
 
     def otp_cb():
+        ctx.platform.raise_if_cancelled()
         ctx.log(wait_message)
         kwargs = {"keyword": keyword, "before_ids": before_ids_ref["value"]}
         if timeout is not None:
@@ -65,11 +66,13 @@ def build_otp_callback(
         if code_pattern:
             kwargs["code_pattern"] = code_pattern
         code = mailbox.wait_for_code(mail_acct, **kwargs)
+        ctx.platform.raise_if_cancelled()
         if code:
             ctx.log(f"{success_label}: {code}")
         return code
 
     def refresh_before_ids():
+        ctx.platform.raise_if_cancelled()
         before_ids_ref["value"] = mailbox.get_current_ids(mail_acct)
         return before_ids_ref["value"]
 
@@ -93,12 +96,14 @@ def build_link_callback(
         return None
 
     def link_cb():
+        ctx.platform.raise_if_cancelled()
         ctx.log(wait_message)
         before_ids = mailbox.get_current_ids(mail_acct)
         kwargs = {"keyword": keyword, "before_ids": before_ids}
         if timeout is not None:
             kwargs["timeout"] = timeout
         link = mailbox.wait_for_link(mail_acct, **kwargs)
+        ctx.platform.raise_if_cancelled()
         if link:
             preview = link if len(link) <= preview_chars else f"{link[:preview_chars]}..."
             ctx.log(f"{success_label}: {preview}")

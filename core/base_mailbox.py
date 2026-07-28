@@ -18,6 +18,19 @@ class MailboxAccount:
 
 
 class BaseMailbox(ABC):
+    def set_cancel_checker(self, checker):
+        self._cancel_check_fn = checker if callable(checker) else (lambda: False)
+
+    def is_cancel_requested(self) -> bool:
+        try:
+            return bool(getattr(self, "_cancel_check_fn", lambda: False)())
+        except Exception:
+            return False
+
+    def raise_if_cancelled(self) -> None:
+        if self.is_cancel_requested():
+            raise RuntimeError("任务已取消")
+
     @abstractmethod
     def get_email(self) -> MailboxAccount:
         """获取一个可用邮箱。"""
@@ -66,6 +79,12 @@ class FallbackMailbox(BaseMailbox):
         if mailbox is None:
             raise RuntimeError(f"未找到邮箱 provider 上下文: {account.email}")
         return mailbox
+
+    def set_cancel_checker(self, checker):
+        super().set_cancel_checker(checker)
+        for _key, mailbox in self.providers:
+            if hasattr(mailbox, "set_cancel_checker"):
+                mailbox.set_cancel_checker(checker)
 
     def get_email(self) -> MailboxAccount:
         errors: list[str] = []

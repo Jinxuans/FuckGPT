@@ -657,6 +657,7 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
         pattern = re.compile(code_pattern or r"(?<!#)(?<!\d)(\d{6})(?!\d)")
         start = time.time()
         while time.time() - start < timeout:
+            self.raise_if_cancelled()
             for mail in self._messages(account):
                 if not self._message_is_for_account(mail, account):
                     continue
@@ -671,7 +672,9 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
                 match = pattern.search(text)
                 if match:
                     return match.group(1) if match.groups() else match.group(0)
-            time.sleep(5)
+            for _ in range(5):
+                self.raise_if_cancelled()
+                time.sleep(1)
         raise TimeoutError(f"等待验证码超时 ({timeout}s)")
 
     def wait_for_link(
@@ -684,6 +687,7 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
         seen = set(before_ids or [])
         start = time.time()
         while time.time() - start < timeout:
+            self.raise_if_cancelled()
             for mail in self._messages(account):
                 if not self._message_is_for_account(mail, account):
                     continue
@@ -695,5 +699,7 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
                 link = _extract_verification_link(self._message_text(mail), keyword)
                 if link:
                     return link
-            time.sleep(5)
+            for _ in range(5):
+                self.raise_if_cancelled()
+                time.sleep(1)
         raise TimeoutError(f"等待验证链接超时 ({timeout}s)")

@@ -180,8 +180,18 @@ class Hotmail007Mailbox(BaseMailbox):
         self.proxy = {"http": proxy, "https": proxy} if proxy else None
         self.session = session or requests.Session()
         self._cache: list[Hotmail007AccountEntry] = []
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
+        self._condition = threading.Condition(self._lock)
         self._log_fn = log_fn if callable(log_fn) else None
+        self._prefetch_enabled = False
+        self._prefetch_total = 0
+        self._prefetch_reserved = 0
+        self._prefetch_delivered = 0
+        self._prefetch_queue_max = 0
+        self._prefetch_stop = False
+        self._prefetch_active = 0
+        self._prefetch_errors: list[str] = []
+        self._prefetch_threads: list[threading.Thread] = []
 
     @classmethod
     def from_config(cls, config: dict) -> "Hotmail007Mailbox":
@@ -201,6 +211,51 @@ class Hotmail007Mailbox(BaseMailbox):
 
     def set_logger(self, log_fn) -> None:
         self._log_fn = log_fn if callable(log_fn) else None
+
+    def configure_prefetch(
+        self,
+        *,
+        total_needed: int,
+        buy_concurrency: int = 1,
+        queue_max: int = 1,
+    ) -> None:
+        total = _int_value(total_needed, 0, minimum=0)
+        if total <= 1:
+            return
+        concurrency = _int_value(buy_concurrency, 1, minimum=1, maximum=20)
+        queue_limit = _int_value(queue_max, concurrency, minimum=1, maximum=100)
+        worker_count = min(concurrency, total)
+        with self._condition:
+            if self._prefetch_enabled:
+                return
+            self._prefetch_enabled = True
+            self._prefetch_total = total
+            self._prefetch_reserved = 0
+            self._prefetch_delivered = 0
+            self._prefetch_queue_max = queue_limit
+            self._prefetch_stop = False
+            self._prefetch_active = 0
+            self._prefetch_errors = []
+            self._prefetch_threads = []
+            self._log(
+                f"Hotmail007 预取已启用：需求 {total} 个，买号并发 {worker_count}，队列上限 {queue_limit}"
+            )
+            for index in range(worker_count):
+                thread = threading.Thread(
+                    target=self._prefetch_worker,
+                    name=f"hotmail007-prefetch-{index + 1}",
+                    daemon=True,
+                )
+                self._prefetch_threads.append(thread)
+                thread.start()
+
+    def shutdown_prefetch(self) -> None:
+        with self._condition:
+            self._prefetch_stop = True
+            self._condition.notify_all()
+            threads = list(self._prefetch_threads)
+        for thread in threads:
+            thread.join(timeout=2)
 
     def _log(self, message: str) -> None:
         if not self._log_fn:
@@ -238,12 +293,13 @@ class Hotmail007Mailbox(BaseMailbox):
         message = str(payload.get("message") or "").strip()
         raise RuntimeError(f"Hotmail007 {action}失败: code={code}, message={message or 'unknown'}")
 
-    def _buy_once(self) -> tuple[str, list[Hotmail007AccountEntry]]:
+    def _buy_once(self, *, quantity: int | None = None) -> tuple[str, list[Hotmail007AccountEntry]]:
         if not self.client_key:
             raise RuntimeError("Hotmail007 clientKey 未配置")
         if not self.product_ids:
             raise RuntimeError("Hotmail007 productId 未配置")
         product_id = random.choice(self.product_ids)
+        buy_quantity = _int_value(quantity, self.buy_quantity, minimum=1, maximum=50)
 
         try:
             payload = self._get_json(
@@ -251,7 +307,7 @@ class Hotmail007Mailbox(BaseMailbox):
                 {
                     "clientKey": self.client_key,
                     "productId": product_id,
-                    "quantity": self.buy_quantity,
+                    "quantity": buy_quantity,
                 },
             )
             data = self._ensure_success(payload, action="购买")
@@ -266,26 +322,34 @@ class Hotmail007Mailbox(BaseMailbox):
         except Exception as exc:
             raise Hotmail007BuyError(product_id, str(exc).strip() or exc.__class__.__name__) from exc
 
-    def _buy_until_success(self) -> Hotmail007AccountEntry:
+    def _buy_batch_until_success(self, quantity: int | None = None) -> list[Hotmail007AccountEntry]:
+        requested_quantity = _int_value(quantity, self.buy_quantity, minimum=1, maximum=50)
         deadline = time.monotonic() + self.buy_timeout_seconds
         last_error = ""
+        self.raise_if_cancelled()
         self._log(
             "Hotmail007 开始循环购买邮箱"
-            f"（productId={','.join(self.product_ids)}, quantity={self.buy_quantity}, "
+            f"（productId={','.join(self.product_ids)}, quantity={requested_quantity}, "
             f"max_attempts={self.buy_max_attempts}, timeout={self.buy_timeout_seconds:g}s）"
         )
         for attempt in range(1, self.buy_max_attempts + 1):
+            self.raise_if_cancelled()
             if time.monotonic() > deadline:
                 break
             try:
-                product_id, entries = self._buy_once()
-                self._cache.extend(entries)
-                entry = self._cache.pop(0)
-                self._log(
-                    f"Hotmail007 购买成功：第 {attempt} 次尝试，productId={product_id}，获得邮箱 {entry.email}"
-                    + (f"，缓存剩余 {len(self._cache)} 个" if self._cache else "")
-                )
-                return entry
+                product_id, entries = self._buy_once(quantity=requested_quantity)
+                if not entries:
+                    raise RuntimeError("Hotmail007 购买成功但未返回账号")
+                returned = entries[:requested_quantity]
+                if len(returned) == 1:
+                    self._log(
+                        f"Hotmail007 购买成功：第 {attempt} 次尝试，productId={product_id}，获得邮箱 {returned[0].email}"
+                    )
+                else:
+                    self._log(
+                        f"Hotmail007 购买成功：第 {attempt} 次尝试，productId={product_id}，获得 {len(returned)} 个邮箱"
+                    )
+                return returned
             except Exception as exc:  # noqa: BLE001 - stock races are expected
                 last_error = str(exc).strip() or exc.__class__.__name__
                 product_id = getattr(exc, "product_id", "")
@@ -302,12 +366,87 @@ class Hotmail007Mailbox(BaseMailbox):
             f"timeout={self.buy_timeout_seconds:g}s, last_error={last_error or 'none'}"
         )
 
+    def _buy_until_success(self) -> Hotmail007AccountEntry:
+        entries = self._buy_batch_until_success(self.buy_quantity)
+        entry = entries[0]
+        with self._condition:
+            self._cache.extend(entries[1:])
+        self._log(
+            f"Hotmail007 获得邮箱 {entry.email}"
+            + (f"，缓存剩余 {len(entries) - 1} 个" if len(entries) > 1 else "")
+        )
+        return entry
+
+    def _prefetch_inflight_locked(self) -> int:
+        return max(self._prefetch_reserved - self._prefetch_delivered - len(self._cache), 0)
+
+    def _prefetch_available_slots_locked(self) -> int:
+        return max(self._prefetch_queue_max - len(self._cache) - self._prefetch_inflight_locked(), 0)
+
+    def _prefetch_worker(self) -> None:
+        while True:
+            with self._condition:
+                while (
+                    not self._prefetch_stop
+                    and self._prefetch_queue_max > 0
+                    and self._prefetch_available_slots_locked() <= 0
+                ):
+                    self._condition.wait(timeout=1)
+                if self._prefetch_stop:
+                    return
+                if self.is_cancel_requested():
+                    return
+                remaining = self._prefetch_total - self._prefetch_reserved
+                if remaining <= 0:
+                    return
+                available_slots = self._prefetch_available_slots_locked()
+                if available_slots <= 0:
+                    continue
+                quantity = min(self.buy_quantity, remaining, available_slots)
+                self._prefetch_reserved += quantity
+                self._prefetch_active += 1
+            try:
+                entries = self._buy_batch_until_success(quantity)
+                entries = entries[:quantity]
+                missing = max(quantity - len(entries), 0)
+                with self._condition:
+                    if missing:
+                        self._prefetch_reserved -= missing
+                    self._cache.extend(entries)
+                    self._prefetch_active -= 1
+                    if entries:
+                        self._log(
+                            f"Hotmail007 预取入队 {len(entries)} 个，当前队列 {len(self._cache)} 个"
+                        )
+                    self._condition.notify_all()
+            except Exception as exc:  # noqa: BLE001 - surface one failed buy cycle to waiters
+                error = str(exc).strip() or exc.__class__.__name__
+                with self._condition:
+                    self._prefetch_reserved -= quantity
+                    self._prefetch_active -= 1
+                    self._prefetch_errors.append(error)
+                    self._log(f"Hotmail007 预取失败：{error}")
+                    self._condition.notify_all()
+                return
+
     def peek_email(self) -> str:
         return "Hotmail007 将在注册开始时循环购买邮箱"
 
     def get_email(self) -> MailboxAccount:
-        with self._lock:
-            entry = self._cache.pop(0) if self._cache else self._buy_until_success()
+        with self._condition:
+            if self._prefetch_enabled:
+                while not self._cache:
+                    self.raise_if_cancelled()
+                    if self._prefetch_delivered >= self._prefetch_total:
+                        raise RuntimeError("Hotmail007 预取邮箱已分配完毕")
+                    if self._prefetch_active == 0 and self._prefetch_errors:
+                        raise RuntimeError(f"Hotmail007 预取失败: {self._prefetch_errors[-1]}")
+                    self._condition.wait(timeout=1)
+                entry = self._cache.pop(0)
+                self._prefetch_delivered += 1
+                self._condition.notify_all()
+            else:
+                entry = self._cache.pop(0) if self._cache else self._buy_until_success()
         issued_at = int(time.time())
         self._log(f"Hotmail007 邮箱已分配：{entry.email}")
         return MailboxAccount(
@@ -488,6 +627,7 @@ class Hotmail007Mailbox(BaseMailbox):
         attempt = 0
         self._log(f"Hotmail007 开始等待验证码：{account.email}，文件夹={','.join(self.folders)}")
         while time.monotonic() < deadline:
+            self.raise_if_cancelled()
             attempt += 1
             log_attempt = attempt <= 3 or attempt % 25 == 0
             try:

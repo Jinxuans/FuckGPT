@@ -64,6 +64,7 @@ ACTIVE_TASK_STATUSES = {
     TASK_STATUS_RUNNING,
     TASK_STATUS_CANCEL_REQUESTED,
 }
+STOP_REQUEST_TASK_STATUSES = TERMINAL_TASK_STATUSES | {TASK_STATUS_CANCEL_REQUESTED}
 
 _task_locks: dict[str, threading.Lock] = {}
 _task_locks_guard = threading.Lock()
@@ -557,6 +558,8 @@ class TaskLogger:
         return sid, label
 
     def log(self, message: str, *, level: str = "info", event_type: str = "log", detail: dict | None = None) -> None:
+        if event_type != "state" and self.is_cancel_requested():
+            return
         # 自动给当前线程绑定的 subtask 加 detail，用于前端按 worker 分组折叠
         merged_detail = dict(detail or {})
         sid, slabel = self._current_subtask()
@@ -576,20 +579,37 @@ class TaskLogger:
             prefix += f"[{sid}]"
         print(f"{prefix} {message}")
 
-    def mark_running(self) -> None:
+    def mark_running(self) -> bool:
+        started = {"ok": False}
+
         def _update(task: TaskModel) -> None:
+            if task.status in STOP_REQUEST_TASK_STATUSES:
+                return
             task.status = TASK_STATUS_RUNNING
             task.started_at = task.started_at or _utcnow()
+            started["ok"] = True
 
         _mutate_task(self.task_id, _update)
-        self.log("任务已开始执行", event_type="state")
+        if started["ok"]:
+            self.log("任务已开始执行", event_type="state")
+        return started["ok"]
 
     def is_cancel_requested(self) -> bool:
         with Session(engine) as session:
             task = session.get(TaskModel, self.task_id)
-            return bool(task and task.status == TASK_STATUS_CANCEL_REQUESTED)
+            return bool((not task) or task.status in STOP_REQUEST_TASK_STATUSES)
+
+    def _status(self) -> str:
+        with Session(engine) as session:
+            task = session.get(TaskModel, self.task_id)
+            return str(task.status or "") if task else ""
+
+    def _is_terminal(self) -> bool:
+        return self._status() in TERMINAL_TASK_STATUSES
 
     def set_progress(self, current: int, total: Optional[int] = None) -> None:
+        if self.is_cancel_requested():
+            return
         current = max(int(current), 0)
 
         def _update(task: TaskModel) -> None:
@@ -600,12 +620,16 @@ class TaskLogger:
         _mutate_task(self.task_id, _update)
 
     def record_success(self) -> None:
+        if self.is_cancel_requested():
+            return
         def _update(task: TaskModel) -> None:
             task.success_count += 1
 
         _mutate_task(self.task_id, _update)
 
     def record_error(self, error: str) -> None:
+        if self.is_cancel_requested():
+            return
         def _update(task: TaskModel) -> None:
             task.error_count += 1
             result = task.get_result()
@@ -617,6 +641,8 @@ class TaskLogger:
         _mutate_task(self.task_id, _update)
 
     def add_cashier_url(self, url: str) -> None:
+        if self.is_cancel_requested():
+            return
         def _update(task: TaskModel) -> None:
             result = task.get_result()
             urls = list(result.get("cashier_urls", []))
@@ -627,6 +653,8 @@ class TaskLogger:
         _mutate_task(self.task_id, _update)
 
     def set_result_data(self, data: Any) -> None:
+        if self.is_cancel_requested():
+            return
         def _update(task: TaskModel) -> None:
             result = task.get_result()
             result["data"] = data
@@ -635,6 +663,9 @@ class TaskLogger:
         _mutate_task(self.task_id, _update)
 
     def finish(self, status: str, *, error: str = "") -> None:
+        current_status = self._status()
+        if current_status in TERMINAL_TASK_STATUSES and current_status != status:
+            return
         def _update(task: TaskModel) -> None:
             task.status = status
             task.finished_at = _utcnow()
@@ -692,6 +723,10 @@ def _build_platform_instance(
         platform.set_logger(logger.log)
     else:
         platform._log_fn = logger.log
+    if hasattr(platform, "set_cancel_checker"):
+        platform.set_cancel_checker(logger.is_cancel_requested)
+    elif hasattr(platform, "_cancel_check_fn"):
+        platform._cancel_check_fn = logger.is_cancel_requested
     return platform
 
 
@@ -702,6 +737,10 @@ class _FixedMailbox:
 
     def get_email(self):
         return self._mailbox_account
+
+    def set_cancel_checker(self, checker):
+        if hasattr(self._mailbox, "set_cancel_checker"):
+            self._mailbox.set_cancel_checker(checker)
 
     def get_current_ids(self, account):
         return self._mailbox.get_current_ids(account)
@@ -777,7 +816,10 @@ def execute_task(task_id: str) -> None:
         payload = task.get_payload()
 
     logger = TaskLogger(task_id)
-    logger.mark_running()
+    if not logger.mark_running():
+        if logger._status() == TASK_STATUS_CANCEL_REQUESTED:
+            logger.finish(TASK_STATUS_CANCELLED, error="任务在启动后立即被取消")
+        return
 
     if logger.is_cancel_requested():
         logger.finish(TASK_STATUS_CANCELLED, error="任务在启动后立即被取消")
@@ -881,6 +923,17 @@ def _codex_oauth_batch_concurrency(requested: Any, count: int) -> int:
     )
 
 
+def _bounded_int(value: Any, default: int, *, minimum: int = 1, maximum: int | None = None) -> int:
+    try:
+        result = int(value if value not in (None, "") else default)
+    except Exception:
+        result = default
+    result = max(result, minimum)
+    if maximum is not None:
+        result = min(result, maximum)
+    return result
+
+
 def _upload_registered_chatgpt_account_to_sub2api(
     account_id: int,
     *,
@@ -977,6 +1030,30 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
                     extra=extra,
                     proxy=mailbox_proxy,
                 )
+                if hasattr(shared_mailbox, "set_cancel_checker"):
+                    shared_mailbox.set_cancel_checker(logger.is_cancel_requested)
+                if (
+                    count > 1
+                    and str(extra.get("mail_provider") or "").strip() == "hotmail007"
+                    and hasattr(shared_mailbox, "configure_prefetch")
+                ):
+                    buy_concurrency = _bounded_int(
+                        extra.get("hotmail007_buy_concurrency"),
+                        concurrency,
+                        minimum=1,
+                        maximum=concurrency,
+                    )
+                    queue_max = _bounded_int(
+                        extra.get("hotmail007_prefetch_queue_max"),
+                        concurrency * 2,
+                        minimum=1,
+                        maximum=count,
+                    )
+                    shared_mailbox.configure_prefetch(
+                        total_needed=count,
+                        buy_concurrency=buy_concurrency,
+                        queue_max=queue_max,
+                    )
     except Exception as exc:
         logger.log(f"邮箱初始化失败: {exc}", level="error")
         logger.finish(TASK_STATUS_FAILED, error=f"邮箱初始化失败: {exc}")
@@ -1009,7 +1086,11 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
                 f"邮箱 API 代理: {mask_proxy_url(mailbox_proxy) if mailbox_proxy else '直连'}"
                 f"（{mailbox_proxy_mode}）"
             )
+            if logger.is_cancel_requested():
+                return "__cancel_requested__"
             account = platform.register(email=email, password=password)
+            if logger.is_cancel_requested():
+                return "__cancel_requested__"
             saved_account = save_account(account)
             saved_account_id = int(saved_account.id)
             try:
@@ -1036,6 +1117,8 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
                 "启用",
             }
             if auto_codex_oauth_enabled and not post_codex_oauth:
+                if logger.is_cancel_requested():
+                    return "__cancel_requested__"
                 logger.log(f"{account.email} 注册后执行 Codex OAuth 授权")
                 try:
                     setattr(account, "id", saved_account_id)
@@ -1051,6 +1134,8 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
                         "keep_browser_open": keep_browser_open,
                     },
                 )
+                if logger.is_cancel_requested():
+                    return "__cancel_requested__"
                 if codex_action.get("ok") and isinstance(codex_action.get("data"), dict):
                     account.extra = {**dict(account.extra or {}), **codex_action["data"]}
                     save_account(account)
@@ -1066,6 +1151,8 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
                         level="warning",
                     )
             if sub2api_upload_config:
+                if logger.is_cancel_requested():
+                    return "__cancel_requested__"
                 logger.log(f"正在上传 {account.email} 的 Agent Identity 到 Sub2API")
                 try:
                     _upload_registered_chatgpt_account_to_sub2api(
@@ -1095,6 +1182,8 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
                 item["codex_oauth"] = post_codex_oauth or {"ok": False, "skipped": True}
             return item
         except Exception as exc:
+            if logger.is_cancel_requested() or str(exc) == "任务已取消":
+                return "__cancel_requested__"
             if platform_proxy and platform_proxy_mode == PROXY_MODE_PROXY_SERVICE:
                 proxy_pool.report_fail(platform_proxy)
             if mailbox_proxy and mailbox_proxy_mode == PROXY_MODE_PROXY_SERVICE and mailbox_proxy != platform_proxy:
@@ -1110,24 +1199,57 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
     errors: list[str] = []
     registered_accounts: list[dict[str, Any]] = []
     completed = 0
+    pool: ThreadPoolExecutor | None = None
+    cancel_pool = False
     try:
-        with ThreadPoolExecutor(max_workers=concurrency) as pool:
-            pending = {pool.submit(_do_one, index) for index in range(count)}
-            while pending:
-                done, pending = wait(pending, return_when=FIRST_COMPLETED)
-                for future in done:
-                    result = future.result()
-                    completed += 1
-                    if isinstance(result, dict):
-                        success += 1
-                        registered_accounts.append(result)
-                    elif result != "__cancel_requested__":
-                        errors.append(str(result))
-                    logger.set_progress(completed, count)
+        pool = ThreadPoolExecutor(max_workers=concurrency)
+        pending = set()
+        next_index = 0
+        while next_index < count and len(pending) < concurrency and not logger.is_cancel_requested():
+            pending.add(pool.submit(_do_one, next_index))
+            next_index += 1
+        while pending:
+            if logger.is_cancel_requested():
+                cancel_pool = True
+                for future in pending:
+                    future.cancel()
+                logger.finish(TASK_STATUS_CANCELLED, error="任务已取消")
+                return
+            done, pending = wait(pending, timeout=1, return_when=FIRST_COMPLETED)
+            if not done:
+                continue
+            for future in done:
+                if future.cancelled():
+                    continue
+                result = future.result()
+                completed += 1
+                if isinstance(result, dict):
+                    success += 1
+                    registered_accounts.append(result)
+                elif result != "__cancel_requested__":
+                    errors.append(str(result))
+                logger.set_progress(completed, count)
+                if logger.is_cancel_requested():
+                    cancel_pool = True
+                    for item in pending:
+                        item.cancel()
+                    logger.finish(TASK_STATUS_CANCELLED, error="任务已取消")
+                    return
+            while next_index < count and len(pending) < concurrency and not logger.is_cancel_requested():
+                pending.add(pool.submit(_do_one, next_index))
+                next_index += 1
     except Exception as exc:
         logger.log(f"致命错误: {exc}", level="error")
         logger.finish(TASK_STATUS_FAILED, error=str(exc))
         return
+    finally:
+        if pool is not None:
+            pool.shutdown(wait=not cancel_pool, cancel_futures=cancel_pool)
+        if hasattr(shared_mailbox, "shutdown_prefetch"):
+            try:
+                shared_mailbox.shutdown_prefetch()
+            except Exception as exc:
+                logger.log(f"邮箱预取停止失败: {exc}", level="warning")
 
     result_data = {
         "success": success,
@@ -1259,13 +1381,33 @@ def _execute_codex_oauth_batch_task(payload: dict[str, Any], logger: TaskLogger)
     success = 0
     errors: list[str] = []
     results: list[dict[str, Any]] = []
-    with ThreadPoolExecutor(max_workers=concurrency) as pool:
-        pending = {pool.submit(_do_one, model) for model in accounts}
+    pool: ThreadPoolExecutor | None = None
+    cancel_pool = False
+    try:
+        pool = ThreadPoolExecutor(max_workers=concurrency)
+        pending = set()
+        next_index = 0
+        while next_index < total and len(pending) < concurrency and not logger.is_cancel_requested():
+            pending.add(pool.submit(_do_one, accounts[next_index]))
+            next_index += 1
         while pending:
-            done, pending = wait(pending, return_when=FIRST_COMPLETED)
+            if logger.is_cancel_requested():
+                cancel_pool = True
+                for future in pending:
+                    future.cancel()
+                logger.finish(TASK_STATUS_CANCELLED, error="任务已取消")
+                return
+            done, pending = wait(pending, timeout=1, return_when=FIRST_COMPLETED)
+            if not done:
+                continue
             for future in done:
+                if future.cancelled():
+                    continue
                 result = future.result()
                 if result.get("cancelled"):
+                    cancel_pool = True
+                    for item in pending:
+                        item.cancel()
                     logger.finish(TASK_STATUS_CANCELLED, error="任务已取消")
                     return
                 completed += 1
@@ -1275,9 +1417,18 @@ def _execute_codex_oauth_batch_task(payload: dict[str, Any], logger: TaskLogger)
                     errors.append(str(result.get("error") or "unknown"))
                 results.append(result)
                 logger.set_progress(completed, total)
-            if logger.is_cancel_requested():
-                logger.finish(TASK_STATUS_CANCELLED, error="任务已取消")
-                return
+                if logger.is_cancel_requested():
+                    cancel_pool = True
+                    for item in pending:
+                        item.cancel()
+                    logger.finish(TASK_STATUS_CANCELLED, error="任务已取消")
+                    return
+            while next_index < total and len(pending) < concurrency and not logger.is_cancel_requested():
+                pending.add(pool.submit(_do_one, accounts[next_index]))
+                next_index += 1
+    finally:
+        if pool is not None:
+            pool.shutdown(wait=not cancel_pool, cancel_futures=cancel_pool)
 
     result_data = {
         "success": success,

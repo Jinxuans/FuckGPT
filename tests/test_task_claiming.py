@@ -4,9 +4,13 @@ from application.tasks import (
     TASK_TYPE_ACCOUNT_CHECK_ALL,
     TASK_TYPE_PLATFORM_ACTION,
     TASK_TYPE_REGISTER,
+    TASK_STATUS_INTERRUPTED,
+    TaskLogger,
     claim_next_runnable_task,
     create_task,
+    get_task,
     request_cancel,
+    _mutate_task,
 )
 from services.task_runtime import TaskRuntime, TaskWorkerState
 
@@ -93,3 +97,29 @@ def test_cancel_requested_worker_does_not_block_runtime_slots():
     assert available_slots == 1
     assert running_scope_counts == {}
     assert busy_account_keys == set()
+
+
+def test_interrupted_task_is_seen_as_stop_requested():
+    task = create_task(
+        task_type=TASK_TYPE_REGISTER,
+        platform="chatgpt",
+        payload={"count": 1},
+        progress_total=1,
+    )
+    _mutate_task(task["id"], lambda model: setattr(model, "status", TASK_STATUS_INTERRUPTED))
+
+    assert TaskLogger(task["id"]).is_cancel_requested() is True
+
+
+def test_terminal_task_is_not_overwritten_by_late_worker_finish():
+    task = create_task(
+        task_type=TASK_TYPE_REGISTER,
+        platform="chatgpt",
+        payload={"count": 1},
+        progress_total=1,
+    )
+    _mutate_task(task["id"], lambda model: setattr(model, "status", TASK_STATUS_INTERRUPTED))
+
+    TaskLogger(task["id"]).finish("succeeded")
+
+    assert get_task(task["id"])["status"] == TASK_STATUS_INTERRUPTED

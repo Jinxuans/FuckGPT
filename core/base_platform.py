@@ -80,6 +80,12 @@ class BasePlatform(ABC):
 
     def set_cancel_checker(self, checker):
         self._cancel_check_fn = checker if callable(checker) else (lambda: False)
+        mailbox = getattr(self, "mailbox", None)
+        if mailbox is not None and hasattr(mailbox, "set_cancel_checker"):
+            try:
+                mailbox.set_cancel_checker(self._cancel_check_fn)
+            except Exception:
+                pass
 
     def is_cancel_requested(self) -> bool:
         try:
@@ -136,8 +142,10 @@ class BasePlatform(ABC):
         )
 
     def register(self, email: str = None, password: str = None) -> Account:
+        self.raise_if_cancelled()
         resolved_password = self._prepare_registration_password(password)
         identity = self._resolve_identity(email, require_email=self._should_require_identity_email())
+        self.raise_if_cancelled()
         ctx = RegistrationContext(
             platform_name=self.name,
             platform_display_name=self.display_name,
@@ -155,6 +163,7 @@ class BasePlatform(ABC):
             if adapter is None:
                 raise NotImplementedError(f"{self.display_name} 未实现浏览器注册适配器")
             result = BrowserRegistrationFlow(adapter).run(ctx)
+            self.raise_if_cancelled()
             return self._attach_identity_metadata(self._account_from_registration_result(result), identity)
 
         if getattr(identity, "identity_provider", "") == "oauth_browser":
@@ -164,6 +173,7 @@ class BasePlatform(ABC):
                     f"{self.display_name} 当前仅浏览器模式支持 oauth_browser，请使用受支持的浏览器执行器"
                 )
             result = ProtocolOAuthFlow(adapter).run(ctx)
+            self.raise_if_cancelled()
             return self._attach_identity_metadata(self._account_from_registration_result(result), identity)
 
         self.log(f"邮箱: {identity.email}")
@@ -171,6 +181,7 @@ class BasePlatform(ABC):
         if adapter is None:
             raise NotImplementedError(f"{self.display_name} 未实现协议邮箱注册适配器")
         result = ProtocolMailboxFlow(adapter).run(ctx)
+        self.raise_if_cancelled()
         return self._attach_identity_metadata(self._account_from_registration_result(result), identity)
 
     @abstractmethod

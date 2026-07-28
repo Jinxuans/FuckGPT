@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 from core.base_mailbox import MAILBOX_FACTORY_REGISTRY, MailboxAccount
 from core.hotmail007_mailbox import Hotmail007Mailbox, parse_hotmail007_account
@@ -31,6 +33,28 @@ class FakeSession:
         if not self.payloads:
             raise RuntimeError("no fake payloads left")
         return FakeResponse(self.payloads.pop(0))
+
+
+class BlockingBuySession:
+    def __init__(self, payloads):
+        self.payloads = list(payloads)
+        self.calls = []
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self._lock = threading.Lock()
+
+    def get(self, url, **kwargs):
+        with self._lock:
+            self.calls.append((url, kwargs))
+            call_count = len(self.calls)
+        if call_count == 2:
+            self.started.set()
+        self.release.wait(timeout=5)
+        with self._lock:
+            if not self.payloads:
+                raise RuntimeError("no fake payloads left")
+            payload = self.payloads.pop(0)
+        return FakeResponse(payload)
 
 
 def test_parse_hotmail007_account_accepts_documented_colon_format():
@@ -96,6 +120,75 @@ def test_hotmail007_buy_loops_until_success_without_sleep(monkeypatch):
     assert any("第 1 次购买未成功，productId=12" in item for item in logs)
     assert any("购买成功：第 3 次尝试，productId=12，获得邮箱 user@outlook.com" in item for item in logs)
     assert not any("client-key" in item or "refresh-token" in item or "mail-pass" in item for item in logs)
+
+
+def test_hotmail007_prefetch_buys_with_bounded_parallelism():
+    logs = []
+    session = BlockingBuySession(
+        [
+            {
+                "code": 0,
+                "success": True,
+                "message": "success",
+                "data": {"accounts": ["first@outlook.com:p:r:c"]},
+            },
+            {
+                "code": 0,
+                "success": True,
+                "message": "success",
+                "data": {"accounts": ["second@outlook.com:p:r:c"]},
+            },
+        ]
+    )
+    mailbox = Hotmail007Mailbox(
+        client_key="client-key",
+        product_id="11",
+        buy_quantity=1,
+        buy_timeout_seconds=5,
+        session=session,
+        log_fn=logs.append,
+    )
+
+    mailbox.configure_prefetch(total_needed=2, buy_concurrency=2, queue_max=2)
+    assert session.started.wait(timeout=2)
+    assert len(session.calls) == 2
+    session.release.set()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        emails = sorted(pool.map(lambda _index: mailbox.get_email().email, range(2)))
+    mailbox.shutdown_prefetch()
+
+    assert emails == ["first@outlook.com", "second@outlook.com"]
+    assert all(call[1]["params"]["quantity"] == 1 for call in session.calls)
+    assert any("预取已启用" in item for item in logs)
+    assert any("预取入队" in item for item in logs)
+
+
+def test_hotmail007_buy_loop_stops_when_cancelled():
+    calls = {"count": 0}
+
+    class CancelAfterFirstFailureSession:
+        def get(self, url, **kwargs):
+            calls["count"] += 1
+            return FakeResponse({"code": 1001, "success": False, "message": "库存不足", "data": {}})
+
+    mailbox = Hotmail007Mailbox(
+        client_key="client-key",
+        product_id="11",
+        buy_max_attempts=200,
+        buy_timeout_seconds=30,
+        session=CancelAfterFirstFailureSession(),
+    )
+    mailbox.set_cancel_checker(lambda: calls["count"] >= 1)
+
+    try:
+        mailbox.get_email()
+    except RuntimeError as exc:
+        assert str(exc) == "任务已取消"
+    else:
+        raise AssertionError("cancelled Hotmail007 buy loop should raise")
+
+    assert calls["count"] == 1
 
 
 def test_hotmail007_wait_for_code_reads_latest_mail_from_inbox():

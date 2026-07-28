@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import threading
+
 from application import tasks as tasks_module
 from core.base_platform import Account
 from domain.actions import ActionExecutionResult
@@ -159,6 +161,192 @@ def test_codex_oauth_batch_concurrency_is_capped():
     assert tasks_module._codex_oauth_batch_concurrency(3, 10) == 3
     assert tasks_module._codex_oauth_batch_concurrency(99, 10) == 5
     assert tasks_module._codex_oauth_batch_concurrency(5, 2) == 2
+
+
+def test_register_task_enables_hotmail007_prefetch(monkeypatch):
+    events = []
+
+    class FakeMailbox:
+        def configure_prefetch(self, **kwargs):
+            events.append(("configure_prefetch", kwargs))
+
+        def shutdown_prefetch(self):
+            events.append(("shutdown_prefetch", {}))
+
+        def get_email(self):
+            return type("MailboxAccount", (), {"email": "mailbox@example.com", "account_id": "mailbox@example.com", "extra": {}})()
+
+        def get_current_ids(self, account):
+            return set()
+
+    class FakePlatform:
+        def register(self, email=None, password=None):
+            return Account(
+                platform="chatgpt",
+                email=email or "registered@example.com",
+                password=password or "Secret123!",
+                user_id="acct_123",
+                extra={"access_token": "access-token"},
+            )
+
+    fake_mailbox = FakeMailbox()
+    monkeypatch.setattr(tasks_module, "get", lambda platform_name: object)
+    monkeypatch.setattr(
+        tasks_module,
+        "_build_platform_instance",
+        lambda *args, **kwargs: FakePlatform(),
+    )
+    monkeypatch.setattr(
+        "core.base_mailbox.create_mailbox",
+        lambda *args, **kwargs: fake_mailbox,
+    )
+    monkeypatch.setattr(
+        tasks_module,
+        "save_account",
+        lambda account: type("SavedAccount", (), {"id": 123})(),
+    )
+    monkeypatch.setattr(
+        "core.mailbox_store.MailboxStore",
+        lambda: type("Store", (), {"record_registration_link": lambda self, **kwargs: None})(),
+    )
+
+    logger = _FakeLogger()
+    tasks_module._execute_register_task(
+        {
+            "platform": "chatgpt",
+            "count": 4,
+            "concurrency": 3,
+            "extra": {
+                "identity_provider": "mailbox",
+                "mail_provider": "hotmail007",
+            },
+        },
+        logger,
+    )
+
+    assert ("configure_prefetch", {"total_needed": 4, "buy_concurrency": 3, "queue_max": 4}) in events
+    assert ("shutdown_prefetch", {}) in events
+    assert logger.finished == (tasks_module.TASK_STATUS_SUCCEEDED, "")
+
+
+def test_register_task_cancel_does_not_wait_for_blocked_worker(monkeypatch):
+    started = threading.Event()
+    release = threading.Event()
+
+    class FakePlatform:
+        def register(self, email=None, password=None):
+            started.set()
+            release.wait(timeout=10)
+            return Account(
+                platform="chatgpt",
+                email=email or "registered@example.com",
+                password=password or "Secret123!",
+                user_id="acct_123",
+                extra={"access_token": "access-token"},
+            )
+
+    monkeypatch.setattr(tasks_module, "get", lambda platform_name: object)
+    monkeypatch.setattr(
+        tasks_module,
+        "_build_platform_instance",
+        lambda *args, **kwargs: FakePlatform(),
+    )
+    monkeypatch.setattr("core.base_mailbox.create_mailbox", lambda *args, **kwargs: object())
+    monkeypatch.setattr(
+        tasks_module,
+        "save_account",
+        lambda account: type("SavedAccount", (), {"id": 123})(),
+    )
+    monkeypatch.setattr(
+        "core.mailbox_store.MailboxStore",
+        lambda: type("Store", (), {"record_registration_link": lambda self, **kwargs: None})(),
+    )
+
+    logger = _FakeLogger()
+    runner = threading.Thread(
+        target=tasks_module._execute_register_task,
+        args=(
+            {
+                "platform": "chatgpt",
+                "count": 1,
+                "concurrency": 1,
+                "extra": {"identity_provider": "mailbox", "mail_provider": "api_mailbox"},
+            },
+            logger,
+        ),
+    )
+    runner.start()
+    assert started.wait(timeout=2)
+    logger.cancel_requested = True
+    runner.join(timeout=3)
+    release.set()
+    assert not runner.is_alive()
+    assert logger.finished == (tasks_module.TASK_STATUS_CANCELLED, "任务已取消")
+
+
+def test_register_task_cancel_stops_scheduling_new_workers(monkeypatch):
+    started_count = 0
+    started_lock = threading.Lock()
+    first_window_started = threading.Event()
+    release = threading.Event()
+
+    class FakePlatform:
+        def register(self, email=None, password=None):
+            nonlocal started_count
+            with started_lock:
+                started_count += 1
+                if started_count == 2:
+                    first_window_started.set()
+            release.wait(timeout=10)
+            return Account(
+                platform="chatgpt",
+                email=email or f"registered{started_count}@example.com",
+                password=password or "Secret123!",
+                user_id=f"acct_{started_count}",
+                extra={"access_token": "access-token"},
+            )
+
+    monkeypatch.setattr(tasks_module, "get", lambda platform_name: object)
+    monkeypatch.setattr(
+        tasks_module,
+        "_build_platform_instance",
+        lambda *args, **kwargs: FakePlatform(),
+    )
+    monkeypatch.setattr("core.base_mailbox.create_mailbox", lambda *args, **kwargs: object())
+    monkeypatch.setattr(
+        tasks_module,
+        "save_account",
+        lambda account: type("SavedAccount", (), {"id": 123})(),
+    )
+    monkeypatch.setattr(
+        "core.mailbox_store.MailboxStore",
+        lambda: type("Store", (), {"record_registration_link": lambda self, **kwargs: None})(),
+    )
+
+    logger = _FakeLogger()
+    runner = threading.Thread(
+        target=tasks_module._execute_register_task,
+        args=(
+            {
+                "platform": "chatgpt",
+                "count": 5,
+                "concurrency": 2,
+                "extra": {"identity_provider": "mailbox", "mail_provider": "api_mailbox"},
+            },
+            logger,
+        ),
+    )
+    runner.start()
+    assert first_window_started.wait(timeout=2)
+    logger.cancel_requested = True
+    runner.join(timeout=3)
+    with started_lock:
+        observed_started = started_count
+    release.set()
+
+    assert not runner.is_alive()
+    assert observed_started == 2
+    assert logger.finished == (tasks_module.TASK_STATUS_CANCELLED, "任务已取消")
 
 
 def test_register_task_uploads_each_saved_account_immediately(monkeypatch):
