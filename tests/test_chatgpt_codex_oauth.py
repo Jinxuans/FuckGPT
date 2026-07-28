@@ -11,22 +11,30 @@ from infrastructure.platform_runtime import (
 from core.account_graph import PLATFORM_CREDENTIAL_TYPES
 from platforms.chatgpt.codex_oauth import (
     ACCOUNT_CHOOSER_SUBMIT_GRACE_SECONDS,
+    EMAIL_SUBMIT_GRACE_SECONDS,
     CODEX_CLIENT_ID,
     CODEX_REDIRECT_URI,
     CODEX_SCOPE,
     PKCECodes,
     _OAuthCallbackBroker,
     _OAuthCallbackServer,
+    _observe_callback_request_on_page,
     _detect_codex_next_step_from_dom,
+    _do_add_phone_attempt,
+    _resume_oauth_after_add_phone_success,
     build_codex_authorize_url,
     _drive_codex_oauth_page,
     _handle_account_chooser,
+    _handle_add_phone_challenge,
     _account_chooser_submission_pending,
     _get_invalid_session_error_page,
     _phone_input_contains,
+    _is_incorrect_password_error,
+    _is_whatsapp_fallback_prompt,
     _select_text_message_delivery,
+    perform_codex_oauth_login_on_page,
 )
-from platforms.chatgpt.plugin import ChatGPTPlatform, _CodexSmsPhoneCallback
+from platforms.chatgpt.plugin import ChatGPTPlatform, _CodexSmsPhoneCallback, _resolve_registration_auth_mode
 
 
 def test_codex_oauth_callback_broker_routes_by_state():
@@ -40,6 +48,43 @@ def test_codex_oauth_callback_broker_routes_by_state():
     assert not first.event.is_set()
     assert second.event.is_set()
     assert second.wait(1)["code"] == "code-two"
+
+
+def test_codex_oauth_callback_broker_logs_first_delivery():
+    logs = []
+    broker = _OAuthCallbackBroker(port=0)
+    waiter = _OAuthCallbackServer(port=0, state="state-one", log=logs.append)
+    broker._waiters = {"state-one": waiter}
+
+    assert broker.deliver({"code": "code-one", "state": "state-one"}) is True
+    assert broker.deliver({"code": "code-one", "state": "state-one"}) is True
+
+    assert logs == ["Codex OAuth 本地回调已到达"]
+
+
+def test_codex_oauth_page_observer_delivers_only_matching_callback_state():
+    logs = []
+    handlers = {}
+    waiter = _OAuthCallbackServer(port=1455, state="state-one")
+
+    class Page:
+        def on(self, event, handler):
+            handlers[event] = handler
+
+    class Request:
+        def __init__(self, url):
+            self.url = url
+
+    _observe_callback_request_on_page(Page(), waiter, logs.append)
+    handlers["request"](Request("http://localhost:1455/auth/callback?code=wrong&state=state-two"))
+    assert not waiter.event.is_set()
+
+    handlers["request"](Request("http://localhost:1455/auth/callback?code=secret-code&state=state-one"))
+
+    assert waiter.event.is_set()
+    assert waiter.wait(1) == {"code": "secret-code", "state": "state-one", "error": "", "error_description": ""}
+    assert logs == ["Codex OAuth 已从浏览器本地回调请求捕获结果"]
+    assert "secret-code" not in " ".join(logs)
 
 
 def test_codex_oauth_authorize_url_matches_cli_proxy_api_flow():
@@ -194,6 +239,283 @@ def test_codex_oauth_add_phone_uses_phone_callback(monkeypatch):
     ]
 
 
+def test_codex_oauth_login_on_page_retries_with_new_authorize_url_after_browser_timeout(monkeypatch):
+    logs = []
+    attempts = []
+    auth_modes = []
+
+    class Page:
+        pass
+
+    class CallbackServer:
+        def __init__(self, *, port=0, state="", log=None):
+            self.state = state
+            self.log = log
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+    def fake_drive(page, **kwargs):
+        attempts.append(kwargs["auth_url"])
+        auth_modes.append(kwargs["registration_auth_mode"])
+        if len(attempts) == 1:
+            raise RuntimeError("Codex OAuth 浏览器登录超时")
+        return {"code": "callback-code", "state": kwargs["callback_server"].state}
+
+    monkeypatch.setattr("platforms.chatgpt.codex_oauth._OAuthCallbackServer", CallbackServer)
+    monkeypatch.setattr("platforms.chatgpt.codex_oauth._drive_codex_oauth_page", fake_drive)
+    monkeypatch.setattr("platforms.chatgpt.codex_oauth._exchange_code_for_tokens", lambda *args, **kwargs: {"access_token": "a", "refresh_token": "r", "id_token": "i"})
+    monkeypatch.setattr("platforms.chatgpt.codex_oauth._save_codex_auth_file", lambda *args, **kwargs: "codex-auth.json")
+    monkeypatch.setattr("platforms.chatgpt.codex_oauth._token_identity", lambda token: {"email": "user@example.com", "account_id": "account", "plan_type": "unknown"})
+
+    result = perform_codex_oauth_login_on_page(
+        Page(),
+        email="user@example.com",
+        password="",
+        registration_auth_mode="email_otp",
+        log_fn=logs.append,
+        timeout=1,
+    )
+
+    states = [parse_qs(urlparse(url).query)["state"][0] for url in attempts]
+    assert len(attempts) == 2
+    assert states[0] != states[1]
+    assert result["codex_access_token"] == "a"
+    assert auth_modes == ["email_otp", "email_otp"]
+    assert "Codex OAuth 浏览器登录超时，重新生成授权链接重试" in logs
+
+
+def test_codex_oauth_email_otp_passes_callback_for_incorrect_code_retry(monkeypatch):
+    captured = {}
+
+    class Event:
+        def __init__(self):
+            self.ready = False
+
+        def is_set(self):
+            return self.ready
+
+        def wait(self, timeout):
+            return self.ready
+
+    class CallbackServer:
+        def __init__(self):
+            self.event = Event()
+
+        def wait(self, timeout):
+            return {"code": "callback-code", "state": "state-test"}
+
+    class Page:
+        url = "https://auth.openai.com/email-verification"
+
+    def otp_callback():
+        return "123456"
+
+    def fake_submit_otp(page, code, log, **kwargs):
+        captured["code"] = code
+        captured["otp_callback"] = kwargs.get("otp_callback")
+        page.url = "http://localhost:1455/auth/callback?code=callback-code&state=state-test"
+        return {"ok": True, "status": 200, "url": page.url}
+
+    monkeypatch.setattr("platforms.chatgpt.codex_oauth._goto_with_retry", lambda *args, **kwargs: None)
+    monkeypatch.setattr("platforms.chatgpt.codex_oauth._derive_registration_state_from_page", lambda page: {"page_type": "email_otp_verification"})
+    monkeypatch.setattr("platforms.chatgpt.codex_oauth._submit_otp_via_page", fake_submit_otp)
+
+    result = _drive_codex_oauth_page(
+        Page(),
+        auth_url="https://auth.openai.com/oauth/authorize?state=state-test",
+        email="user@example.com",
+        password="Secret123!",
+        callback_server=CallbackServer(),
+        log=lambda message: None,
+        otp_callback=otp_callback,
+        phone_callback=None,
+        timeout=5,
+    )
+
+    assert result["code"] == "callback-code"
+    assert captured == {"code": "123456", "otp_callback": otp_callback}
+
+
+def test_codex_oauth_email_otp_account_skips_generated_password(monkeypatch):
+    calls = []
+    stage = {"value": "password"}
+
+    class Event:
+        ready = False
+
+        def is_set(self):
+            return self.ready
+
+    class CallbackServer:
+        event = Event()
+
+        def wait(self, timeout):
+            return {"code": "callback-code", "state": "state-test"}
+
+    class Target:
+        def __init__(self, selector):
+            self.selector = selector
+
+        def is_visible(self, **kwargs):
+            return stage["value"] == "password" and "password" in self.selector
+
+    class Locator:
+        def __init__(self, selector):
+            self.first = Target(selector)
+
+    class Page:
+        url = "https://auth.openai.com/log-in"
+
+        def locator(self, selector):
+            return Locator(selector)
+
+    def click_passwordless(page, selectors, **kwargs):
+        calls.append(("passwordless", tuple(selectors)))
+        stage["value"] = "otp"
+        page.url = "https://auth.openai.com/email-verification"
+        return selectors[0]
+
+    def submit_otp(page, code, log, **kwargs):
+        calls.append(("otp", code))
+        CallbackServer.event.ready = True
+        return {"ok": True, "status": 200, "url": page.url}
+
+    monkeypatch.setattr("platforms.chatgpt.codex_oauth._goto_with_retry", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        "platforms.chatgpt.codex_oauth._derive_registration_state_from_page",
+        lambda page: {"page_type": "login_password" if stage["value"] == "password" else "email_otp_verification"},
+    )
+    monkeypatch.setattr("platforms.chatgpt.codex_oauth._click_first_no_wait", click_passwordless)
+    monkeypatch.setattr("platforms.chatgpt.codex_oauth._submit_otp_via_page", submit_otp)
+    monkeypatch.setattr(
+        "platforms.chatgpt.codex_oauth._submit_oauth_password_direct",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("password must not be submitted")),
+    )
+
+    result = _drive_codex_oauth_page(
+        Page(),
+        auth_url="https://auth.openai.com/oauth/authorize?state=state-test",
+        email="user@example.com",
+        password="locally-generated-only",
+        callback_server=CallbackServer(),
+        log=lambda message: None,
+        otp_callback=lambda: "123456",
+        phone_callback=None,
+        timeout=5,
+        registration_auth_mode="email_otp",
+    )
+
+    assert result["code"] == "callback-code"
+    assert calls[0][0] == "passwordless"
+    assert calls[1] == ("otp", "123456")
+
+
+def test_codex_oauth_incorrect_password_can_recover_with_email_otp(monkeypatch):
+    calls = []
+    stage = {"value": "password"}
+
+    class Event:
+        ready = False
+        waits = 0
+
+        def is_set(self):
+            return self.ready
+
+        def wait(self, timeout):
+            self.waits += 1
+            if self.waits >= 2 and stage["value"] == "passwordless_pending":
+                stage["value"] = "otp"
+                Page.url = "https://auth.openai.com/email-verification"
+            return self.ready
+
+    class CallbackServer:
+        event = Event()
+
+        def wait(self, timeout):
+            return {"code": "callback-code", "state": "state-test"}
+
+    class Target:
+        def __init__(self, selector):
+            self.selector = selector
+
+        def is_visible(self, **kwargs):
+            return stage["value"] == "password" and "password" in self.selector
+
+    class Locator:
+        def __init__(self, selector):
+            self.first = Target(selector)
+
+    class Page:
+        url = "https://auth.openai.com/log-in"
+
+        def locator(self, selector):
+            return Locator(selector)
+
+    def submit_password(page, password, log):
+        calls.append(("password", password))
+        return {"ok": False, "status": 400, "url": page.url, "text": "Incorrect email address or password"}
+
+    def click_passwordless(page, selectors, **kwargs):
+        calls.append(("passwordless", tuple(selectors)))
+        stage["value"] = "passwordless_pending"
+        return selectors[0]
+
+    def submit_otp(page, code, log, **kwargs):
+        calls.append(("otp", code))
+        CallbackServer.event.ready = True
+        return {"ok": True, "status": 200, "url": page.url}
+
+    monkeypatch.setattr("platforms.chatgpt.codex_oauth._goto_with_retry", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        "platforms.chatgpt.codex_oauth._derive_registration_state_from_page",
+        lambda page: {"page_type": "login_password" if stage["value"] == "password" else "email_otp_verification"},
+    )
+    monkeypatch.setattr("platforms.chatgpt.codex_oauth._submit_oauth_password_direct", submit_password)
+    monkeypatch.setattr("platforms.chatgpt.codex_oauth._click_first_no_wait", click_passwordless)
+    monkeypatch.setattr("platforms.chatgpt.codex_oauth._submit_otp_via_page", submit_otp)
+
+    result = _drive_codex_oauth_page(
+        Page(),
+        auth_url="https://auth.openai.com/oauth/authorize?state=state-test",
+        email="user@example.com",
+        password="unknown-password",
+        callback_server=CallbackServer(),
+        log=lambda message: None,
+        otp_callback=lambda: "654321",
+        phone_callback=None,
+        timeout=5,
+    )
+
+    assert result["code"] == "callback-code"
+    assert calls[0] == ("password", "unknown-password")
+    assert calls[1][0] == "passwordless"
+    assert calls[2] == ("otp", "654321")
+    assert _is_incorrect_password_error("Incorrect email address or password") is True
+
+
+def test_registration_auth_mode_restores_from_legacy_overview_and_profile_amr():
+    assert _resolve_registration_auth_mode(
+        {"account_overview": {"legacy_extra": {"registration_auth_mode": "email_otp"}}}
+    ) == "email_otp"
+    assert _resolve_registration_auth_mode(
+        {"account_overview": {"legacy_extra": {"profile": {"amr": ["otp", "urn:openai:amr:otp_email"]}}}}
+    ) == "email_otp"
+    assert _resolve_registration_auth_mode({"registration_auth_mode": "password"}) == "password"
+
+
+def test_whatsapp_fallback_prompt_recognizes_observed_japanese_message():
+    message = (
+        "この電話番号にはテキストメッセージを送信できなかったため、WhatsApp に切り替えました。"
+        "続行すると、WhatsApp で認証コードを送信します。"
+    )
+
+    assert _is_whatsapp_fallback_prompt(message) is True
+
+
 def test_codex_oauth_account_chooser_selects_matching_email():
     logs = []
     clicks = []
@@ -203,8 +525,14 @@ def test_codex_oauth_account_chooser_selects_matching_email():
             clicks.append(("nth", index))
             return self
 
+        def is_visible(self, **kwargs):
+            return True
+
+        def is_enabled(self, **kwargs):
+            return True
+
         def click(self, **kwargs):
-            clicks.append(("click", kwargs.get("timeout")))
+            clicks.append(("click", kwargs.get("timeout"), kwargs.get("no_wait_after")))
 
     class Page:
         def evaluate(self, script, expected_email):
@@ -220,8 +548,36 @@ def test_codex_oauth_account_chooser_selects_matching_email():
             return Locator()
 
     assert _handle_account_chooser(Page(), "User@Example.com", logs.append) is True
-    assert clicks == [("nth", 0), ("click", 5000)]
+    assert clicks == [("nth", 0), ("click", 3000, True)]
     assert any("已选择匹配账号 user@example.com" in item for item in logs)
+
+
+def test_codex_oauth_account_chooser_treats_click_timeout_as_pending_navigation():
+    logs = []
+
+    class Locator:
+        def nth(self, index):
+            return self
+
+        def is_visible(self, **kwargs):
+            return True
+
+        def is_enabled(self, **kwargs):
+            return True
+
+        def click(self, **kwargs):
+            raise TimeoutError("Locator.click: Timeout 3000ms exceeded\nCall log with session value")
+
+    class Page:
+        def evaluate(self, script, expected_email):
+            return {"action": "select", "index": 0, "email": expected_email}
+
+        def locator(self, selector):
+            return Locator()
+
+    assert _handle_account_chooser(Page(), "user@example.com", logs.append) is True
+    assert any("已进入异步跳转观察期" in item for item in logs)
+    assert not any("session value" in item for item in logs)
 
 
 def test_codex_oauth_account_chooser_switches_when_email_mismatches():
@@ -276,6 +632,7 @@ def test_detect_codex_next_step_from_dom_identifies_add_phone():
 
 def test_codex_oauth_account_chooser_grace_period_observes_without_reclick(monkeypatch):
     calls = []
+    logs = []
     fake_now = {"value": 1000.0}
 
     class Event:
@@ -306,7 +663,7 @@ def test_codex_oauth_account_chooser_grace_period_observes_without_reclick(monke
         email="user@example.com",
         password="Secret123!",
         callback_server=CallbackServer(),
-        log=lambda message: None,
+        log=logs.append,
         otp_callback=None,
         phone_callback=None,
         timeout=5,
@@ -315,6 +672,175 @@ def test_codex_oauth_account_chooser_grace_period_observes_without_reclick(monke
     assert result["code"] == "callback-code"
     assert calls == [("goto", None)]
     assert fake_now["value"] >= 1000.0 + ACCOUNT_CHOOSER_SUBMIT_GRACE_SECONDS
+    assert sum("Codex OAuth 页面变化" in item for item in logs) == 1
+    assert sum("等待页面异步跳转" in item for item in logs) == 1
+
+
+def test_codex_oauth_email_submit_grace_prevents_repeated_clicks(monkeypatch):
+    calls = []
+    logs = []
+    now = {"value": 1000.0}
+
+    class Event:
+        def is_set(self):
+            return now["value"] >= 1008.0
+
+        def wait(self, timeout):
+            now["value"] += timeout
+            return self.is_set()
+
+    class CallbackServer:
+        event = Event()
+
+        def wait(self, timeout):
+            return {"code": "callback-code", "state": "state-test"}
+
+    class Target:
+        def is_visible(self, **kwargs):
+            return True
+
+    class Locator:
+        first = Target()
+
+    class Page:
+        url = "https://auth.openai.com/log-in"
+
+        def locator(self, selector):
+            return Locator()
+
+    monkeypatch.setattr("platforms.chatgpt.codex_oauth._goto_with_retry", lambda *args, **kwargs: None)
+    monkeypatch.setattr("platforms.chatgpt.codex_oauth._derive_registration_state_from_page", lambda page: {"page_type": ""})
+    monkeypatch.setattr("platforms.chatgpt.codex_oauth._get_invalid_session_error_page", lambda page: {})
+    monkeypatch.setattr("platforms.chatgpt.codex_oauth._fill_input_like_user", lambda *args: calls.append("fill") or True)
+    monkeypatch.setattr("platforms.chatgpt.codex_oauth._click_first", lambda *args, **kwargs: calls.append("click") or 'button[type="submit"]')
+    monkeypatch.setattr("platforms.chatgpt.codex_oauth.time.time", lambda: now["value"])
+
+    result = _drive_codex_oauth_page(
+        Page(),
+        auth_url="https://auth.openai.com/oauth/authorize?state=state-test",
+        email="user@example.com",
+        password="Secret123!",
+        callback_server=CallbackServer(),
+        log=logs.append,
+        otp_callback=None,
+        phone_callback=None,
+        timeout=30,
+    )
+
+    assert result["code"] == "callback-code"
+    assert calls == ["fill", "click"]
+    assert EMAIL_SUBMIT_GRACE_SECONDS >= 45
+    assert sum("邮箱页: 已提交，等待页面异步跳转" in item for item in logs) == 1
+
+
+def test_codex_oauth_email_submit_uses_input_enter_when_button_is_not_clickable(monkeypatch):
+    calls = []
+    logs = []
+    now = {"value": 1000.0}
+
+    class Event:
+        def is_set(self):
+            return now["value"] >= 1008.0
+
+        def wait(self, timeout):
+            now["value"] += timeout
+            return self.is_set()
+
+    class CallbackServer:
+        event = Event()
+
+        def wait(self, timeout):
+            return {"code": "callback-code", "state": "state-test"}
+
+    class Target:
+        def is_visible(self, **kwargs):
+            return True
+
+    class Locator:
+        first = Target()
+
+    class Page:
+        url = "https://auth.openai.com/log-in"
+
+        def locator(self, selector):
+            return Locator()
+
+    monkeypatch.setattr("platforms.chatgpt.codex_oauth._goto_with_retry", lambda *args, **kwargs: None)
+    monkeypatch.setattr("platforms.chatgpt.codex_oauth._derive_registration_state_from_page", lambda page: {"page_type": ""})
+    monkeypatch.setattr("platforms.chatgpt.codex_oauth._get_invalid_session_error_page", lambda page: {})
+    monkeypatch.setattr("platforms.chatgpt.codex_oauth._fill_input_like_user", lambda *args: calls.append("fill") or True)
+    monkeypatch.setattr("platforms.chatgpt.codex_oauth._click_first", lambda *args, **kwargs: calls.append("click") or None)
+    monkeypatch.setattr("platforms.chatgpt.codex_oauth._press_enter_on_input", lambda *args: calls.append("enter") or True)
+    monkeypatch.setattr("platforms.chatgpt.codex_oauth.time.time", lambda: now["value"])
+
+    result = _drive_codex_oauth_page(
+        Page(),
+        auth_url="https://auth.openai.com/oauth/authorize?state=state-test",
+        email="user@example.com",
+        password="Secret123!",
+        callback_server=CallbackServer(),
+        log=logs.append,
+        otp_callback=None,
+        phone_callback=None,
+        timeout=30,
+    )
+
+    assert result["code"] == "callback-code"
+    assert calls == ["fill", "click", "enter"]
+    assert sum("邮箱页按钮不可点击" in item for item in logs) == 1
+    assert sum("邮箱页: 已提交，等待页面异步跳转" in item for item in logs) == 1
+
+
+def test_codex_oauth_recovers_stalled_consent_page_with_reload(monkeypatch):
+    calls = []
+    now = {"value": 1000.0}
+
+    class Event:
+        def __init__(self):
+            self.ready = False
+
+        def is_set(self):
+            return self.ready
+
+        def wait(self, timeout):
+            now["value"] += timeout
+            return self.ready
+
+    class CallbackServer:
+        def __init__(self):
+            self.event = Event()
+
+        def wait(self, timeout):
+            return {"code": "callback-code", "state": "state-test"}
+
+    class Page:
+        url = "https://auth.openai.com/sign-in-with-chatgpt/codex/consent"
+
+        def reload(self, **kwargs):
+            calls.append(("reload", kwargs.get("timeout")))
+            self.url = "http://localhost:1455/auth/callback?code=callback-code&state=state-test"
+
+    monkeypatch.setattr("platforms.chatgpt.codex_oauth._goto_with_retry", lambda *args, **kwargs: calls.append(("goto", None)))
+    monkeypatch.setattr("platforms.chatgpt.codex_oauth._derive_registration_state_from_page", lambda page: {"page_type": "consent"})
+    monkeypatch.setattr("platforms.chatgpt.codex_oauth._get_invalid_session_error_page", lambda page: {})
+    monkeypatch.setattr("platforms.chatgpt.codex_oauth._click_continue_like_button", lambda *args, **kwargs: False)
+    monkeypatch.setattr("platforms.chatgpt.codex_oauth._extract_auth_error_text", lambda page: "")
+    monkeypatch.setattr("platforms.chatgpt.codex_oauth.time.time", lambda: now["value"])
+
+    result = _drive_codex_oauth_page(
+        Page(),
+        auth_url="https://auth.openai.com/oauth/authorize?state=state-test",
+        email="user@example.com",
+        password="Secret123!",
+        callback_server=CallbackServer(),
+        log=lambda message: None,
+        otp_callback=None,
+        phone_callback=None,
+        timeout=30,
+    )
+
+    assert result["code"] == "callback-code"
+    assert calls == [("goto", None), ("reload", 30000)]
 
 
 def test_codex_oauth_invalid_session_clicks_try_again_then_reselects_account(monkeypatch):
@@ -401,17 +927,293 @@ def test_phone_input_contains_accepts_formatted_local_number():
 
 
 def test_select_text_message_delivery_prefers_sms_over_whatsapp(monkeypatch):
-    clicked = []
-
     class Page:
-        def evaluate(self, script):
-            clicked.append("Text Message")
-            return True
+        def evaluate(self, script, keyword):
+            assert keyword == "sms"
+            assert "checked" in script
+            return {
+                "selected": True,
+                "candidates": [{"tag": "input", "text": "Text Message", "visible": True, "selected": True}],
+            }
 
     monkeypatch.setattr("platforms.chatgpt.codex_oauth._click_first_no_wait", lambda *args, **kwargs: None)
 
     assert _select_text_message_delivery(Page(), lambda message: None) is True
-    assert clicked == ["Text Message"]
+
+
+def test_select_text_message_delivery_does_not_dom_click_non_actionable_text(monkeypatch):
+    logs = []
+
+    class Page:
+        def evaluate(self, script, keyword):
+            assert ".click()" not in script
+            return {
+                "selected": False,
+                "candidates": [{"tag": "label", "text": "Text Message", "visible": True, "selected": False}],
+            }
+
+    monkeypatch.setattr("platforms.chatgpt.codex_oauth._click_first_no_wait", lambda *args, **kwargs: None)
+
+    assert _select_text_message_delivery(Page(), logs.append) is False
+    assert any("未找到可点击" in item for item in logs)
+
+
+def test_select_text_message_delivery_uses_keyboard_for_visible_radio(monkeypatch):
+    actions = []
+    states = iter(
+        [
+            {
+                "selected": False,
+                "radioIndices": [1],
+                "candidates": [{"tag": "input", "text": "Text Message", "visible": True}],
+            },
+            {"selected": True, "radioIndices": [1], "candidates": []},
+        ]
+    )
+
+    class Target:
+        def is_visible(self, **kwargs):
+            return True
+
+        def is_enabled(self, **kwargs):
+            return True
+
+        def focus(self, **kwargs):
+            actions.append("focus")
+
+        def press(self, key, **kwargs):
+            actions.append(("press", key))
+
+    class Locator:
+        def nth(self, index):
+            assert index == 1
+            return Target()
+
+    class Page:
+        def evaluate(self, script, keyword):
+            return next(states)
+
+        def locator(self, selector):
+            assert selector == 'input[type="radio"]'
+            return Locator()
+
+    monkeypatch.setattr("platforms.chatgpt.codex_oauth._click_first_no_wait", lambda *args, **kwargs: None)
+    monkeypatch.setattr("platforms.chatgpt.codex_oauth.time.sleep", lambda seconds: None)
+
+    logs = []
+    assert _select_text_message_delivery(Page(), logs.append) is True
+    assert actions == ["focus", ("press", "Space")]
+    assert any("键盘 Space" in item for item in logs)
+
+
+def test_add_phone_retries_send_via_whatsapp_on_fallback_prompt(monkeypatch):
+    events = []
+    error_messages = iter(
+        [
+            "We couldn't send a text message to this phone number, so we switched to WhatsApp. "
+            "Continue to send a verification code on WhatsApp.",
+            "",
+        ]
+    )
+
+    class Page:
+        url = "https://auth.openai.com/add-phone"
+
+    class PhoneCallback:
+        def __init__(self):
+            self.calls = 0
+
+        def __call__(self):
+            self.calls += 1
+            if self.calls == 1:
+                return "+56967181019"
+            return "123456"
+
+        def mark_send_succeeded(self):
+            events.append("send_succeeded")
+
+        def mark_send_failed(self, reason=""):
+            events.append(("send_failed", reason))
+
+    def fake_click_first_no_wait(page, selectors, timeout=0):
+        if any("WhatsApp" in selector for selector in selectors):
+            events.append("select_whatsapp")
+            return 'button:has-text("WhatsApp")'
+        events.append("send")
+        return 'button[type="submit"]'
+
+    monkeypatch.setattr("platforms.chatgpt.codex_oauth.time.sleep", lambda seconds: None)
+    monkeypatch.setattr("platforms.chatgpt.codex_oauth._select_phone_country_ui", lambda *args: True)
+    monkeypatch.setattr("platforms.chatgpt.codex_oauth._wait_for_any_selector", lambda *args, **kwargs: 'input[type="tel"]')
+    monkeypatch.setattr("platforms.chatgpt.codex_oauth._fill_input_like_user", lambda *args, **kwargs: True)
+    monkeypatch.setattr("platforms.chatgpt.codex_oauth._select_text_message_delivery", lambda *args, **kwargs: True)
+    monkeypatch.setattr("platforms.chatgpt.codex_oauth._click_first_no_wait", fake_click_first_no_wait)
+    monkeypatch.setattr("platforms.chatgpt.codex_oauth._extract_auth_error_text", lambda page: next(error_messages))
+    monkeypatch.setattr("platforms.chatgpt.codex_oauth._submit_otp_via_page", lambda *args, **kwargs: {"ok": True, "status": 200})
+
+    _do_add_phone_attempt(Page(), PhoneCallback(), log=lambda message: None, resume_url="")
+
+    assert events == ["send", "select_whatsapp", "send", "send_succeeded"]
+
+
+def test_add_phone_retries_new_number_when_chinese_in_use_error(monkeypatch):
+    attempts = []
+
+    class Page:
+        url = "https://auth.openai.com/add-phone"
+
+        def goto(self, url, **kwargs):
+            attempts.append(("goto", url))
+
+    class PhoneCallback:
+        def __init__(self):
+            self.reset_count = 0
+
+        def __call__(self):
+            return "+15555550123"
+
+        def cleanup(self):
+            attempts.append("cleanup")
+
+        def reset(self):
+            self.reset_count += 1
+            attempts.append("reset")
+
+    def fake_do_attempt(page, phone_callback, **kwargs):
+        attempts.append("attempt")
+        if len([item for item in attempts if item == "attempt"]) == 1:
+            raise RuntimeError("手机号提交失败: 该电话号码已被使用。请使用其他电话号码。")
+
+    callback = PhoneCallback()
+    monkeypatch.setattr("platforms.chatgpt.codex_oauth.time.sleep", lambda seconds: None)
+    monkeypatch.setattr("platforms.chatgpt.codex_oauth._do_add_phone_attempt", fake_do_attempt)
+
+    _handle_add_phone_challenge(
+        Page(),
+        callback,
+        log=lambda message: None,
+        resume_url="https://auth.openai.com/oauth/authorize?state=state-test",
+    )
+
+    assert attempts == ["attempt", "cleanup", "reset", ("goto", "https://auth.openai.com/add-phone"), "attempt"]
+
+
+def test_add_phone_retries_new_number_when_japanese_in_use_error(monkeypatch):
+    attempts = []
+
+    class Page:
+        url = "https://auth.openai.com/add-phone"
+
+        def goto(self, url, **kwargs):
+            attempts.append(("goto", url))
+
+    class PhoneCallback:
+        def __call__(self):
+            return "+15555550123"
+
+        def cleanup(self):
+            attempts.append("cleanup")
+
+        def reset(self):
+            attempts.append("reset")
+
+    def fake_do_attempt(page, phone_callback, **kwargs):
+        attempts.append("attempt")
+        if len([item for item in attempts if item == "attempt"]) == 1:
+            raise RuntimeError("手机号提交失败: この電話番号はすでに使用されています。別の電話番号を使用してください。")
+
+    monkeypatch.setattr("platforms.chatgpt.codex_oauth.time.sleep", lambda seconds: None)
+    monkeypatch.setattr("platforms.chatgpt.codex_oauth._do_add_phone_attempt", fake_do_attempt)
+
+    _handle_add_phone_challenge(
+        Page(),
+        PhoneCallback(),
+        log=lambda message: None,
+        resume_url="https://auth.openai.com/oauth/authorize?state=state-test",
+    )
+
+    assert attempts == ["attempt", "cleanup", "reset", ("goto", "https://auth.openai.com/add-phone"), "attempt"]
+
+
+def test_add_phone_retries_new_number_when_japanese_invalid_number_error(monkeypatch):
+    attempts = []
+
+    class Page:
+        url = "https://auth.openai.com/add-phone"
+
+        def goto(self, url, **kwargs):
+            attempts.append(("goto", url))
+
+    class PhoneCallback:
+        def __call__(self):
+            return "+15555550123"
+
+        def cleanup(self):
+            attempts.append("cleanup")
+
+        def reset(self):
+            attempts.append("reset")
+
+    def fake_do_attempt(page, phone_callback, **kwargs):
+        attempts.append("attempt")
+        if len([item for item in attempts if item == "attempt"]) == 1:
+            raise RuntimeError("手机号提交失败: 電話番号が無効です。")
+
+    monkeypatch.setattr("platforms.chatgpt.codex_oauth.time.sleep", lambda seconds: None)
+    monkeypatch.setattr("platforms.chatgpt.codex_oauth._do_add_phone_attempt", fake_do_attempt)
+
+    _handle_add_phone_challenge(
+        Page(),
+        PhoneCallback(),
+        log=lambda message: None,
+        resume_url="https://auth.openai.com/oauth/authorize?state=state-test",
+    )
+
+    assert attempts == ["attempt", "cleanup", "reset", ("goto", "https://auth.openai.com/add-phone"), "attempt"]
+
+
+def test_resume_oauth_after_add_phone_success_keeps_natural_consent(monkeypatch):
+    gotos = []
+
+    class Page:
+        url = "https://auth.openai.com/sign-in-with-chatgpt/codex/consent"
+
+        def goto(self, url, **kwargs):
+            gotos.append(url)
+
+    monkeypatch.setattr("platforms.chatgpt.codex_oauth.time.time", lambda: 1000.0)
+
+    _resume_oauth_after_add_phone_success(
+        Page(),
+        resume_url="https://auth.openai.com/oauth/authorize?state=state-test",
+        log=lambda message: None,
+    )
+
+    assert gotos == []
+
+
+def test_resume_oauth_after_add_phone_success_falls_back_when_still_on_add_phone(monkeypatch):
+    gotos = []
+    now = {"value": 1000.0}
+
+    class Page:
+        url = "https://auth.openai.com/add-phone"
+
+        def goto(self, url, **kwargs):
+            gotos.append(url)
+
+    monkeypatch.setattr("platforms.chatgpt.codex_oauth.time.time", lambda: now["value"])
+    monkeypatch.setattr("platforms.chatgpt.codex_oauth.time.sleep", lambda seconds: now.__setitem__("value", now["value"] + seconds))
+    monkeypatch.setattr("platforms.chatgpt.codex_oauth._derive_registration_state_from_page", lambda page: {"page_type": "add_phone"})
+
+    _resume_oauth_after_add_phone_success(
+        Page(),
+        resume_url="https://auth.openai.com/oauth/authorize?state=state-test",
+        log=lambda message: None,
+        observe_seconds=1,
+    )
+
+    assert gotos == ["https://auth.openai.com/oauth/authorize?state=state-test"]
 
 
 def test_codex_sms_phone_callback_retries_when_no_numbers(monkeypatch):
@@ -454,6 +1256,88 @@ def test_codex_sms_phone_callback_retries_when_no_numbers(monkeypatch):
     assert any("接码暂无号码" in item for item in logs)
 
 
+def test_codex_sms_phone_callback_sparsifies_large_no_number_retry_logs(monkeypatch):
+    class Provider:
+        request_timeout = 1
+        poll_interval = 0
+
+        def __init__(self):
+            self.calls = 0
+
+        def get_number(self, service="", country=""):
+            self.calls += 1
+            if self.calls <= 26:
+                raise RuntimeError("SMSBower getNumber失败: 当前服务/国家暂无号码 (NO_NUMBERS)")
+            return SmsActivation(
+                activation_id="activation-27",
+                phone_number="+15555550123",
+                provider="smsbower",
+            )
+
+    monkeypatch.setattr("platforms.chatgpt.plugin.time.sleep", lambda seconds: None)
+    logs = []
+    provider = Provider()
+    callback = _CodexSmsPhoneCallback(
+        provider,
+        log_fn=logs.append,
+        buy_max_attempts=30,
+        buy_retry_interval=0,
+    )
+
+    assert callback() == "+15555550123"
+    retry_logs = [item for item in logs if "接码暂无号码" in item]
+    assert len(retry_logs) == 4
+    assert any("(25/30)" in item for item in retry_logs)
+
+
+def test_codex_sms_phone_callback_cleanup_is_idempotent():
+    cancels = []
+
+    class Provider:
+        def cancel(self, activation_id):
+            cancels.append(activation_id)
+
+    callback = _CodexSmsPhoneCallback(Provider())
+    callback.activation = SmsActivation(
+        activation_id="activation-1",
+        phone_number="+15555550123",
+        provider="smsbower",
+    )
+
+    callback.cleanup()
+    callback.cleanup()
+
+    assert cancels == ["activation-1"]
+    assert callback.activation is None
+
+
+def test_codex_sms_phone_callback_stops_when_cancelled(monkeypatch):
+    class Provider:
+        def get_number(self, service="", country=""):
+            raise RuntimeError("SMSBower getNumber失败: 当前服务/国家暂无号码 (NO_NUMBERS)")
+
+    monkeypatch.setattr("platforms.chatgpt.plugin.time.sleep", lambda seconds: None)
+    checks = {"count": 0}
+
+    def cancel_check():
+        checks["count"] += 1
+        return checks["count"] >= 2
+
+    callback = _CodexSmsPhoneCallback(
+        Provider(),
+        buy_max_attempts=30,
+        buy_retry_interval=1,
+        cancel_check=cancel_check,
+    )
+
+    try:
+        callback()
+    except RuntimeError as exc:
+        assert str(exc) == "任务已取消"
+    else:
+        raise AssertionError("cancelled phone callback should stop")
+
+
 def test_codex_phone_callback_uses_smsbower_retry_settings(monkeypatch):
     class Repo:
         def get_default_provider_key(self, provider_type):
@@ -469,6 +1353,7 @@ def test_codex_phone_callback_uses_smsbower_retry_settings(monkeypatch):
                 "smsbower_default_country": "0",
                 "smsbower_buy_max_attempts": "7",
                 "smsbower_buy_retry_interval": "1.5",
+                "smsbower_otp_timeout_seconds": "180",
             }
 
     class Client:
@@ -484,6 +1369,43 @@ def test_codex_phone_callback_uses_smsbower_retry_settings(monkeypatch):
     assert isinstance(callback, _CodexSmsPhoneCallback)
     assert callback.buy_max_attempts == 7
     assert callback.buy_retry_interval == 1.5
+    assert callback.otp_timeout_seconds == 180
+
+
+def test_codex_phone_callback_supports_non_smsbower_provider(monkeypatch):
+    class Repo:
+        def get_default_provider_key(self, provider_type):
+            assert provider_type == "sms"
+            return "herosms"
+
+        def resolve_runtime_settings(self, provider_type, provider_key, extra):
+            return {
+                "herosms_api_key": "secret-key",
+                "herosms_default_service": "dr",
+                "herosms_default_country": "12",
+                "herosms_buy_max_attempts": "9",
+            }
+
+    class Client:
+        default_service = "dr"
+        default_country = "12"
+        buy_max_attempts = 9
+        buy_retry_interval = 2
+        otp_timeout_seconds = 150
+
+        def configuration_error(self):
+            return ""
+
+    monkeypatch.setattr("infrastructure.provider_settings_repository.ProviderSettingsRepository", Repo)
+    monkeypatch.setattr("core.herosms_sms.HeroSMSClient.from_config", classmethod(lambda cls, config: Client()))
+
+    callback = ChatGPTPlatform(config=RegisterConfig())._build_codex_phone_callback(proxy=None)
+
+    assert isinstance(callback, _CodexSmsPhoneCallback)
+    assert callback.provider.__class__ is Client
+    assert callback.service == "dr"
+    assert callback.country == "12"
+    assert callback.buy_max_attempts == 9
 
 
 def test_codex_oauth_result_is_persistable_but_returned_safely():

@@ -223,6 +223,12 @@ def build_account_display_summary(
         _append_metric(secondary_metrics, _metric("plan_name", "套餐", effective_plan_name, tone="muted"))
     if plan_state and plan_state != "unknown":
         _append_metric(secondary_metrics, _metric("plan_state", "套餐状态", plan_state, tone="muted"))
+    if "phone_bound" in overview:
+        phone_value = _text(overview.get("phone_number_masked")) or ("已绑定" if overview.get("phone_bound") else "未绑定")
+        _append_metric(
+            secondary_metrics,
+            _metric("phone_bound", "绑定手机", phone_value, tone="good" if overview.get("phone_bound") else "muted"),
+        )
     if checked_at_value:
         _append_metric(secondary_metrics, _metric("checked_at", "最近检测", checked_at_value, tone="muted"))
 

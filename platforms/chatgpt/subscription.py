@@ -57,6 +57,15 @@ def _status_from_me(data: dict) -> str:
     return "free"
 
 
+def _status_from_details(me: dict | None, usage: dict | None) -> str:
+    usage_status = _plan((usage or {}).get("plan_type"))
+    if usage_status != "free":
+        return usage_status
+    if isinstance(me, dict):
+        return _status_from_me(me)
+    return usage_status
+
+
 def _usage(account, proxy: Optional[str]) -> dict:
     headers = {"Authorization": f"Bearer {account.access_token}", "User-Agent": WHAM_USAGE_USER_AGENT}
     account_id = _account_id(account)
@@ -95,7 +104,7 @@ def fetch_subscription_status_details(account, proxy: Optional[str] = None) -> d
                 usage = _usage(account, proxy)
             except Exception as exc:
                 logger.info("usage enrichment failed: %s", exc)
-            return {"status": _status_from_me(data), "source": "backend-api/me", "me": data, "usage": usage}
+            return {"status": _status_from_details(data, usage), "source": "backend-api/me", "me": data, "usage": usage}
     except Exception as exc:
         logger.info("subscription status fallback to usage: %s", exc)
     usage = _usage(account, proxy)

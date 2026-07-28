@@ -22,6 +22,7 @@ from .browser_register import (
     EMAIL_INPUT_SELECTORS,
     EMAIL_SUBMIT_SELECTORS,
     PASSWORD_INPUT_SELECTORS,
+    PASSWORDLESS_LOGIN_SELECTORS,
     Camoufox,
     _apply_camoufox_visible_window_limit,
     _build_proxy_config,
@@ -31,6 +32,7 @@ from .browser_register import (
     _extract_auth_error_text,
     _fill_input_like_user,
     _goto_with_retry,
+    _press_enter_on_input,
     _submit_otp_via_page,
     _submit_oauth_password_direct,
     _wait_for_any_selector,
@@ -243,6 +245,7 @@ PHONE_SEND_SELECTORS = [
     'button:has-text("Continue")',
     'button:has-text("continue")',
     'button:has-text("发送")',
+    'input[type="submit"]',
 ]
 
 PHONE_TEXT_MESSAGE_SELECTORS = [
@@ -260,13 +263,34 @@ PHONE_TEXT_MESSAGE_SELECTORS = [
     '[role="option"]:has-text("短信")',
 ]
 
+PHONE_WHATSAPP_SELECTORS = [
+    'label:has-text("WhatsApp")',
+    'button:has-text("WhatsApp")',
+    '[role="radio"]:has-text("WhatsApp")',
+    '[role="option"]:has-text("WhatsApp")',
+]
+
 ACCOUNT_CHOOSER_SUBMIT_GRACE_SECONDS = 15
+# A real proxied login took about 35 seconds to leave the email page. Keep the
+# first submission in observation mode long enough to avoid sending it twice.
+EMAIL_SUBMIT_GRACE_SECONDS = 45
+PASSWORDLESS_LOGIN_GRACE_SECONDS = 20
+CODEX_BROWSER_LOGIN_MAX_ATTEMPTS = 2
+CODEX_CONSENT_STALL_RECOVERY_THRESHOLD = 3
+CODEX_CONSENT_STALL_MAX_RECOVERIES = 2
 
 
 @dataclass(slots=True)
 class PKCECodes:
     code_verifier: str
     code_challenge: str
+
+
+@dataclass(slots=True)
+class _CodexOAuthAttempt:
+    pkce: PKCECodes
+    state: str
+    auth_url: str
 
 
 def _utcnow() -> str:
@@ -288,6 +312,12 @@ def generate_pkce_codes() -> PKCECodes:
     verifier = _b64url(secrets.token_bytes(96))
     challenge = _b64url(hashlib.sha256(verifier.encode("ascii")).digest())
     return PKCECodes(code_verifier=verifier, code_challenge=challenge)
+
+
+def _new_codex_oauth_attempt() -> _CodexOAuthAttempt:
+    pkce = generate_pkce_codes()
+    state = secrets.token_urlsafe(32)
+    return _CodexOAuthAttempt(pkce=pkce, state=state, auth_url=build_codex_authorize_url(state, pkce))
 
 
 def build_codex_authorize_url(state: str, pkce: PKCECodes) -> str:
@@ -368,11 +398,18 @@ def codex_credential_filename(email: str, plan_type: str, account_id: str) -> st
 
 
 class _OAuthCallbackServer:
-    def __init__(self, *, port: int = CODEX_CALLBACK_PORT, state: str = ""):
+    def __init__(
+        self,
+        *,
+        port: int = CODEX_CALLBACK_PORT,
+        state: str = "",
+        log: Callable[[str], None] | None = None,
+    ):
         self.port = int(port)
         self.event = threading.Event()
         self.result: dict[str, str] = {}
         self.state = str(state or "")
+        self.log = log or (lambda _message: None)
 
     def __enter__(self) -> "_OAuthCallbackServer":
         _oauth_callback_broker.register(self)
@@ -409,15 +446,24 @@ class _OAuthCallbackBroker:
 
     def deliver(self, result: dict[str, str]) -> bool:
         state = str(result.get("state") or "")
+        log: Callable[[str], None] | None = None
         with self._lock:
             waiter = self._waiters.get(state)
             if not waiter and len(self._waiters) == 1:
                 waiter = next(iter(self._waiters.values()))
             if not waiter:
                 return False
+            first_delivery = not waiter.event.is_set()
             waiter.result = dict(result)
             waiter.event.set()
-            return True
+            if first_delivery:
+                log = waiter.log
+        if log:
+            try:
+                log("Codex OAuth 本地回调已到达")
+            except Exception:
+                pass
+        return True
 
     def _ensure_started(self) -> None:
         if self._httpd and self._thread and self._thread.is_alive():
@@ -650,10 +696,21 @@ def _handle_account_chooser(page, email: str, log: Callable[[str], None]) -> boo
     if action == "select":
         selected_email = str(result.get("email") or "").strip()
         index = int(result.get("index") or 0)
+        target = page.locator('button[name="session_id"]').nth(index)
         try:
-            page.locator('button[name="session_id"]').nth(index).click(timeout=5000)
+            if not target.is_visible(timeout=500) or not target.is_enabled(timeout=500):
+                log(f"Codex OAuth 账号选择页: 匹配账号当前不可点击 {selected_email or email}")
+                return False
+            target.click(timeout=3000, no_wait_after=True)
         except Exception as exc:
-            log(f"Codex OAuth 账号选择页: 匹配账号点击失败 {selected_email or email}: {exc}")
+            summary = str(exc or "").splitlines()[0][:160]
+            if "timeout" in summary.lower():
+                log(
+                    f"Codex OAuth 账号选择页: 匹配账号点击等待超时，"
+                    f"已进入异步跳转观察期 {selected_email or email}"
+                )
+                return True
+            log(f"Codex OAuth 账号选择页: 匹配账号点击失败 {selected_email or email}: {summary}")
             return False
         log(f"Codex OAuth 账号选择页: 已选择匹配账号 {selected_email or email}")
         return True
@@ -854,57 +911,202 @@ def _select_phone_country_ui(page, dial_code: str, country_name: str, log: Calla
     return False
 
 
+def _delivery_option_state(page, keyword: str) -> dict[str, Any]:
+    try:
+        result = page.evaluate(
+            """
+            (keyword) => {
+              const visible = (el) => {
+                if (!el) return false;
+                const style = window.getComputedStyle(el);
+                const rect = el.getBoundingClientRect();
+                return style && style.display !== 'none' && style.visibility !== 'hidden'
+                  && rect.width > 0 && rect.height > 0;
+              };
+              const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
+              const matches = (text) => {
+                const lowered = normalize(text).toLowerCase();
+                if (keyword === 'sms') {
+                  return (lowered.includes('text message') || lowered === 'sms' || lowered.includes('短信'))
+                    && !lowered.includes('whatsapp');
+                }
+                return lowered.includes('whatsapp');
+              };
+              const candidates = [];
+              const radios = Array.from(document.querySelectorAll('input[type="radio"]'));
+              const radioIndices = [];
+              for (const el of Array.from(document.querySelectorAll('label, button, [role="radio"], [role="option"], input[type="radio"]'))) {
+                let text = normalize(el.innerText || el.textContent || el.value || '');
+                let input = null;
+                if (el.matches('input[type="radio"]')) {
+                  input = el;
+                  const label = el.closest('label') || (el.id ? document.querySelector(`label[for="${el.id}"]`) : null);
+                  text = normalize(label?.innerText || label?.textContent || text);
+                } else if (el.matches('label')) {
+                  input = el.querySelector('input[type="radio"]') || (el.htmlFor ? document.getElementById(el.htmlFor) : null);
+                }
+                if (!matches(text)) continue;
+                const radioIndex = input ? radios.indexOf(input) : -1;
+                if (radioIndex >= 0 && !radioIndices.includes(radioIndex)) radioIndices.push(radioIndex);
+                candidates.push({
+                  tag: el.tagName.toLowerCase(),
+                  text: text.slice(0, 60),
+                  visible: visible(el),
+                  disabled: Boolean(el.disabled || el.getAttribute('aria-disabled') === 'true'),
+                  selected: Boolean(
+                    input?.checked
+                    || el.getAttribute('aria-checked') === 'true'
+                    || el.getAttribute('aria-selected') === 'true'
+                    || el.getAttribute('data-state') === 'checked'
+                  ),
+                });
+              }
+              return { selected: candidates.some((item) => item.visible && item.selected), candidates, radioIndices };
+            }
+            """,
+            keyword,
+        )
+        return result if isinstance(result, dict) else {}
+    except Exception:
+        return {}
+
+
+def _select_delivery_radio_with_keyboard(page, state: dict[str, Any], keyword: str) -> bool:
+    for raw_index in state.get("radioIndices") or []:
+        try:
+            index = int(raw_index)
+            target = page.locator('input[type="radio"]').nth(index)
+            if not target.is_visible(timeout=500) or not target.is_enabled(timeout=500):
+                continue
+            target.focus(timeout=1000)
+            target.press("Space", timeout=1500)
+            time.sleep(0.2)
+            if _delivery_option_state(page, keyword).get("selected"):
+                return True
+        except Exception:
+            continue
+    return False
+
+
 def _select_text_message_delivery(page, log: Callable[[str], None]) -> bool:
     selector = _click_first_no_wait(page, PHONE_TEXT_MESSAGE_SELECTORS, timeout=3)
     if selector:
         log(f"Codex OAuth add_phone: 已选择短信方式 {selector}")
         return True
-    try:
-        clicked = bool(
-            page.evaluate(
-                """
-                () => {
-                  const visible = (el) => {
-                    if (!el) return false;
-                    const style = window.getComputedStyle(el);
-                    const rect = el.getBoundingClientRect();
-                    return style && style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
-                  };
-                  const candidates = Array.from(document.querySelectorAll('label, button, [role="radio"], [role="option"], div, span'))
-                    .filter((el) => {
-                      if (!visible(el)) return false;
-                      const text = String(el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim().toLowerCase();
-                      return (text.includes('text message') || text === 'sms' || text.includes('短信')) && !text.includes('whatsapp');
-                    });
-                  for (const el of candidates) {
-                    const target = el.closest('label, button, [role="radio"], [role="option"]') || el;
-                    if (!visible(target)) continue;
-                    target.click();
-                    return true;
-                  }
-                  const radios = Array.from(document.querySelectorAll('input[type="radio"]'));
-                  for (const radio of radios) {
-                    const label = radio.closest('label') || document.querySelector(`label[for="${radio.id}"]`);
-                    const text = String(label?.innerText || label?.textContent || '').replace(/\\s+/g, ' ').trim().toLowerCase();
-                    if ((text.includes('text message') || text === 'sms' || text.includes('短信')) && !text.includes('whatsapp')) {
-                      radio.click();
-                      radio.dispatchEvent(new Event('input', { bubbles: true }));
-                      radio.dispatchEvent(new Event('change', { bubbles: true }));
-                      return true;
-                    }
-                  }
-                  return false;
-                }
-                """
-            )
-        )
-        if clicked:
-            log("Codex OAuth add_phone: 已通过文本匹配选择 Text Message")
-            return True
-    except Exception as exc:
-        log(f"Codex OAuth add_phone: 选择 Text Message 异常: {exc}")
-    log("Codex OAuth add_phone: 未发现 Text Message 选择项，继续尝试发送")
+    state = _delivery_option_state(page, "sms")
+    if state.get("selected"):
+        log("Codex OAuth add_phone: Text Message 已处于选中状态")
+        return True
+    if _select_delivery_radio_with_keyboard(page, state, "sms"):
+        log("Codex OAuth add_phone: 已使用键盘 Space 选择 Text Message")
+        return True
+    log(f"Codex OAuth add_phone: 未找到可点击的 Text Message 选项，候选={(state.get('candidates') or [])[:4]}")
     return False
+
+
+def _is_whatsapp_fallback_prompt(text: str) -> bool:
+    lowered = str(text or "").lower()
+    return (
+        "whatsapp" in lowered
+        and (
+            "switched to whatsapp" in lowered
+            or "continue to send" in lowered
+            or "couldn't send a text message" in lowered
+            or "could not send a text message" in lowered
+            or "whatsapp に切り替えました" in lowered
+            or "whatsappに切り替えました" in lowered
+            or "whatsapp で認証コード" in lowered
+            or "whatsappで認証コード" in lowered
+        )
+    )
+
+
+def _select_whatsapp_delivery(page, log: Callable[[str], None]) -> bool:
+    selector = _click_first_no_wait(page, PHONE_WHATSAPP_SELECTORS, timeout=3)
+    if selector:
+        log(f"Codex OAuth add_phone: 已选择 WhatsApp 方式 {selector}")
+        return True
+    state = _delivery_option_state(page, "whatsapp")
+    if state.get("selected"):
+        log("Codex OAuth add_phone: WhatsApp 已处于选中状态")
+        return True
+    if _select_delivery_radio_with_keyboard(page, state, "whatsapp"):
+        log("Codex OAuth add_phone: 已使用键盘 Space 选择 WhatsApp")
+        return True
+    log(f"Codex OAuth add_phone: 未找到可点击的 WhatsApp 选项，候选={(state.get('candidates') or [])[:4]}")
+    return False
+
+
+def _summarize_add_phone_controls(page) -> str:
+    try:
+        result = page.evaluate(
+            """
+            () => {
+              const visible = (el) => {
+                if (!el) return false;
+                const style = window.getComputedStyle(el);
+                const rect = el.getBoundingClientRect();
+                return style && style.display !== 'none' && style.visibility !== 'hidden'
+                  && rect.width > 0 && rect.height > 0;
+              };
+              const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
+              const buttons = Array.from(document.querySelectorAll('button, input[type="submit"], [role="button"]'))
+                .filter(visible)
+                .slice(0, 10)
+                .map((el) => ({
+                  text: normalize(el.innerText || el.textContent || el.value).slice(0, 50),
+                  disabled: Boolean(el.disabled || el.getAttribute('aria-disabled') === 'true'),
+                  type: String(el.getAttribute('type') || el.getAttribute('role') || el.tagName).slice(0, 20),
+                }));
+              const options = Array.from(document.querySelectorAll('label, [role="radio"], [role="option"]'))
+                .filter(visible)
+                .map((el) => normalize(el.innerText || el.textContent))
+                .filter((text) => /text message|sms|whatsapp|短信/i.test(text))
+                .slice(0, 8);
+              return { buttons, options };
+            }
+            """
+        )
+        return json.dumps(result, ensure_ascii=False)[:700]
+    except Exception as exc:
+        return f"unavailable:{str(exc or '').splitlines()[0][:120]}"
+
+
+def _resume_oauth_after_add_phone_success(
+    page,
+    *,
+    resume_url: str,
+    log: Callable[[str], None],
+    observe_seconds: float = 5,
+) -> None:
+    deadline = time.time() + max(float(observe_seconds), 0)
+    last_url = str(getattr(page, "url", "") or "")
+    while time.time() < deadline:
+        current_url = str(getattr(page, "url", "") or "")
+        if current_url:
+            last_url = current_url
+        if (
+            "localhost:1455/auth/callback" in current_url
+            or "localhost:1455/success" in current_url
+            or "code=" in current_url
+        ):
+            log("Codex OAuth add_phone: 手机验证后已进入回调流程")
+            return
+        if current_url and "add-phone" not in current_url:
+            log(f"Codex OAuth add_phone: 手机验证后页面已自然跳转 {current_url[:110]}")
+            return
+        try:
+            page_type = str((_derive_registration_state_from_page(page) or {}).get("page_type") or "")
+        except Exception:
+            page_type = ""
+        if page_type in {"consent", "workspace_selection", "organization_selection", "oauth_callback", "chatgpt_home"}:
+            log(f"Codex OAuth add_phone: 手机验证后已进入 {page_type}")
+            return
+        time.sleep(0.5)
+
+    if resume_url:
+        log(f"Codex OAuth add_phone: 手机验证后仍停留 add_phone，重新打开授权链接 {last_url[:110]}")
+        page.goto(resume_url, wait_until="domcontentloaded", timeout=30000)
 
 
 def _handle_add_phone_challenge(
@@ -939,7 +1141,17 @@ def _handle_add_phone_challenge(
                 or "NO_NUMBERS" in message
                 or "暂无号码" in message
                 or "无号码" in message
+                or "已被使用" in message
+                or "其他电话号码" in message
+                or "电话号码无效" in message
+                or "手机号无效" in message
+                or "電話番号が無効" in message
+                or "電話番号は無効" in message
+                or "すでに使用" in message
+                or "別の電話番号" in message
                 or "phone_number_in_use" in message
+                or "invalid phone" in message.lower()
+                or "invalid number" in message.lower()
                 or "no numbers" in message.lower()
                 or "no_number" in message.lower()
                 or "no number" in message.lower()
@@ -1050,11 +1262,26 @@ def _do_add_phone_attempt(
 
     send_selector = _click_first_no_wait(page, PHONE_SEND_SELECTORS, timeout=8)
     if not send_selector:
-        raise RuntimeError("未找到发送验证码按钮")
+        controls = _summarize_add_phone_controls(page)
+        log(f"Codex OAuth add_phone: 未找到可见且可点击的发送按钮，页面控件={controls}")
+        raise RuntimeError("未找到可见且可点击的发送验证码按钮")
     log(f"Codex OAuth add_phone: 已点击发送按钮 {send_selector}")
     time.sleep(2)
 
     error_text = _extract_auth_error_text(page)
+    if _is_whatsapp_fallback_prompt(error_text):
+        log(f"Codex OAuth add_phone: 短信发送失败，切换 WhatsApp 重试: {error_text[:160]}")
+        if not _select_whatsapp_delivery(page, log):
+            raise RuntimeError(f"手机号提交失败，且未找到 WhatsApp 选项: {error_text[:200]}")
+        time.sleep(0.5)
+        whatsapp_send_selector = _click_first_no_wait(page, PHONE_SEND_SELECTORS, timeout=8)
+        if not whatsapp_send_selector:
+            raise RuntimeError("切换 WhatsApp 后未找到发送验证码按钮")
+        log(f"Codex OAuth add_phone: 已点击 WhatsApp 发送按钮 {whatsapp_send_selector}")
+        time.sleep(2)
+        error_text = _extract_auth_error_text(page)
+        if _is_whatsapp_fallback_prompt(error_text):
+            error_text = ""
     if error_text:
         if hasattr(phone_callback, "mark_send_failed"):
             phone_callback.mark_send_failed(error_text)
@@ -1071,8 +1298,7 @@ def _do_add_phone_attempt(
         if otp_result.get("ok"):
             if hasattr(phone_callback, "report_success"):
                 phone_callback.report_success()
-            if resume_url:
-                page.goto(resume_url, wait_until="domcontentloaded", timeout=30000)
+            _resume_oauth_after_add_phone_success(page, resume_url=resume_url, log=log)
             return
         page_error = _extract_auth_error_text(page)
         if page_error and any(token in page_error.lower() for token in ("invalid", "incorrect", "wrong", "expired")):
@@ -1105,6 +1331,96 @@ def _try_skip_add_phone(page, *, auth_url: str, callback_server: _OAuthCallbackS
     return False
 
 
+def _sleep_until_callback(callback_server: _OAuthCallbackServer, seconds: float) -> bool:
+    wait_seconds = max(float(seconds), 0.05)
+    event_wait = getattr(callback_server.event, "wait", None)
+    if callable(event_wait):
+        return bool(event_wait(wait_seconds))
+    time.sleep(wait_seconds)
+    return bool(callback_server.event.is_set())
+
+
+def _observe_callback_request_on_page(
+    page,
+    callback_server: _OAuthCallbackServer,
+    log: Callable[[str], None],
+) -> None:
+    on = getattr(page, "on", None)
+    if not callable(on):
+        return
+
+    def _capture(request) -> None:
+        try:
+            parsed = urlparse(str(getattr(request, "url", "") or ""))
+            if parsed.hostname not in {"localhost", "127.0.0.1"} or parsed.port != CODEX_CALLBACK_PORT:
+                return
+            if parsed.path != "/auth/callback":
+                return
+            query = parse_qs(parsed.query)
+            result = {
+                "code": (query.get("code") or [""])[0],
+                "state": (query.get("state") or [""])[0],
+                "error": (query.get("error") or [""])[0],
+                "error_description": (query.get("error_description") or [""])[0],
+            }
+            if result["state"] != callback_server.state:
+                return
+            first_delivery = not callback_server.event.is_set()
+            callback_server.result = result
+            callback_server.event.set()
+            if first_delivery:
+                log("Codex OAuth 已从浏览器本地回调请求捕获结果")
+        except Exception:
+            return
+
+    on("request", _capture)
+
+
+def _recover_stalled_consent_page(
+    page,
+    *,
+    auth_url: str,
+    recovery_index: int,
+    log: Callable[[str], None],
+) -> None:
+    if recovery_index <= 1:
+        log("Codex OAuth consent 页面停滞，刷新页面重试")
+        try:
+            page.reload(wait_until="domcontentloaded", timeout=30000)
+            return
+        except Exception as exc:
+            log(f"Codex OAuth consent 页面刷新失败，改为重新打开授权链接: {exc}")
+    log("Codex OAuth consent 页面仍停滞，重新打开授权链接重试")
+    _goto_with_retry(page, auth_url, wait_until="domcontentloaded", timeout=30000, log=log)
+
+
+def _is_incorrect_password_error(text: str) -> bool:
+    value = str(text or "").lower()
+    return any(
+        token in value
+        for token in (
+            "incorrect email address or password",
+            "incorrect password",
+            "invalid email or password",
+            "invalid credentials",
+            "wrong password",
+            "邮箱地址或密码不正确",
+            "邮箱或密码不正确",
+            "密码不正确",
+            "メールアドレスまたはパスワードが正しくありません",
+            "パスワードが正しくありません",
+        )
+    )
+
+
+def _request_oauth_email_otp(page, log: Callable[[str], None], *, reason: str) -> bool:
+    selector = _click_first_no_wait(page, PASSWORDLESS_LOGIN_SELECTORS, timeout=5)
+    if not selector:
+        return False
+    log(f"Codex OAuth 密码页已选择邮箱验证码登录 ({reason}): {selector}")
+    return True
+
+
 def _drive_codex_oauth_page(
     page,
     *,
@@ -1116,13 +1432,20 @@ def _drive_codex_oauth_page(
     otp_callback: Callable[[], str] | None,
     phone_callback: Callable[[], str] | None,
     timeout: int,
+    registration_auth_mode: str = "",
 ) -> dict[str, str]:
+    _observe_callback_request_on_page(page, callback_server, log)
     _goto_with_retry(page, auth_url, wait_until="domcontentloaded", timeout=45000, log=log)
     deadline = time.time() + max(int(timeout), 30)
     last_signature = ""
     repeated = 0
     invalid_session_retries = 0
     account_chooser_grace_until = 0.0
+    email_submit_grace_until = 0.0
+    passwordless_login_grace_until = 0.0
+    passwordless_login_requested = False
+    consent_stall_recoveries = 0
+    prefer_email_otp = str(registration_auth_mode or "").strip().lower() == "email_otp"
 
     while time.time() < deadline:
         if callback_server.event.is_set():
@@ -1138,15 +1461,36 @@ def _drive_codex_oauth_page(
                 page_type = dom_page_type
                 state["page_type"] = dom_page_type
         signature = f"{page_type}|{current_url}"
-        if signature == last_signature:
+        signature_changed = signature != last_signature
+        if not signature_changed:
             repeated += 1
         else:
             repeated = 0
             last_signature = signature
-        log(f"Codex OAuth 页面: page={page_type or '-'} url={current_url[:110]}")
+            log(f"Codex OAuth 页面变化: page={page_type or '-'} url={current_url[:110]}")
 
         if "localhost:1455/auth/callback" in current_url or "localhost:1455/success" in current_url:
             return callback_server.wait(10)
+
+        consent_like_page = page_type in {"consent", "workspace_selection", "organization_selection"} or any(
+            token in current_url for token in ("sign-in-with-chatgpt", "workspace", "organization", "consent")
+        )
+        if (
+            consent_like_page
+            and repeated >= CODEX_CONSENT_STALL_RECOVERY_THRESHOLD
+            and consent_stall_recoveries < CODEX_CONSENT_STALL_MAX_RECOVERIES
+        ):
+            consent_stall_recoveries += 1
+            _recover_stalled_consent_page(
+                page,
+                auth_url=auth_url,
+                recovery_index=consent_stall_recoveries,
+                log=log,
+            )
+            repeated = 0
+            if _sleep_until_callback(callback_server, 1):
+                return callback_server.wait(1)
+            continue
 
         invalid_session = _get_invalid_session_error_page(page)
         if invalid_session.get("invalidSession"):
@@ -1155,21 +1499,26 @@ def _drive_codex_oauth_page(
             if invalid_session_retries <= 3:
                 log(f"Codex OAuth 缓存账号 session 失效，点击 Try again 后重选账号 ({invalid_session_retries}/3)")
                 if _click_invalid_session_try_again(page):
-                    time.sleep(1)
+                    if _sleep_until_callback(callback_server, 1):
+                        return callback_server.wait(1)
                     continue
                 log("Codex OAuth Invalid session ID 页面未找到 Try again，重新打开授权链接")
                 _goto_with_retry(page, auth_url, wait_until="domcontentloaded", timeout=30000, log=log)
-                time.sleep(1)
+                if _sleep_until_callback(callback_server, 1):
+                    return callback_server.wait(1)
                 continue
             log("Codex OAuth 缓存账号 session 连续失效，重新打开授权链接")
             _goto_with_retry(page, auth_url, wait_until="domcontentloaded", timeout=30000, log=log)
-            time.sleep(1)
+            if _sleep_until_callback(callback_server, 1):
+                return callback_server.wait(1)
             continue
 
         if page_type == "account_chooser":
             if account_chooser_grace_until and time.time() < account_chooser_grace_until:
-                log("Codex OAuth 账号选择页: 已提交，宽限期内观察下一步")
-                time.sleep(1)
+                if repeated <= 1:
+                    log("Codex OAuth 账号选择页: 已提交，等待页面异步跳转")
+                if _sleep_until_callback(callback_server, 1):
+                    return callback_server.wait(1)
                 continue
             if _account_chooser_submission_pending(page, email):
                 log("Codex OAuth 账号选择页: 账号选择已提交，等待页面跳转")
@@ -1177,11 +1526,13 @@ def _drive_codex_oauth_page(
                     account_chooser_grace_until,
                     time.time() + ACCOUNT_CHOOSER_SUBMIT_GRACE_SECONDS,
                 )
-                time.sleep(1)
+                if _sleep_until_callback(callback_server, 1):
+                    return callback_server.wait(1)
                 continue
             if _handle_account_chooser(page, email, log):
                 account_chooser_grace_until = time.time() + ACCOUNT_CHOOSER_SUBMIT_GRACE_SECONDS
-                time.sleep(1)
+                if _sleep_until_callback(callback_server, 1):
+                    return callback_server.wait(1)
                 continue
             raise RuntimeError("Codex OAuth 账号选择页未找到匹配账号或切换入口")
 
@@ -1195,12 +1546,25 @@ def _drive_codex_oauth_page(
         except Exception:
             email_selector = None
         if email_selector:
+            if email_submit_grace_until and time.time() < email_submit_grace_until:
+                if repeated <= 1:
+                    log("Codex OAuth 邮箱页: 已提交，等待页面异步跳转")
+                if _sleep_until_callback(callback_server, 1):
+                    return callback_server.wait(1)
+                continue
             if not _fill_input_like_user(page, email_selector, email):
                 raise RuntimeError("Codex OAuth 邮箱页填写失败")
             log(f"Codex OAuth 邮箱页输入框: {email_selector}")
-            if not _click_first(page, EMAIL_SUBMIT_SELECTORS, timeout=8):
+            email_submit_selector = _click_first(page, EMAIL_SUBMIT_SELECTORS, timeout=8)
+            if not email_submit_selector and _press_enter_on_input(page, email_selector):
+                email_submit_selector = f"{email_selector} keyboard Enter"
+                log("Codex OAuth 邮箱页按钮不可点击，已在邮箱输入框按 Enter")
+            if not email_submit_selector:
                 raise RuntimeError("Codex OAuth 邮箱页未找到 Continue 按钮")
-            time.sleep(1)
+            email_submit_grace_until = time.time() + EMAIL_SUBMIT_GRACE_SECONDS
+            log(f"Codex OAuth 邮箱页已点击 Continue: {email_submit_selector}")
+            if _sleep_until_callback(callback_server, 1):
+                return callback_server.wait(1)
             continue
 
         password_visible = False
@@ -1212,10 +1576,38 @@ def _drive_codex_oauth_page(
         except Exception:
             password_visible = False
         if password_visible or page_type == "login_password":
+            if passwordless_login_requested:
+                if time.time() < passwordless_login_grace_until:
+                    if _sleep_until_callback(callback_server, 1):
+                        return callback_server.wait(1)
+                    continue
+                raise RuntimeError("Codex OAuth 已选择邮箱验证码登录，但页面未进入验证码阶段")
+            if prefer_email_otp and callable(otp_callback):
+                log("Codex OAuth 账号由邮箱验证码注册，跳过未在远端设置的本地生成密码")
+                if not _request_oauth_email_otp(page, log, reason="registration_auth_mode=email_otp"):
+                    raise RuntimeError("Codex OAuth 邮箱验证码账号未找到可见且可点击的验证码登录按钮")
+                passwordless_login_requested = True
+                passwordless_login_grace_until = time.time() + PASSWORDLESS_LOGIN_GRACE_SECONDS
+                if _sleep_until_callback(callback_server, 1):
+                    return callback_server.wait(1)
+                continue
             password_result = _submit_oauth_password_direct(page, password, log)
             if not password_result.get("ok"):
-                raise RuntimeError(f"Codex OAuth 密码页失败: {password_result.get('text') or password_result.get('url')}")
-            time.sleep(1)
+                password_error = str(password_result.get("text") or password_result.get("url") or "")
+                if (
+                    callable(otp_callback)
+                    and not passwordless_login_requested
+                    and _is_incorrect_password_error(password_error)
+                    and _request_oauth_email_otp(page, log, reason="密码校验失败，切换恢复")
+                ):
+                    passwordless_login_requested = True
+                    passwordless_login_grace_until = time.time() + PASSWORDLESS_LOGIN_GRACE_SECONDS
+                    if _sleep_until_callback(callback_server, 1):
+                        return callback_server.wait(1)
+                    continue
+                raise RuntimeError(f"Codex OAuth 密码页失败: {password_error}")
+            if _sleep_until_callback(callback_server, 1):
+                return callback_server.wait(1)
             continue
 
         if page_type == "email_otp_verification":
@@ -1223,10 +1615,11 @@ def _drive_codex_oauth_page(
                 raise RuntimeError("Codex OAuth 登录触发邮箱验证码，但该账号未绑定可用验证邮箱")
             log("Codex OAuth 需要邮箱验证码，正在读取绑定邮箱")
             code = str(otp_callback() or "").strip()
-            otp_result = _submit_otp_via_page(page, code, log)
+            otp_result = _submit_otp_via_page(page, code, log, otp_callback=otp_callback)
             if not otp_result.get("ok"):
                 raise RuntimeError(f"Codex OAuth 验证码提交失败: {otp_result.get('text') or otp_result.get('url')}")
-            time.sleep(1)
+            if _sleep_until_callback(callback_server, 1):
+                return callback_server.wait(1)
             continue
 
         if page_type == "add_phone":
@@ -1238,17 +1631,18 @@ def _drive_codex_oauth_page(
                     log=log,
                     resume_url=auth_url,
                 )
-                time.sleep(1)
+                if _sleep_until_callback(callback_server, 1):
+                    return callback_server.wait(1)
                 continue
             if _try_skip_add_phone(page, auth_url=auth_url, callback_server=callback_server, log=log):
                 return callback_server.wait(10)
             raise RuntimeError("Codex OAuth 登录触发 add_phone，但未配置可用接码服务")
 
-        if page_type in {"consent", "workspace_selection", "organization_selection"} or any(
-            token in current_url for token in ("sign-in-with-chatgpt", "workspace", "organization", "consent")
-        ):
+        if consent_like_page:
             if _click_continue_like_button(page, log, page_type or "Codex OAuth 授权确认"):
-                time.sleep(1)
+                callback_wait = 3 if page_type == "consent" or "consent" in current_url else 1
+                if _sleep_until_callback(callback_server, callback_wait):
+                    return callback_server.wait(1)
                 continue
 
         error_text = _extract_auth_error_text(page)
@@ -1257,7 +1651,8 @@ def _drive_codex_oauth_page(
 
         if repeated > 12:
             raise RuntimeError(f"Codex OAuth 页面停滞: page={page_type or '-'} url={current_url[:160]}")
-        time.sleep(1)
+        if _sleep_until_callback(callback_server, 1):
+            return callback_server.wait(1)
 
     raise RuntimeError("Codex OAuth 浏览器登录超时")
 
@@ -1322,11 +1717,16 @@ def _finalize_codex_oauth_callback(
     }
 
 
+def _is_codex_browser_login_timeout(exc: Exception) -> bool:
+    return "Codex OAuth 浏览器登录超时" in str(exc or "")
+
+
 def perform_codex_oauth_login_on_page(
     page,
     *,
     email: str,
     password: str,
+    registration_auth_mode: str = "",
     proxy: str | None = None,
     log_fn: Callable[[str], None] | None = None,
     otp_callback: Callable[[], str] | None = None,
@@ -1337,44 +1737,54 @@ def perform_codex_oauth_login_on_page(
     log = log_fn or (lambda _message: None)
     email = str(email or "").strip()
     password = str(password or "")
+    normalized_auth_mode = str(registration_auth_mode or "").strip().lower()
     if not email:
         raise RuntimeError("Codex OAuth 需要账号邮箱")
-    if not password:
+    if not password and normalized_auth_mode != "email_otp":
         raise RuntimeError("Codex OAuth 需要账号密码")
 
-    pkce = generate_pkce_codes()
-    state = secrets.token_urlsafe(32)
-    auth_url = build_codex_authorize_url(state, pkce)
-    log("Codex OAuth 授权链接已生成，复用当前浏览器窗口")
+    last_error: Exception | None = None
+    for attempt_index in range(1, CODEX_BROWSER_LOGIN_MAX_ATTEMPTS + 1):
+        attempt = _new_codex_oauth_attempt()
+        suffix = f" ({attempt_index}/{CODEX_BROWSER_LOGIN_MAX_ATTEMPTS})" if attempt_index > 1 else ""
+        log(f"Codex OAuth 授权链接已生成，复用当前浏览器窗口{suffix}")
 
-    with _OAuthCallbackServer(port=CODEX_CALLBACK_PORT, state=state) as callback_server:
-        callback = _drive_codex_oauth_page(
-            page,
-            auth_url=auth_url,
-            email=email,
-            password=password,
-            callback_server=callback_server,
-            log=log,
-            otp_callback=otp_callback,
-            phone_callback=phone_callback,
-            timeout=timeout,
-        )
-
-    return _finalize_codex_oauth_callback(
-        callback,
-        expected_state=state,
-        pkce=pkce,
-        email=email,
-        proxy=proxy,
-        auth_dir=auth_dir,
-        log=log,
-    )
+        try:
+            with _OAuthCallbackServer(port=CODEX_CALLBACK_PORT, state=attempt.state, log=log) as callback_server:
+                callback = _drive_codex_oauth_page(
+                    page,
+                    auth_url=attempt.auth_url,
+                    email=email,
+                    password=password,
+                    callback_server=callback_server,
+                    log=log,
+                    otp_callback=otp_callback,
+                    phone_callback=phone_callback,
+                    timeout=timeout,
+                    registration_auth_mode=registration_auth_mode,
+                )
+            return _finalize_codex_oauth_callback(
+                callback,
+                expected_state=attempt.state,
+                pkce=attempt.pkce,
+                email=email,
+                proxy=proxy,
+                auth_dir=auth_dir,
+                log=log,
+            )
+        except Exception as exc:
+            last_error = exc
+            if not _is_codex_browser_login_timeout(exc) or attempt_index >= CODEX_BROWSER_LOGIN_MAX_ATTEMPTS:
+                raise
+            log("Codex OAuth 浏览器登录超时，重新生成授权链接重试")
+    raise RuntimeError(f"Codex OAuth 授权失败: {last_error}")
 
 
 def perform_codex_oauth_login(
     *,
     email: str,
     password: str,
+    registration_auth_mode: str = "",
     proxy: str | None = None,
     headless: bool = True,
     log_fn: Callable[[str], None] | None = None,
@@ -1388,15 +1798,11 @@ def perform_codex_oauth_login(
     log = log_fn or (lambda _message: None)
     email = str(email or "").strip()
     password = str(password or "")
+    normalized_auth_mode = str(registration_auth_mode or "").strip().lower()
     if not email:
         raise RuntimeError("Codex OAuth 需要账号邮箱")
-    if not password:
+    if not password and normalized_auth_mode != "email_otp":
         raise RuntimeError("Codex OAuth 需要账号密码")
-
-    pkce = generate_pkce_codes()
-    state = secrets.token_urlsafe(32)
-    auth_url = build_codex_authorize_url(state, pkce)
-    log("Codex OAuth 授权链接已生成，启动本地回调服务")
 
     browser_config = backend_config or BrowserBackendConfig.camoufox(headless=bool(headless))
     launch_opts = {"headless": browser_config.is_headless}
@@ -1407,41 +1813,53 @@ def perform_codex_oauth_login(
             launch_opts["geoip"] = True
     _apply_camoufox_visible_window_limit(launch_opts, browser_config)
 
-    with _OAuthCallbackServer(port=CODEX_CALLBACK_PORT, state=state) as callback_server:
-        browser_context = open_browser_backend(
-            launch_opts=launch_opts,
-            config=browser_config,
-            camoufox_class=Camoufox,
-            log=log,
-        )
-        browser = browser_context.__enter__()
-        keep_open = bool(keep_browser_open and not browser_config.is_headless)
-        try:
-            page = browser.new_page()
-            callback = _drive_codex_oauth_page(
-                page,
-                auth_url=auth_url,
-                email=email,
-                password=password,
-                callback_server=callback_server,
-                log=log,
-                otp_callback=otp_callback,
-                phone_callback=phone_callback,
-                timeout=timeout,
-            )
-        finally:
-            if keep_open:
-                keep_browser_context_open(browser_context, browser, label=f"codex-oauth:{email}")
-                log("Codex OAuth 浏览器窗口已保留，可手动关闭")
-            else:
-                browser_context.__exit__(*sys.exc_info())
-
-    return _finalize_codex_oauth_callback(
-        callback,
-        expected_state=state,
-        pkce=pkce,
-        email=email,
-        proxy=proxy,
-        auth_dir=auth_dir,
+    browser_context = open_browser_backend(
+        launch_opts=launch_opts,
+        config=browser_config,
+        camoufox_class=Camoufox,
         log=log,
     )
+    browser = browser_context.__enter__()
+    keep_open = bool(keep_browser_open and not browser_config.is_headless)
+    try:
+        page = browser.new_page()
+        last_error: Exception | None = None
+        for attempt_index in range(1, CODEX_BROWSER_LOGIN_MAX_ATTEMPTS + 1):
+            attempt = _new_codex_oauth_attempt()
+            suffix = f" ({attempt_index}/{CODEX_BROWSER_LOGIN_MAX_ATTEMPTS})" if attempt_index > 1 else ""
+            log(f"Codex OAuth 授权链接已生成，启动本地回调服务{suffix}")
+            try:
+                with _OAuthCallbackServer(port=CODEX_CALLBACK_PORT, state=attempt.state, log=log) as callback_server:
+                    callback = _drive_codex_oauth_page(
+                        page,
+                        auth_url=attempt.auth_url,
+                        email=email,
+                        password=password,
+                        callback_server=callback_server,
+                        log=log,
+                        otp_callback=otp_callback,
+                        phone_callback=phone_callback,
+                        timeout=timeout,
+                        registration_auth_mode=registration_auth_mode,
+                    )
+                return _finalize_codex_oauth_callback(
+                    callback,
+                    expected_state=attempt.state,
+                    pkce=attempt.pkce,
+                    email=email,
+                    proxy=proxy,
+                    auth_dir=auth_dir,
+                    log=log,
+                )
+            except Exception as exc:
+                last_error = exc
+                if not _is_codex_browser_login_timeout(exc) or attempt_index >= CODEX_BROWSER_LOGIN_MAX_ATTEMPTS:
+                    raise
+                log("Codex OAuth 浏览器登录超时，重新生成授权链接重试")
+        raise RuntimeError(f"Codex OAuth 授权失败: {last_error}")
+    finally:
+        if keep_open:
+            keep_browser_context_open(browser_context, browser, label=f"codex-oauth:{email}")
+            log("Codex OAuth 浏览器窗口已保留，可手动关闭")
+        else:
+            browser_context.__exit__(*sys.exc_info())

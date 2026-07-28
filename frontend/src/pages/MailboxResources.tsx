@@ -701,6 +701,7 @@ export default function MailboxResources() {
           identity_provider: "mailbox",
           mail_provider: resource.provider,
           mailbox_address_id: resource.mailbox_address_id,
+          prefer_password_registration: true,
         },
       }),
     });

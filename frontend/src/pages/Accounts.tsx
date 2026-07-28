@@ -257,6 +257,7 @@ function RegisterModal({
   const [platformProxyMode, setPlatformProxyMode] = useState('direct')
   const [platformProxyValue, setPlatformProxyValue] = useState('')
   const [outlookPoolText, setOutlookPoolText] = useState('')
+  const [preferPasswordRegistration, setPreferPasswordRegistration] = useState(true)
   const [autoUploadSub2Api, setAutoUploadSub2Api] = useState(false)
   const [autoCodexOAuth, setAutoCodexOAuth] = useState(false)
   const [codexOAuthBrowserMode, setCodexOAuthBrowserMode] = useState('headless')
@@ -380,6 +381,9 @@ function RegisterModal({
         auto_codex_oauth_after_register: autoCodexOAuth,
         codex_oauth_browser_mode: codexOAuthBrowserMode,
         codex_oauth_keep_browser_open: keepCodexBrowserOpen,
+      }
+      if (platformMeta?.name === 'chatgpt' && selection.executorType !== 'protocol') {
+        extra.prefer_password_registration = preferPasswordRegistration
       }
       if (selection.identityProvider === 'mailbox') {
         if (selection.executorType === 'protocol') {
@@ -519,6 +523,27 @@ function RegisterModal({
                       placeholder={t('accounts.outlookPoolPlaceholder')}
                       className="control-surface w-full resize-y font-mono text-xs"
                     />
+                  </div>
+                ) : null}
+
+                {platformMeta?.name === 'chatgpt' && selection.executorType !== 'protocol' ? (
+                  <div className="rounded-xl border border-[var(--border)] bg-[var(--bg-pane)]/45 px-4 py-3">
+                    <label className="flex cursor-pointer items-start gap-3">
+                      <input
+                        type="checkbox"
+                        checked={preferPasswordRegistration}
+                        onChange={(event) => setPreferPasswordRegistration(event.target.checked)}
+                        className="mt-0.5 h-4 w-4 accent-[var(--accent)]"
+                      />
+                      <span>
+                        <span className="block text-sm font-medium text-[var(--text-primary)]">
+                          {t('accounts.preferPasswordRegistration')}
+                        </span>
+                        <span className="mt-1 block text-xs text-[var(--text-muted)]">
+                          {t('accounts.preferPasswordRegistrationHint')}
+                        </span>
+                      </span>
+                    </label>
                   </div>
                 ) : null}
 

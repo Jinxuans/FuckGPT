@@ -122,6 +122,35 @@ def test_chatgpt_subscription_status_falls_back_to_wham_usage(monkeypatch):
     assert captured_headers["Chatgpt-Account-Id"] == "acct-123"
 
 
+def test_chatgpt_subscription_status_prefers_wham_usage_plan(monkeypatch):
+    class _Resp:
+        def __init__(self, data):
+            self._data = data
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self._data
+
+    def _fake_get(url, **kwargs):
+        if url.endswith("/backend-api/me"):
+            return _Resp(data={"plan_type": "free", "orgs": {"data": []}})
+        return _Resp(data={"plan_type": "plus"})
+
+    monkeypatch.setattr(subscription.requests, "get", _fake_get)
+    account = type(
+        "AccountStub",
+        (),
+        {"access_token": "token", "cookies": "", "id_token": "", "extra": {}},
+    )()
+
+    details = subscription.fetch_subscription_status_details(account)
+
+    assert details["status"] == "plus"
+    assert details["usage"]["plan_type"] == "plus"
+
+
 def test_chatgpt_check_valid_uses_proxy_pool_before_direct(monkeypatch):
     calls: list[str | None] = []
     proxy_events: list[tuple[str, str]] = []
@@ -162,3 +191,82 @@ def test_chatgpt_check_valid_uses_proxy_pool_before_direct(monkeypatch):
     assert calls == ["http://127.0.0.1:7890"]
     assert proxy_events == [("success", "http://127.0.0.1:7890")]
     assert plugin.get_last_check_overview()["chatgpt_usage"] == {"plan_type": "free"}
+
+
+def test_chatgpt_check_valid_uses_usage_plan_and_masks_phone(monkeypatch):
+    def _fake_status(account, proxy=None):
+        return {
+            "status": "plus",
+            "source": "backend-api/me",
+            "me": {"email": "phone@test.com", "phone_number": "+56996830313"},
+            "usage": {"plan_type": "plus"},
+        }
+
+    monkeypatch.setattr(subscription, "fetch_subscription_status_details", _fake_status)
+    monkeypatch.setattr(proxy_pool, "get_next", lambda region="": None)
+
+    plugin = ChatGPTPlatform.__new__(ChatGPTPlatform)
+    plugin.config = RegisterConfig()
+    plugin.mailbox = None
+    account = type(
+        "AccountStub",
+        (),
+        {
+            "token": "token",
+            "region": "",
+            "extra": {"access_token": "token", "id_token": "", "cookies": ""},
+        },
+    )()
+
+    assert plugin.check_valid(account) is True
+    overview = plugin.get_last_check_overview()
+    assert overview["plan"] == "plus"
+    assert overview["plan_state"] == "subscribed"
+    assert overview["phone_bound"] is True
+    assert overview["phone_number_masked"] == "+569****0313"
+    assert "已绑手机" in overview["chips"]
+
+
+def test_chatgpt_query_state_uses_account_id_for_subscription(monkeypatch):
+    captured: dict[str, str] = {}
+
+    def _fake_profile(access_token, proxy=None):
+        return True, {"email": "state@test.com"}
+
+    def _fake_status(account, proxy=None):
+        captured["account_id"] = getattr(account, "chatgpt_account_id", "")
+        return {
+            "status": "plus",
+            "source": "backend-api/wham/usage",
+            "usage": {"plan_type": "plus"},
+        }
+
+    monkeypatch.setattr("platforms.chatgpt.switch._fetch_profile", _fake_profile)
+    monkeypatch.setattr("platforms.chatgpt.switch.read_current_codex_account", lambda: {})
+    monkeypatch.setattr("platforms.chatgpt.switch.get_codex_desktop_state", lambda: {"available": True})
+    monkeypatch.setattr(subscription, "fetch_subscription_status_details", _fake_status)
+
+    plugin = ChatGPTPlatform.__new__(ChatGPTPlatform)
+    plugin.config = RegisterConfig()
+    account = type(
+        "AccountStub",
+        (),
+        {
+            "token": "token",
+            "user_id": "fallback-account-id",
+            "extra": {
+                "access_token": "token",
+                "account_id": "acct-real",
+                "id_token": "id-token",
+                "session_token": "session-token",
+                "cookies": "",
+            },
+        },
+    )()
+
+    result = plugin._handle_query_state(account, {})
+
+    assert result["ok"] is True
+    assert captured["account_id"] == "acct-real"
+    assert result["data"]["subscription_status"] == "plus"
+    assert result["data"]["chatgpt_usage"]["plan_type"] == "plus"

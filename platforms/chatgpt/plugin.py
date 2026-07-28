@@ -34,6 +34,24 @@ def _truthy(value) -> bool:
     return str(value or "").strip().lower() in {"1", "true", "yes", "on", "是", "开启", "启用"}
 
 
+def _resolve_registration_auth_mode(extra: dict | None) -> str:
+    payload = extra if isinstance(extra, dict) else {}
+    direct = str(payload.get("registration_auth_mode") or "").strip().lower()
+    if direct:
+        return direct
+    overview = payload.get("account_overview") if isinstance(payload.get("account_overview"), dict) else {}
+    legacy = overview.get("legacy_extra") if isinstance(overview.get("legacy_extra"), dict) else {}
+    stored = str(legacy.get("registration_auth_mode") or "").strip().lower()
+    if stored:
+        return stored
+    profile = payload.get("profile") if isinstance(payload.get("profile"), dict) else legacy.get("profile")
+    profile = profile if isinstance(profile, dict) else {}
+    amr = [str(item or "").strip().lower() for item in profile.get("amr") or []]
+    if any("otp_email" in item for item in amr):
+        return "email_otp"
+    return ""
+
+
 def _mask_phone_number(value) -> str:
     text = str(value or "").strip()
     if not text:
@@ -69,6 +87,8 @@ class _CodexSmsPhoneCallback:
         log_fn=None,
         buy_max_attempts: int = 20,
         buy_retry_interval: float = 3,
+        otp_timeout_seconds: int = 120,
+        cancel_check=None,
     ):
         self.provider = provider
         self.service = service
@@ -76,9 +96,12 @@ class _CodexSmsPhoneCallback:
         self.log_fn = log_fn if callable(log_fn) else (lambda _message: None)
         self.buy_max_attempts = max(int(buy_max_attempts or 1), 1)
         self.buy_retry_interval = max(float(buy_retry_interval or 0), 0)
+        self.otp_timeout_seconds = max(int(otp_timeout_seconds or 1), 1)
         self.activation = None
         self.completed = False
         self.sent = False
+        self._has_cancel_check = callable(cancel_check)
+        self.cancel_check = cancel_check if callable(cancel_check) else (lambda: False)
 
     def _log(self, message: str) -> None:
         try:
@@ -86,17 +109,21 @@ class _CodexSmsPhoneCallback:
         except Exception:
             pass
 
+    def _raise_if_cancelled(self) -> None:
+        try:
+            cancelled = bool(self.cancel_check())
+        except Exception:
+            cancelled = False
+        if cancelled:
+            self.cleanup()
+            raise RuntimeError("任务已取消")
+
     def __call__(self) -> str:
+        self._raise_if_cancelled()
         if self.activation is None:
             self.activation = self._buy_number_with_retry()
             return self.activation.phone_number
-        timeout = int(float(getattr(self.provider, "request_timeout", 15) or 15) * 8)
-        timeout = max(timeout, 120)
-        return self.provider.wait_for_code(
-            self.activation.activation_id,
-            timeout=timeout,
-            poll_interval=getattr(self.provider, "poll_interval", 3),
-        )
+        return self._wait_for_code()
 
     @staticmethod
     def _is_retryable_buy_error(exc: Exception) -> bool:
@@ -109,11 +136,16 @@ class _CodexSmsPhoneCallback:
             or "no numbers" in lowered
             or "no_number" in lowered
             or "no number" in lowered
+            or "out of stock" in lowered
+            or "no stock" in lowered
+            or "暂无库存" in message
+            or "无库存" in message
         )
 
     def _buy_number_with_retry(self):
         last_error: Exception | None = None
         for attempt in range(1, self.buy_max_attempts + 1):
+            self._raise_if_cancelled()
             try:
                 activation = self.provider.get_number(service=self.service, country=self.country)
                 self._log(f"Codex OAuth 接码买号成功: activation={activation.activation_id}")
@@ -124,13 +156,40 @@ class _CodexSmsPhoneCallback:
                     raise
                 if attempt >= self.buy_max_attempts:
                     break
-                self._log(
-                    f"Codex OAuth 接码暂无号码，{self.buy_retry_interval:g}s 后重试 "
-                    f"({attempt}/{self.buy_max_attempts}): {exc}"
-                )
-                if self.buy_retry_interval > 0:
+                if attempt <= 3 or attempt % 25 == 0:
+                    self._log(
+                        f"Codex OAuth 接码暂无号码，{self.buy_retry_interval:g}s 后重试 "
+                        f"({attempt}/{self.buy_max_attempts}): {exc}"
+                    )
+                if self.buy_retry_interval > 0 and not self._has_cancel_check:
                     time.sleep(self.buy_retry_interval)
+                elif self.buy_retry_interval > 0:
+                    deadline = time.monotonic() + self.buy_retry_interval
+                    while time.monotonic() < deadline:
+                        self._raise_if_cancelled()
+                        time.sleep(min(0.5, max(deadline - time.monotonic(), 0)))
         raise RuntimeError(f"Codex OAuth 接码买号重试耗尽: {last_error}") from last_error
+
+    def _wait_for_code(self) -> str:
+        deadline = time.monotonic() + self.otp_timeout_seconds
+        interval = max(float(getattr(self.provider, "poll_interval", 3) or 0), 0)
+        last_status = ""
+        while time.monotonic() < deadline:
+            self._raise_if_cancelled()
+            status = self.provider.get_status(self.activation.activation_id)
+            last_status = status.raw or status.status
+            if status.code:
+                return status.code
+            if status.status == "cancelled":
+                raise RuntimeError(f"短信激活已取消: {self.activation.activation_id}")
+            if interval > 0 and not self._has_cancel_check:
+                time.sleep(interval)
+                continue
+            sleep_deadline = time.monotonic() + interval
+            while time.monotonic() < sleep_deadline:
+                self._raise_if_cancelled()
+                time.sleep(min(0.5, max(sleep_deadline - time.monotonic(), 0)))
+        raise TimeoutError(f"等待短信验证码超时 ({self.otp_timeout_seconds}s)，最后状态: {last_status or 'none'}")
 
     def mark_send_succeeded(self) -> None:
         if self.activation is None or self.sent:
@@ -165,6 +224,9 @@ class _CodexSmsPhoneCallback:
             self.provider.cancel(self.activation.activation_id)
         except Exception:
             pass
+        finally:
+            self.activation = None
+            self.sent = False
 
     def reset(self) -> None:
         self.activation = None
@@ -295,6 +357,7 @@ class ChatGPTPlatform(BasePlatform):
             "cookies": result.get("cookies", ""),
             "profile": result.get("profile", {}),
             "expires_at": result.get("expires_at", ""),
+            "registration_auth_mode": result.get("registration_auth_mode", ""),
         }
         for key in (
             "codex_auth_path",
@@ -335,6 +398,7 @@ class ChatGPTPlatform(BasePlatform):
                 codex_phone_callback=codex_phone_callback,
                 codex_oauth_timeout=int(ctx.extra.get("codex_oauth_timeout") or 300),
                 keep_browser_open=keep_browser_open,
+                prefer_password_registration=_truthy(ctx.extra.get("prefer_password_registration")),
                 log_fn=ctx.log,
                 backend_config=(ctx.extra or {}).get("_reuse_backend_config"),
             )
@@ -410,14 +474,18 @@ class ChatGPTPlatform(BasePlatform):
         ]
 
     def execute_action(self, action_id: str, account: Account, params: dict) -> dict:
+        self.raise_if_cancelled()
         aliases = {
             "switch_account": "switch_desktop",
             "get_account_state": "query_state",
         }
         resolved_action = aliases.get(action_id, action_id)
         if resolved_action in self.capabilities:
-            return self._handle_capability(resolved_action, account, params or {})
-        return self._execute_platform_action(resolved_action, account, params or {})
+            result = self._handle_capability(resolved_action, account, params or {})
+        else:
+            result = self._execute_platform_action(resolved_action, account, params or {})
+        self.raise_if_cancelled()
+        return result
 
     def get_desktop_state(self) -> dict:
         from platforms.chatgpt.switch import get_codex_desktop_state
@@ -441,14 +509,16 @@ class ChatGPTPlatform(BasePlatform):
         a.client_id = extra.get("client_id", OAUTH_CLIENT_ID)
         a.cookies = extra.get("cookies", "")
         a.user_id = account.user_id or ""
-        a.account_id = account.user_id or ""
+        a.account_id = extra.get("account_id") or extra.get("chatgpt_account_id") or account.user_id or ""
 
         if action_id == "codex_oauth_authorize":
             from platforms.chatgpt.codex_oauth import perform_codex_oauth_login
 
+            self.raise_if_cancelled()
             if not account.email:
                 return {"ok": False, "error": "Codex OAuth 授权需要账号邮箱"}
-            if not account.password:
+            registration_auth_mode = _resolve_registration_auth_mode(extra)
+            if not account.password and registration_auth_mode != "email_otp":
                 return {"ok": False, "error": "Codex OAuth 授权需要账号密码"}
             browser_mode = str(params.get("browser_mode") or "").strip().lower()
             if not browser_mode:
@@ -465,9 +535,12 @@ class ChatGPTPlatform(BasePlatform):
                     proxy=mailbox_proxy or None,
                     extra=self.config.extra if self.config else {},
                 )
+                if hasattr(mailbox, "set_cancel_checker"):
+                    mailbox.set_cancel_checker(self.is_cancel_requested)
                 before_ids = mailbox.get_current_ids(mailbox_account)
 
                 def _otp_callback():
+                    self.raise_if_cancelled()
                     self.log("等待 Codex OAuth 邮箱验证码...")
                     code = mailbox.wait_for_code(
                         mailbox_account,
@@ -475,6 +548,7 @@ class ChatGPTPlatform(BasePlatform):
                         timeout=180,
                         before_ids=before_ids,
                     )
+                    self.raise_if_cancelled()
                     if code:
                         self.log(f"Codex OAuth 验证码: {code}")
                     return code
@@ -486,6 +560,7 @@ class ChatGPTPlatform(BasePlatform):
             result = perform_codex_oauth_login(
                 email=account.email,
                 password=account.password,
+                registration_auth_mode=registration_auth_mode,
                 proxy=proxy,
                 headless=headless,
                 log_fn=self.log,
@@ -493,6 +568,7 @@ class ChatGPTPlatform(BasePlatform):
                 phone_callback=phone_callback,
                 keep_browser_open=keep_browser_open,
             )
+            self.raise_if_cancelled()
             return {"ok": True, "data": result}
 
         if action_id == "switch_desktop":
@@ -519,6 +595,8 @@ class ChatGPTPlatform(BasePlatform):
                 access_token=a.access_token,
                 session_token=session_token,
                 cookies=a.cookies,
+                chatgpt_account_id=a.account_id,
+                id_token=a.id_token,
                 proxy=proxy,
             )
             local_state = read_current_codex_account()
@@ -560,31 +638,44 @@ class ChatGPTPlatform(BasePlatform):
 
     def _build_codex_phone_callback(self, proxy: str | None):
         try:
-            from core.smsbower_sms import SMSBowerClient
+            from infrastructure.provider_definitions_repository import ProviderDefinitionsRepository
             from infrastructure.provider_settings_repository import ProviderSettingsRepository
+            from providers.registry import create_provider, load_all
 
             repo = ProviderSettingsRepository()
             provider_key = repo.get_default_provider_key("sms")
             if not provider_key:
                 self.log("Codex OAuth 未配置默认接码服务，add_phone 将尝试跳过")
                 return None
-            if provider_key != "smsbower":
-                self.log(f"Codex OAuth 暂不支持接码 provider: {provider_key}")
-                return None
+            definition = ProviderDefinitionsRepository().get_by_key("sms", provider_key)
             extra = repo.resolve_runtime_settings("sms", provider_key, self.config.extra if self.config else {})
             if proxy and not extra.get("sms_proxy"):
                 extra["proxy"] = proxy
-            client = SMSBowerClient.from_config(extra)
-            if not client.api_key or not client.default_service or not client.default_country:
-                self.log("Codex OAuth 默认接码服务未配置 API Key/service/country，add_phone 将尝试跳过")
+            extra["_log_fn"] = self.log
+            load_all()
+            client = create_provider("sms", (definition.driver_type if definition else "") or provider_key, extra)
+            configuration_error = getattr(client, "configuration_error", lambda: "")()
+            service = str(getattr(client, "default_service", "") or "").strip()
+            country = str(getattr(client, "default_country", "") or "").strip()
+            if configuration_error or not service or not country:
+                reason = configuration_error or "service/country 未配置"
+                self.log(f"Codex OAuth 默认接码服务配置不完整（{reason}），add_phone 将尝试跳过")
                 return None
             return _CodexSmsPhoneCallback(
                 client,
-                service=client.default_service,
-                country=client.default_country,
+                service=service,
+                country=country,
                 log_fn=self.log,
-                buy_max_attempts=_int_setting(extra.get("smsbower_buy_max_attempts"), 20),
-                buy_retry_interval=_float_setting(extra.get("smsbower_buy_retry_interval"), 3),
+                buy_max_attempts=_int_setting(
+                    getattr(client, "buy_max_attempts", extra.get(f"{provider_key}_buy_max_attempts", 20)), 20
+                ),
+                buy_retry_interval=_float_setting(
+                    getattr(client, "buy_retry_interval", extra.get(f"{provider_key}_buy_retry_interval", 3)), 3
+                ),
+                otp_timeout_seconds=_int_setting(
+                    getattr(client, "otp_timeout_seconds", extra.get(f"{provider_key}_otp_timeout_seconds", 120)), 120
+                ),
+                cancel_check=self.is_cancel_requested,
             )
         except Exception as exc:
             self.log(f"Codex OAuth 初始化接码服务失败，add_phone 将尝试跳过: {exc}")
@@ -601,6 +692,8 @@ class ChatGPTPlatform(BasePlatform):
         a.access_token = extra.get("access_token") or account.token
         a.session_token = extra.get("session_token", "")
         a.cookies = extra.get("cookies", "")
+        a.account_id = extra.get("account_id") or extra.get("chatgpt_account_id") or account.user_id or ""
+        a.id_token = extra.get("id_token", "")
 
         from platforms.chatgpt.switch import fetch_chatgpt_account_state, get_codex_desktop_state, read_current_codex_account
 
@@ -608,6 +701,8 @@ class ChatGPTPlatform(BasePlatform):
             access_token=a.access_token,
             session_token=a.session_token,
             cookies=a.cookies,
+            chatgpt_account_id=a.account_id,
+            id_token=a.id_token,
             proxy=proxy,
         )
         data["local_app_account"] = read_current_codex_account()

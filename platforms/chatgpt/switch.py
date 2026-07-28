@@ -337,6 +337,8 @@ def fetch_chatgpt_account_state(
     access_token: str = "",
     session_token: str = "",
     cookies: str = "",
+    chatgpt_account_id: str = "",
+    id_token: str = "",
     proxy: str | None = None,
 ) -> dict:
     state = {
@@ -355,15 +357,24 @@ def fetch_chatgpt_account_state(
         if ok:
             state["profile"] = profile
             try:
-                from platforms.chatgpt.subscription import check_subscription_status
+                from platforms.chatgpt.subscription import fetch_subscription_status_details
 
                 class _A:
                     pass
 
                 account = _A()
                 account.access_token = resolved_access
+                account.chatgpt_account_id = chatgpt_account_id
+                account.id_token = id_token
                 account.cookies = cookies
-                state["subscription_status"] = check_subscription_status(account, proxy=proxy)
+                account.extra = {"chatgpt_account_id": chatgpt_account_id}
+                details = fetch_subscription_status_details(account, proxy=proxy)
+                state["subscription_status"] = details.get("status")
+                state["subscription_source"] = details.get("source")
+                if isinstance(details.get("usage"), dict):
+                    state["chatgpt_usage"] = details["usage"]
+                    state["plan"] = details["status"]
+                    state["plan_name"] = details["status"]
             except Exception as exc:
                 state["subscription_error"] = str(exc)
         else:

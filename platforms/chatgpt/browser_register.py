@@ -180,6 +180,22 @@ OTP_INPUT_SELECTORS = [
     "input[id*='code' i]",
 ]
 
+OTP_SUBMIT_SELECTORS = [
+    'button[data-testid="continue-button"]',
+    'button:has-text("Continue")',
+    'button:has-text("continue")',
+    'button:has-text("Verify")',
+    'button:has-text("verify")',
+    'button:has-text("Next")',
+    'button:has-text("next")',
+    'button:text-is("続ける")',
+    'button:text-is("続行")',
+    'button:text-is("確認")',
+    'button:text-is("認証")',
+    'button:text-is("次へ")',
+    'button[type="submit"]',
+]
+
 SIGNUP_RECOVERY_SELECTORS = [
     'a:has-text("Sign up")',
     'button:has-text("Sign up")',
@@ -206,6 +222,9 @@ SIGNUP_RECOVERY_SELECTORS = [
 PASSWORDLESS_LOGIN_SELECTORS = [
     'button[name="intent"][value="passwordless_login_send_otp"]',
     'button[value="passwordless_login_send_otp"]',
+    'button:has-text("Continue with email code")',
+    'button:has-text("Use email code")',
+    'button:has-text("Email code")',
     'button:has-text("one-time code")',
     'button:has-text("one time code")',
     'button:has-text("passwordless")',
@@ -283,69 +302,276 @@ def _wait_for_any_selector(page, selectors: list[str], timeout: int = 30):
 
 
 def _click_first(page, selectors: list[str], *, timeout: int = 10) -> str | None:
-    found = _wait_for_any_selector(page, selectors, timeout=timeout)
-    if not found:
-        return None
-    try:
-        page.click(found)
-        return found
-    except Exception:
-        return None
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        for selector in selectors:
+            try:
+                locator = page.locator(selector)
+                count = min(locator.count(), 12)
+            except Exception:
+                continue
+            for index in range(count):
+                target = locator.nth(index)
+                try:
+                    if not target.is_visible(timeout=200) or not target.is_enabled(timeout=200):
+                        continue
+                    target.click(timeout=1500)
+                    return selector if index == 0 else f"{selector} nth={index}"
+                except Exception:
+                    continue
+        time.sleep(0.1)
+    return None
 
 
 def _click_first_no_wait(page, selectors: list[str], *, timeout: int = 10) -> str | None:
     """Click a visible element without waiting for navigation.
 
     OpenAI's add-phone page sometimes leaves the submit XHR pending long enough
-    that Playwright reports "Operation timed out" even though the click was
-    delivered. This helper treats that as a click problem only after a
-    no-wait click and a DOM fallback both fail.
+    that a normal Playwright click waits too long after the action was delivered.
+    Only visible, enabled elements are considered and no DOM click fallback is
+    used.
     """
-    found = _wait_for_any_selector(page, selectors, timeout=timeout)
-    if not found:
-        return None
-    for kwargs in (
-        {"timeout": 3000, "no_wait_after": True},
-        {"timeout": 3000, "force": True, "no_wait_after": True},
-    ):
-        try:
-            page.click(found, **kwargs)
-            return found
-        except Exception:
-            pass
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        for selector in selectors:
+            try:
+                locator = page.locator(selector)
+                count = min(locator.count(), 12)
+            except Exception:
+                continue
+            for index in range(count):
+                target = locator.nth(index)
+                try:
+                    if not target.is_visible(timeout=200) or not target.is_enabled(timeout=200):
+                        continue
+                    target.click(timeout=3000, no_wait_after=True)
+                    return selector if index == 0 else f"{selector} nth={index}"
+                except Exception:
+                    continue
+        time.sleep(0.1)
+    return None
+
+
+def _summarize_otp_submit_state(page) -> str:
     try:
-        clicked = bool(
-            page.evaluate(
-                """
-                (selector) => {
-                  const visible = (el) => {
-                    const style = window.getComputedStyle(el);
-                    const rect = el.getBoundingClientRect();
-                    return style && style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
-                  };
-                  let target = null;
-                  try {
-                    target = document.querySelector(selector);
-                  } catch (_) {
-                    const textMatch = selector.match(/:has-text\\(["'](.+?)["']\\)/);
-                    const tag = String(selector.split(':')[0] || 'button').trim() || 'button';
-                    const needle = textMatch ? textMatch[1].toLowerCase() : '';
-                    target = Array.from(document.querySelectorAll(tag)).find((el) => {
-                      const text = String(el.innerText || el.textContent || '').trim().toLowerCase();
-                      return visible(el) && (!needle || text.includes(needle));
-                    });
-                  }
-                  if (!target || !visible(target) || target.disabled) return false;
-                  target.click();
-                  return true;
-                }
-                """,
-                found,
-            )
+        summary = page.evaluate(
+            """
+            () => {
+              const visible = (el) => {
+                if (!el) return false;
+                const style = window.getComputedStyle(el);
+                const rect = el.getBoundingClientRect();
+                return style && style.display !== 'none' && style.visibility !== 'hidden'
+                  && rect.width > 0 && rect.height > 0;
+              };
+              const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
+              const buttons = Array.from(document.querySelectorAll('button, input[type="submit"]'))
+                .slice(0, 12)
+                .map((el) => ({
+                  text: normalize(el.innerText || el.value || el.textContent).slice(0, 40),
+                  visible: visible(el),
+                  disabled: Boolean(el.disabled || el.getAttribute('aria-disabled') === 'true'),
+                  type: String(el.getAttribute('type') || el.tagName || '').slice(0, 20),
+                }));
+              const inputs = Array.from(document.querySelectorAll(
+                  'input[autocomplete="one-time-code"], input[inputmode="numeric"], input[name*="code" i], input[id*="code" i], input[type="text"]'
+                ))
+                .slice(0, 8)
+                .map((el) => ({
+                  autocomplete: String(el.getAttribute('autocomplete') || ''),
+                  inputmode: String(el.getAttribute('inputmode') || ''),
+                  visible: visible(el),
+                  disabled: Boolean(el.disabled),
+                  readOnly: Boolean(el.readOnly),
+                  valueLength: String(el.value || '').trim().length,
+                }));
+              return { buttons, inputs };
+            }
+            """
         )
-        return found if clicked else None
-    except Exception:
-        return None
+    except Exception as exc:
+        return f"diagnostics_failed={str(exc)[:120]}"
+    if not isinstance(summary, dict):
+        return "diagnostics_unavailable"
+    buttons = summary.get("buttons") if isinstance(summary.get("buttons"), list) else []
+    inputs = summary.get("inputs") if isinstance(summary.get("inputs"), list) else []
+    button_text = "; ".join(
+        f"{item.get('text') or item.get('type') or '-'} visible={item.get('visible')} disabled={item.get('disabled')}"
+        for item in buttons[:5]
+        if isinstance(item, dict)
+    )
+    input_text = "; ".join(
+        f"otpInput visible={item.get('visible')} disabled={item.get('disabled')} readOnly={item.get('readOnly')} valueLength={item.get('valueLength')}"
+        for item in inputs[:3]
+        if isinstance(item, dict)
+    )
+    return f"buttons=[{button_text or '-'}] inputs=[{input_text or '-'}]"
+
+
+def _click_otp_submit_button(page, log: Callable[[str], None], *, timeout: int = 8) -> str | None:
+    start_url = str(getattr(page, "url", "") or "")
+    deadline = time.time() + max(int(timeout), 1)
+    last_error = ""
+    seen_controls: set[str] = set()
+    while time.time() < deadline:
+        for selector in OTP_SUBMIT_SELECTORS:
+            try:
+                locator = page.locator(selector)
+                count = min(int(locator.count()), 5)
+            except Exception:
+                continue
+            for index in range(count):
+                target = locator.nth(index)
+                try:
+                    if not target.is_visible(timeout=200):
+                        continue
+                    if not target.is_enabled(timeout=200):
+                        continue
+                    try:
+                        signature = str(
+                            target.evaluate(
+                                """
+                                (el) => [
+                                  el.tagName,
+                                  el.id,
+                                  el.getAttribute('name'),
+                                  el.getAttribute('value'),
+                                  String(el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim(),
+                                ].join('|')
+                                """
+                            )
+                            or ""
+                        )
+                    except Exception:
+                        signature = ""
+                    lowered_signature = signature.lower()
+                    if any(token in lowered_signature for token in ("resend", "重新发送", "重发", "再送信")):
+                        continue
+                    if any(token in lowered_signature for token in ("google", "apple", "microsoft", "facebook", "github")):
+                        continue
+                    if signature and signature in seen_controls:
+                        continue
+                    if signature:
+                        seen_controls.add(signature)
+                    target.click(timeout=3000, no_wait_after=True)
+                    return selector if index == 0 else f"{selector} nth={index}"
+                except Exception as exc:
+                    last_error = f"{selector} nth={index}: {str(exc)[:120]}"
+                    if _wait_for_otp_submit_progress(page, start_url=start_url, timeout=1.5):
+                        return f"{selector} nth={index} delayed"
+                    try:
+                        hit_target = bool(
+                            target.evaluate(
+                                """
+                                (el) => {
+                                  const rect = el.getBoundingClientRect();
+                                  const hit = document.elementFromPoint(
+                                    rect.left + rect.width / 2,
+                                    rect.top + rect.height / 2
+                                  );
+                                  return Boolean(hit && (hit === el || el.contains(hit)));
+                                }
+                                """
+                            )
+                        )
+                        box = target.bounding_box() if hit_target else None
+                        if box and box.get("width", 0) > 0 and box.get("height", 0) > 0:
+                            x = float(box["x"]) + float(box["width"]) / 2
+                            y = float(box["y"]) + float(box["height"]) / 2
+                            page.mouse.move(x, y, steps=3)
+                            page.mouse.click(x, y)
+                            if _wait_for_otp_submit_progress(page, start_url=start_url, timeout=8):
+                                return f"{selector} nth={index} real mouse"
+                    except Exception:
+                        pass
+                    try:
+                        target.focus(timeout=1000)
+                        target.press("Enter", timeout=1500)
+                        if _wait_for_otp_submit_progress(page, start_url=start_url, timeout=8):
+                            return f"{selector} nth={index} keyboard Enter"
+                    except Exception:
+                        pass
+                    continue
+        time.sleep(0.25)
+    if last_error:
+        log(f"验证码页提交按钮点击失败: {last_error}")
+    log(f"验证码页提交按钮状态: {_summarize_otp_submit_state(page)}")
+    return None
+
+
+def _otp_submit_progress_url(url: str) -> bool:
+    value = str(url or "")
+    return (
+        "about-you" in value
+        or "add-phone" in value
+        or "chatgpt.com" in value
+        or "code=" in value
+        or "consent" in value
+        or "sign-in-with-chatgpt" in value
+        or "workspace" in value
+        or "organization" in value
+    )
+
+
+def _wait_for_otp_submit_progress(page, *, start_url: str, timeout: float) -> bool:
+    deadline = time.time() + max(float(timeout), 0)
+    while time.time() < deadline:
+        current_url = str(getattr(page, "url", "") or "")
+        if _otp_submit_progress_url(current_url) and (
+            current_url != str(start_url or "")
+            or ("email-verification" not in current_url and "email-otp" not in current_url)
+        ):
+            return True
+        time.sleep(0.25)
+    return False
+
+
+def _fill_otp_with_keyboard_fallback(page, otp: str, log: Callable[[str], None]) -> bool:
+    selectors = [
+        "input[autocomplete='one-time-code']",
+        "input[inputmode='numeric']",
+        "input[name*='code' i]",
+        "input[id*='code' i]",
+        "input[type='text']",
+    ]
+    for selector in selectors:
+        try:
+            target = page.locator(selector).first
+            target.wait_for(state="visible", timeout=1200)
+            if not target.is_enabled(timeout=500):
+                continue
+            try:
+                target.click(timeout=1200)
+            except Exception:
+                target.focus(timeout=1000)
+            time.sleep(0.1)
+            cleared = False
+            for shortcut in ("Control+A", "Meta+A"):
+                try:
+                    page.keyboard.press(shortcut)
+                    page.keyboard.press("Backspace")
+                    cleared = True
+                    break
+                except Exception:
+                    continue
+            if not cleared:
+                try:
+                    target.fill("")
+                except Exception:
+                    pass
+            page.keyboard.type(str(otp), delay=random.randint(30, 70))
+            time.sleep(0.3)
+            try:
+                final_value = str(target.input_value() or "").strip()
+            except Exception:
+                final_value = ""
+            if final_value == str(otp).strip():
+                log(f"验证码页已使用键盘 fallback 重新填写输入框: {selector}")
+                return True
+        except Exception:
+            continue
+    log("验证码页键盘 fallback 重新填写失败")
+    return False
 
 
 def _auth_timeout_retry_page_state(page, *, path_patterns: list[str] | None = None) -> dict:
@@ -462,7 +688,13 @@ def _recover_auth_timeout_retry_page(
 
 
 def _is_login_password_url(url: str) -> bool:
-    return bool(re.search(r"(?:auth|accounts)\.openai\.com/.*log-?in/password", str(url or ""), flags=re.I))
+    return bool(
+        re.search(
+            r"(?:auth|accounts)\.openai\.com/(?:.*/)?log-?in(?:/password)?(?:[/?#]|$)",
+            str(url or ""),
+            flags=re.I,
+        )
+    )
 
 
 def _build_manual_flow_state(page_type: str, current_url: str) -> dict:
@@ -562,6 +794,10 @@ def _extract_auth_error_text(page) -> str:
         "text=Incorrect code",
         "text=验证码错误",
         "text=验证码无效",
+        "text=無効なコード",
+        "text=コードが無効",
+        "text=コードの有効期限が切れ",
+        "text=認証コードが正しくありません",
         "text=Enter a valid age to continue",
         "text=doesn't look right",
         "[role='alert']",
@@ -578,7 +814,19 @@ def _extract_auth_error_text(page) -> str:
         body_text = str(page.locator("body").inner_text(timeout=350) or "").strip()
     except Exception:
         body_text = ""
-    for token in ("Invalid code", "Incorrect code", "验证码错误", "验证码无效"):
+    for token in (
+        "Invalid code",
+        "Incorrect code",
+        "expired code",
+        "code has expired",
+        "验证码错误",
+        "验证码无效",
+        "验证码已过期",
+        "無効なコード",
+        "コードが無効",
+        "コードの有効期限が切れ",
+        "認証コードが正しくありません",
+    ):
         if token in body_text:
             return token
     return ""
@@ -632,38 +880,17 @@ def _fill_input_like_user(page, selector: str, value: str) -> bool:
         return False
 
 
-def _submit_form_with_fallback(page, input_selector: str) -> bool:
+def _press_enter_on_input(page, input_selector: str) -> bool:
     try:
-        return bool(
-            page.evaluate(
-                """
-                (selector) => {
-                  const input = document.querySelector(selector);
-                  if (!input) return false;
-                  const form = input.form || input.closest?.('form');
-                  if (form?.requestSubmit) {
-                    form.requestSubmit();
-                    return true;
-                  }
-                  if (form?.submit) {
-                    form.submit();
-                    return true;
-                  }
-                  input.focus?.();
-                  for (const type of ['keydown', 'keypress', 'keyup']) {
-                    input.dispatchEvent(new KeyboardEvent(type, {
-                      key: 'Enter',
-                      code: 'Enter',
-                      bubbles: true,
-                      cancelable: true,
-                    }));
-                  }
-                  return true;
-                }
-                """,
-                input_selector,
-            )
-        )
+        target = page.locator(input_selector).first
+        if not target.is_visible(timeout=500) or not target.is_enabled(timeout=500):
+            return False
+        try:
+            target.click(timeout=1000)
+        except Exception:
+            target.focus(timeout=1000)
+        target.press("Enter", timeout=1500)
+        return True
     except Exception:
         return False
 
@@ -936,8 +1163,8 @@ def _start_browser_signup_via_page(page, email: str, log) -> dict:
         submit_selector = _click_first(page, EMAIL_SUBMIT_SELECTORS, timeout=8)
         if submit_selector:
             log(f"邮箱页已点击继续按钮: {submit_selector}")
-        elif _submit_form_with_fallback(page, email_selector):
-            log("邮箱页未找到可点击 Continue，已使用表单 fallback 提交")
+        elif _press_enter_on_input(page, email_selector):
+            log("邮箱页未找到可点击 Continue，已在邮箱输入框按 Enter")
         else:
             raise RuntimeError("邮箱页未找到 Continue 按钮")
 
@@ -951,9 +1178,17 @@ def _start_browser_signup_via_authorize(page, email: str, device_id: str, log) -
     _goto_with_retry(page, f"{CHATGPT_APP}/", wait_until="domcontentloaded", timeout=30000, log=log)
 
     log("获取 CSRF token...")
-    csrf_token = _get_browser_csrf_token(page)
+    csrf_token = ""
+    for attempt in range(1, 4):
+        csrf_token = _get_browser_csrf_token(page)
+        if csrf_token:
+            break
+        if attempt < 3:
+            delay = 1.5 * attempt
+            log(f"CSRF token 瞬时获取失败 ({attempt}/3)，{delay:.1f}s 后在当前页面重试")
+            time.sleep(delay)
     if not csrf_token:
-        raise RuntimeError("获取 CSRF token 失败")
+        raise RuntimeError("连续 3 次获取 CSRF token 失败")
 
     log(f"提交邮箱: {email}")
     authorize_url = _start_browser_signin(page, email, device_id, csrf_token)
@@ -1640,12 +1875,14 @@ def _submit_oauth_password_direct(page, password: str, log) -> dict:
     submit_selector = _click_first(page, PASSWORD_SUBMIT_SELECTORS, timeout=8)
     if submit_selector:
         log(f"  OAuth 密码页已点击继续按钮: {submit_selector}")
-    elif _submit_form_with_fallback(page, input_selector):
-        log("  OAuth 密码页使用表单 fallback 提交")
+    elif _press_enter_on_input(page, input_selector):
+        log("  OAuth 密码页未找到可点击 Continue，已在密码输入框按 Enter")
     else:
         raise RuntimeError("OAuth 密码页未找到 Continue 按钮")
 
-    deadline = time.time() + 20
+    submit_started_at = time.time()
+    deadline = submit_started_at + 45
+    extended_wait_logged = False
     while time.time() < deadline:
         current_url = str(page.url or "")
         state = _derive_registration_state_from_page(page)
@@ -1658,8 +1895,11 @@ def _submit_oauth_password_direct(page, password: str, log) -> dict:
         error_text = _extract_auth_error_text(page)
         if error_text:
             return {"ok": False, "status": 400, "url": current_url, "data": None, "text": error_text}
+        if not extended_wait_logged and time.time() - submit_started_at >= 20:
+            extended_wait_logged = True
+            log("OAuth 密码提交后 20 秒仍无跳转且未发现错误，代理链路较慢，继续观察至 45 秒")
         time.sleep(0.5)
-    return {"ok": False, "status": 0, "url": str(page.url or ""), "data": None, "text": "OAuth 密码提交后未跳转"}
+    return {"ok": False, "status": 0, "url": str(page.url or ""), "data": None, "text": "OAuth 密码提交后观察 45 秒仍未跳转"}
 
 
 def _submit_password_via_page(page, password: str, log) -> dict:
@@ -1678,12 +1918,14 @@ def _submit_password_via_page(page, password: str, log) -> dict:
     submit_selector = _click_first(page, PASSWORD_SUBMIT_SELECTORS, timeout=8)
     if submit_selector:
         log(f"密码页已点击继续按钮: {submit_selector}")
-    elif _submit_form_with_fallback(page, input_selector):
-        log("密码页未找到可点击 Continue，已使用表单 fallback 提交")
+    elif _press_enter_on_input(page, input_selector):
+        log("密码页未找到可点击 Continue，已在密码输入框按 Enter")
     else:
         raise RuntimeError("密码页未找到 Continue 按钮")
 
-    deadline = time.time() + 20
+    submit_started_at = time.time()
+    deadline = submit_started_at + 45
+    extended_wait_logged = False
     last_url = str(page.url or "")
     while time.time() < deadline:
         current_url = str(page.url or "")
@@ -1706,8 +1948,8 @@ def _submit_password_via_page(page, password: str, log) -> dict:
                 start_url = str(page.url or start_url)
                 time.sleep(0.4)
                 continue
-            if _submit_form_with_fallback(page, input_selector):
-                log("恢复后未找到密码提交按钮，已使用表单 fallback 提交")
+            if _press_enter_on_input(page, input_selector):
+                log("恢复后未找到可点击密码提交按钮，已在密码输入框按 Enter")
                 start_url = str(page.url or start_url)
                 time.sleep(0.4)
                 continue
@@ -1716,9 +1958,12 @@ def _submit_password_via_page(page, password: str, log) -> dict:
         if error_text:
             _dump_debug(page, "chatgpt_password_fail")
             return {"ok": False, "status": 400, "url": current_url, "data": None, "text": error_text}
+        if not extended_wait_logged and time.time() - submit_started_at >= 20:
+            extended_wait_logged = True
+            log("密码提交后 20 秒仍无跳转且未发现错误，代理链路较慢，继续观察至 45 秒")
         time.sleep(0.5)
     _dump_debug(page, "chatgpt_password_fail")
-    return {"ok": False, "status": 0, "url": last_url, "data": None, "text": "密码页提交后未跳转"}
+    return {"ok": False, "status": 0, "url": last_url, "data": None, "text": "密码页提交后观察 45 秒仍未跳转"}
 
 
 def _submit_otp_via_page(
@@ -1740,6 +1985,7 @@ def _submit_otp_via_page(
     time.sleep(1)
 
     filled = False
+    used_dom_fallback = False
 
     # 先尝试 6 格 OTP 输入框
     try:
@@ -1779,8 +2025,21 @@ def _submit_otp_via_page(
             try:
                 target = candidate.first
                 target.wait_for(state="visible", timeout=1200)
-                target.click(timeout=1200)
-                target.fill("")
+                try:
+                    target.click(timeout=1200)
+                except Exception:
+                    target.focus(timeout=1000)
+                cleared = False
+                for shortcut in ("Control+A", "Meta+A"):
+                    try:
+                        target.press(shortcut, timeout=1000)
+                        target.press("Backspace", timeout=1000)
+                        cleared = True
+                        break
+                    except Exception:
+                        continue
+                if not cleared:
+                    target.fill("")
                 target.type(otp, delay=random.randint(18, 45))
                 final_value = str(target.input_value() or "").strip()
                 if final_value:
@@ -1861,6 +2120,7 @@ def _submit_otp_via_page(
             )
             if isinstance(result, dict) and result.get("ok"):
                 filled = True
+                used_dom_fallback = True
                 log(f"验证码页已使用 DOM fallback 填写输入框: {result.get('selector') or '-'}")
         except Exception as exc:
             log(f"验证码页 DOM fallback 填写失败: {exc}")
@@ -1869,29 +2129,37 @@ def _submit_otp_via_page(
         return {"ok": False, "status": 0, "url": page.url, "data": None, "text": "验证码页未找到可填写输入框"}
 
     _browser_pause(page)
-    submit_selector = _click_first(
-        page,
-        [
-            'button[type="submit"]',
-            'button[data-testid="continue-button"]',
-            'button:has-text("Continue")',
-            'button:has-text("continue")',
-            'button:has-text("Verify")',
-            'button:has-text("verify")',
-            'button:has-text("Next")',
-            'button:has-text("next")',
-            'button:has-text("続ける")',
-            'button:has-text("確認")',
-            'button:has-text("認証")',
-            'button:has-text("次へ")',
-        ],
-        timeout=8,
-    )
+    submit_selector = _click_otp_submit_button(page, log, timeout=8)
+    if not submit_selector and used_dom_fallback:
+        log("验证码页 DOM fallback 后提交按钮不可点击，改用键盘重新输入验证码")
+        if _fill_otp_with_keyboard_fallback(page, otp, log):
+            _browser_pause(page)
+            submit_selector = _click_otp_submit_button(page, log, timeout=5)
     if not submit_selector:
-        return {"ok": False, "status": 0, "url": page.url, "data": None, "text": "验证码页未找到 Continue 按钮"}
+        for input_selector in OTP_INPUT_SELECTORS:
+            if not _press_enter_on_input(page, input_selector):
+                continue
+            log(f"验证码页提交按钮不可点击，已在验证码输入框按 Enter: {input_selector}")
+            if _wait_for_otp_submit_progress(page, start_url=str(page.url or ""), timeout=8):
+                submit_selector = f"{input_selector} keyboard Enter"
+            break
+    if not submit_selector:
+        log("验证码页未确认点击成功，继续观察页面是否已延迟跳转")
+        if _wait_for_otp_submit_progress(page, start_url=str(page.url or ""), timeout=12):
+            submit_selector = "delayed submit progress"
+    if not submit_selector:
+        return {
+            "ok": False,
+            "status": 0,
+            "url": page.url,
+            "data": None,
+            "text": "验证码页未找到可点击 Continue 按钮",
+        }
     log(f"验证码页已点击继续按钮: {submit_selector}")
 
-    deadline = time.time() + 20
+    submit_started_at = time.time()
+    deadline = submit_started_at + 45
+    extended_wait_logged = False
     last_url = page.url
     while time.time() < deadline:
         current_url = page.url
@@ -1904,7 +2172,22 @@ def _submit_otp_via_page(
             return {"ok": True, "status": 200, "url": current_url, "data": None, "text": ""}
         error_text = _extract_auth_error_text(page)
         normalized_error = str(error_text or "").lower()
-        incorrect_code = any(token in normalized_error for token in ("invalid code", "incorrect code", "验证码错误", "验证码无效"))
+        incorrect_code = any(
+            token in normalized_error
+            for token in (
+                "invalid code",
+                "incorrect code",
+                "expired code",
+                "code has expired",
+                "验证码错误",
+                "验证码无效",
+                "验证码已过期",
+                "無効なコード",
+                "コードが無効",
+                "コードの有効期限が切れ",
+                "認証コードが正しくありません",
+            )
+        )
         if incorrect_code and callable(otp_callback) and resend_attempts < 2:
             resend_attempts += 1
             refresh_before_ids = getattr(otp_callback, "refresh_before_ids", None)
@@ -1921,12 +2204,14 @@ def _submit_otp_via_page(
                     'button:has-text("Resend")',
                     'button:has-text("重新发送")',
                     'button:has-text("重发")',
+                    'button:has-text("メールを再送信する")',
+                    'button:has-text("再送信")',
                 ],
                 timeout=5,
             )
             if not resend_selector:
                 return {"ok": False, "status": 400, "url": current_url, "data": None, "text": error_text}
-            log(f"验证码错误，已重发邮件 ({resend_attempts}/2): {resend_selector}")
+            log(f"验证码无效或过期，已重发邮件 ({resend_attempts}/2): {resend_selector}")
             time.sleep(1)
             new_code = str(otp_callback() or "").strip()
             if not new_code:
@@ -1940,8 +2225,18 @@ def _submit_otp_via_page(
             )
         if error_text:
             return {"ok": False, "status": 400, "url": current_url, "data": None, "text": error_text}
+        if not extended_wait_logged and time.time() - submit_started_at >= 20:
+            extended_wait_logged = True
+            log("验证码提交后 20 秒仍无跳转且未发现错误，代理链路较慢，继续观察至 45 秒")
         time.sleep(0.5)
-    return {"ok": False, "status": 0, "url": last_url, "data": None, "text": "验证码页提交后未跳转"}
+    state_summary = _summarize_otp_submit_state(page)
+    return {
+        "ok": False,
+        "status": 0,
+        "url": last_url,
+        "data": None,
+        "text": f"验证码页提交后观察 45 秒仍未跳转: {state_summary}",
+    }
 
 
 def _submit_about_you_via_page(page, log) -> dict:
@@ -2558,6 +2853,16 @@ def _submit_about_you_via_page(page, log) -> dict:
             return {"ok": True, "status": 200, "url": current_url, "data": None, "text": ""}
         if "add-phone" in current_url:
             return {"ok": True, "status": 200, "url": current_url, "data": None, "text": ""}
+        live_state = _derive_registration_state_from_page(page)
+        if str(live_state.get("page_type") or "") in {
+            "chatgpt_home",
+            "oauth_callback",
+            "consent",
+            "workspace_selection",
+            "organization_selection",
+            "add_phone",
+        }:
+            return {"ok": True, "status": 200, "url": current_url, "data": live_state, "text": ""}
         try:
             error_text = page.locator("text=Sorry, we cannot create your account").first.text_content(timeout=500)
         except Exception:
@@ -2637,7 +2942,38 @@ def _submit_about_you_via_page(page, log) -> dict:
     return {"ok": False, "status": 0, "url": last_url, "data": None, "text": "about_you 提交后未跳转"}
 
 
-def _browser_registration_flow(page, email: str, password: str, otp_callback, log) -> dict:
+def _probe_password_registration_page(page, state: dict, log) -> dict:
+    if not _is_email_otp(state):
+        return state
+    original_url = str(getattr(page, "url", "") or state.get("current_url") or "")
+    password_url = f"{OPENAI_AUTH}/create-account/password"
+    log(f"主动探测密码注册页面: {password_url}")
+    try:
+        _goto_with_retry(page, password_url, wait_until="domcontentloaded", timeout=30000, log=log)
+        probed_state = _derive_registration_state_from_page(page)
+        if _is_password_registration(probed_state):
+            log("主动密码注册探测成功，继续密码创建流程")
+            return probed_state
+        log(
+            "主动密码注册探测未进入密码页: "
+            f"page={probed_state.get('page_type') or '-'} url={str(getattr(page, 'url', '') or '')[:110]}"
+        )
+    except Exception as exc:
+        log(f"主动密码注册探测失败，恢复原验证码页面: {str(exc).splitlines()[0][:180]}")
+    if original_url:
+        _goto_with_retry(page, original_url, wait_until="domcontentloaded", timeout=30000, log=log)
+    return _derive_registration_state_from_page(page)
+
+
+def _browser_registration_flow(
+    page,
+    email: str,
+    password: str,
+    otp_callback,
+    log,
+    *,
+    prefer_password_registration: bool = False,
+) -> dict:
     device_id = str(uuid.uuid4())
     _seed_browser_device_id(page, device_id)
     try:
@@ -2645,7 +2981,10 @@ def _browser_registration_flow(page, email: str, password: str, otp_callback, lo
         state = _start_browser_signup_via_authorize(page, email, device_id, log)
     except Exception as exc:
         log(f"ChatGPT NextAuth 注册入口失败: {exc}")
-        raise
+        state = _derive_registration_state_from_page(page)
+        if not str(state.get("page_type") or ""):
+            log("NextAuth 未返回可继续状态，改用可见 OpenAI 注册页面")
+            state = _start_browser_signup_via_page(page, email, log)
     auth_cookies = _get_cookies(page)
     log(
         "授权态 cookies: "
@@ -2653,6 +2992,8 @@ def _browser_registration_flow(page, email: str, password: str, otp_callback, lo
         f"oai-did={'yes' if auth_cookies.get('oai-did') else 'no'}"
     )
     log(f"注册状态起点: page={state.get('page_type') or '-'} url={(state.get('current_url') or '')[:100]}")
+    if prefer_password_registration:
+        state = _probe_password_registration_page(page, state, log)
     register_submitted = False
     seen_states: dict[str, int] = {}
 
@@ -2675,7 +3016,9 @@ def _browser_registration_flow(page, email: str, password: str, otp_callback, lo
 
         if _is_registration_complete(state):
             _handle_post_signup_onboarding(page, log)
-            return _extract_flow_state(None, page.url)
+            final_state = _extract_flow_state(None, page.url)
+            final_state["registration_auth_mode"] = "password" if register_submitted else "email_otp"
+            return final_state
 
         if _is_password_registration(state):
             if register_submitted:
@@ -2737,6 +3080,17 @@ def _browser_registration_flow(page, email: str, password: str, otp_callback, lo
                 log(f"跳转到 about_you 页面: {target_url[:120]}")
                 _goto_with_retry(page, target_url, wait_until="domcontentloaded", timeout=30000, log=log)
             about_resp = _submit_about_you_via_page(page, log)
+            if (
+                not about_resp.get("ok")
+                and "about_you 提交后未跳转" in str(about_resp.get("text") or "")
+            ):
+                log("about_you 提交后观察 20 秒仍确认停留当前页，刷新后重填并重试一次")
+                try:
+                    page.reload(wait_until="domcontentloaded", timeout=30000)
+                except Exception as exc:
+                    log(f"about_you 刷新失败，重新打开页面重试: {exc}")
+                    _goto_with_retry(page, target_url, wait_until="domcontentloaded", timeout=30000, log=log)
+                about_resp = _submit_about_you_via_page(page, log)
             log(f"about_you 提交状态: {about_resp.get('status', 0)}")
             if not about_resp.get("ok"):
                 raise RuntimeError(f"about_you 提交失败: {(about_resp.get('text') or '')[:300]}")
@@ -2769,6 +3123,7 @@ class ChatGPTBrowserRegister:
         codex_phone_callback: Optional[Callable[[], str]] = None,
         codex_oauth_timeout: int = 300,
         keep_browser_open: bool = False,
+        prefer_password_registration: bool = False,
         log_fn: Callable[[str], None] = print,
         backend_config: Optional[BrowserBackendConfig] = None,
     ):
@@ -2779,6 +3134,7 @@ class ChatGPTBrowserRegister:
         self.codex_phone_callback = codex_phone_callback
         self.codex_oauth_timeout = int(codex_oauth_timeout or 300)
         self.keep_browser_open = bool(keep_browser_open)
+        self.prefer_password_registration = bool(prefer_password_registration)
         self.log = log_fn
         # backend_config 为 None 时默认 Camoufox，跟老调用方一致。
         # BitBrowser 路径需要上层 plugin.py 显式传 backend_config。
@@ -2828,6 +3184,7 @@ class ChatGPTBrowserRegister:
                 password,
                 self.otp_callback,
                 self.log,
+                prefer_password_registration=self.prefer_password_registration,
             )
             self.log(f"注册流程完成: page={final_state.get('page_type') or '-'}")
 
@@ -2848,6 +3205,7 @@ class ChatGPTBrowserRegister:
                 "expires_at": session_info.get("expires_at", ""),
                 "session": session_info.get("session", {}),
                 "registration_state": final_state,
+                "registration_auth_mode": final_state.get("registration_auth_mode") or "email_otp",
             }
             if self.post_codex_oauth:
                 self.log("注册后动作: 复用当前浏览器窗口执行 Codex OAuth")
@@ -2858,6 +3216,7 @@ class ChatGPTBrowserRegister:
                         page,
                         email=email,
                         password=password,
+                        registration_auth_mode=result["registration_auth_mode"],
                         proxy=self.proxy,
                         log_fn=self.log,
                         otp_callback=self.otp_callback,
