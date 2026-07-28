@@ -194,10 +194,45 @@ def _create_hotmail007(extra: dict, proxy: str | None) -> BaseMailbox:
     )
 
 
+def _create_tempmail_lol(extra: dict, proxy: str | None) -> BaseMailbox:
+    from core.remote_mailboxes import TempMailLolMailbox
+
+    return TempMailLolMailbox.from_config({**extra, "proxy": proxy})
+
+
+def _create_moemail(extra: dict, proxy: str | None) -> BaseMailbox:
+    from core.remote_mailboxes import MoeMailMailbox
+
+    return MoeMailMailbox.from_config({**extra, "proxy": proxy})
+
+
+def _create_duckmail(extra: dict, proxy: str | None) -> BaseMailbox:
+    from core.remote_mailboxes import DuckMailMailbox
+
+    return DuckMailMailbox.from_config({**extra, "proxy": proxy})
+
+
+def _create_gptmail(extra: dict, proxy: str | None) -> BaseMailbox:
+    from core.remote_mailboxes import GPTMailMailbox
+
+    return GPTMailMailbox.from_config({**extra, "proxy": proxy})
+
+
+def _create_maliapi(extra: dict, proxy: str | None) -> BaseMailbox:
+    from core.remote_mailboxes import MaliAPIMailbox
+
+    return MaliAPIMailbox.from_config({**extra, "proxy": proxy})
+
+
 MAILBOX_FACTORY_REGISTRY = {
     "local_ms_pool": _create_local_ms_pool,
     "api_mailbox": _create_api_mailbox,
     "hotmail007": _create_hotmail007,
+    "tempmail_lol": _create_tempmail_lol,
+    "moemail": _create_moemail,
+    "duckmail": _create_duckmail,
+    "gptmail": _create_gptmail,
+    "maliapi": _create_maliapi,
 }
 
 
