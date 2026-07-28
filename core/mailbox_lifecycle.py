@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
+from sqlalchemy import delete
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 
@@ -527,6 +528,18 @@ class MailboxAllocationLifecycle:
                 account_email=account_email,
                 platform=account_platform,
             )
+            with Session(db.engine) as session:
+                session.exec(
+                    delete(ProviderResourceModel)
+                    .where(ProviderResourceModel.account_id == account_id)
+                    .where(ProviderResourceModel.provider_type == "mailbox")
+                )
+                session.exec(
+                    delete(ProviderAccountModel)
+                    .where(ProviderAccountModel.account_id == account_id)
+                    .where(ProviderAccountModel.provider_type == "mailbox")
+                )
+                session.commit()
             bound += 1
             linked_accounts.add(account_id)
         return imported, bound

@@ -13,6 +13,8 @@ from core.db import (
     MailboxAllocationModel,
     MailboxProviderAccountModel,
     MailboxResourceModel,
+    ProviderAccountModel,
+    ProviderResourceModel,
 )
 from core.mailbox_lifecycle import (
     ALLOCATION_CANCELLED,
@@ -296,3 +298,5 @@ def test_migration_recovers_bound_mailbox_from_account_graph_after_json_delete(m
     with Session(db.engine) as session:
         link = session.exec(select(MailboxAccountLinkModel)).one()
         assert link.account_id == account_id
+        assert session.exec(select(ProviderAccountModel)).all() == []
+        assert session.exec(select(ProviderResourceModel)).all() == []
