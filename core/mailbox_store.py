@@ -85,6 +85,9 @@ class MailboxStore:
             return _read_list(ACCOUNT_MAILBOX_LINKS_FILE)
 
     def list_resources(self) -> list[dict[str, Any]]:
+        from core.mailbox_lifecycle import MailboxAllocationLifecycle
+
+        canonical = MailboxAllocationLifecycle().list_resources()
         with _LOCK:
             accounts = _read_list(MAILBOX_ACCOUNTS_FILE)
             addresses = _read_list(MAILBOX_ADDRESSES_FILE)
@@ -143,7 +146,22 @@ class MailboxStore:
 
         order = {"registered": 0, "allocated": 1, "available": 2, "disabled": 3}
         resources.sort(key=lambda item: (order.get(str(item.get("status") or ""), 9), str(item.get("updated_at") or ""), str(item.get("address") or "")))
-        return resources
+        canonical_addresses = {
+            (
+                str(item.get("provider") or "").strip().lower(),
+                str(item.get("address") or "").strip().lower(),
+            )
+            for item in canonical
+        }
+        return canonical + [
+            item
+            for item in resources
+            if (
+                str(item.get("provider") or "").strip().lower(),
+                str(item.get("address") or "").strip().lower(),
+            )
+            not in canonical_addresses
+        ]
 
     def get_account(self, account_id: str) -> dict[str, Any] | None:
         account_id = _text(account_id)
@@ -207,6 +225,11 @@ class MailboxStore:
 
     def delete_account(self, account_id: str) -> bool:
         account_id = _text(account_id)
+        from core.mailbox_lifecycle import MailboxAllocationLifecycle
+
+        canonical_id = MailboxAllocationLifecycle.parse_public_resource_id(account_id)
+        if canonical_id is not None:
+            return MailboxAllocationLifecycle().archive_resource(canonical_id)
         with _LOCK:
             accounts = _read_list(MAILBOX_ACCOUNTS_FILE)
             addresses = _read_list(MAILBOX_ADDRESSES_FILE)
@@ -304,6 +327,15 @@ class MailboxStore:
 
     def release_address(self, address_id: str) -> dict[str, Any] | None:
         address_id = _text(address_id)
+        from core.mailbox_lifecycle import MailboxAllocationLifecycle
+
+        canonical_id = MailboxAllocationLifecycle.parse_public_resource_id(address_id)
+        if canonical_id is not None:
+            MailboxAllocationLifecycle().release_resource(canonical_id)
+            return next(
+                (item for item in MailboxAllocationLifecycle().list_resources() if item.get("id") == address_id),
+                None,
+            )
         mailbox_account_id = ""
         updated: dict[str, Any] | None = None
         with _LOCK:
@@ -433,6 +465,46 @@ class MailboxStore:
         proxy: str | None = None,
         extra: dict[str, Any] | None = None,
     ) -> tuple[Any, MailboxAccount, dict[str, Any]]:
+        from core.mailbox_lifecycle import MailboxAllocationLifecycle
+
+        canonical = MailboxAllocationLifecycle().get_resource_for_account(account_id)
+        if canonical is not None:
+            provider_account_model = MailboxAllocationLifecycle().get_provider_account_for_resource(int(canonical.id or 0))
+            if provider_account_model is None:
+                raise RuntimeError("邮箱 provider 登录账号不存在")
+            provider_account = {
+                "provider_type": "mailbox",
+                "provider_name": provider_account_model.provider_name,
+                "login_identifier": provider_account_model.login_identifier,
+                "display_name": provider_account_model.display_name,
+                "credentials": provider_account_model.get_credentials(),
+                "metadata": provider_account_model.get_metadata(),
+            }
+            credentials = dict(provider_account.get("credentials") or {})
+            mailbox_account = MailboxAccount(
+                email=canonical.address,
+                account_id=canonical.resource_identifier,
+                extra={
+                    "provider_account": provider_account,
+                    "provider_resource": canonical.get_provider_resource(),
+                },
+            )
+            mailbox = create_mailbox(
+                canonical.provider_name,
+                {**dict(extra or {}), **credentials},
+                proxy=proxy,
+            )
+            public_id = MailboxAllocationLifecycle.public_resource_id(int(canonical.id or 0))
+            return mailbox, mailbox_account, {
+                "link": {
+                    "platform": platform,
+                    "account_id": int(account_id),
+                    "mailbox_address_id": public_id,
+                    "purpose": purpose,
+                },
+                "address": {"id": public_id, "address": canonical.address},
+                "account": {"id": public_id, "provider": canonical.provider_name},
+            }
         link = self.get_link_for_account(platform=platform, account_id=account_id, purpose=purpose)
         if not link:
             raise RuntimeError("该账号未绑定验证邮箱")
@@ -475,6 +547,40 @@ class MailboxStore:
         proxy: str | None = None,
         extra: dict[str, Any] | None = None,
     ) -> tuple[Any, MailboxAccount, dict[str, Any]]:
+        from core.mailbox_lifecycle import MailboxAllocationLifecycle
+
+        canonical_id = MailboxAllocationLifecycle.parse_public_resource_id(str(mailbox_address_id or ""))
+        if canonical_id is not None:
+            lifecycle = MailboxAllocationLifecycle()
+            resource = lifecycle.get_resource(canonical_id)
+            if resource is None:
+                raise RuntimeError("邮箱资源不存在")
+            provider_account_model = lifecycle.get_provider_account_for_resource(canonical_id)
+            if provider_account_model is None:
+                raise RuntimeError("邮箱 provider 登录账号不存在")
+            provider_account = {
+                "provider_type": "mailbox",
+                "provider_name": provider_account_model.provider_name,
+                "login_identifier": provider_account_model.login_identifier,
+                "display_name": provider_account_model.display_name,
+                "credentials": provider_account_model.get_credentials(),
+                "metadata": provider_account_model.get_metadata(),
+            }
+            credentials = dict(provider_account.get("credentials") or {})
+            mailbox_account = MailboxAccount(
+                email=resource.address,
+                account_id=resource.resource_identifier,
+                extra={
+                    "provider_account": provider_account,
+                    "provider_resource": resource.get_provider_resource(),
+                },
+            )
+            runtime_extra = {**dict(extra or {}), **credentials}
+            mailbox = create_mailbox(resource.provider_name, runtime_extra, proxy=proxy)
+            return mailbox, mailbox_account, {
+                "address": {"id": mailbox_address_id, "address": resource.address},
+                "account": {"id": mailbox_address_id, "provider": resource.provider_name},
+            }
         address = self.get_address(str(mailbox_address_id or ""))
         if not address:
             raise RuntimeError("邮箱地址不存在")

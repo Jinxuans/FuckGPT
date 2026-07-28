@@ -517,16 +517,11 @@ class BasePlatform(ABC):
         }
         mailbox_account = getattr(identity, "mailbox_account", None)
         if mailbox_account:
-            mailbox_extra = dict(getattr(mailbox_account, "extra", {}) or {})
             snapshot["mailbox"] = {
                 "provider": (self.config.extra or {}).get("mail_provider", ""),
                 "email": getattr(mailbox_account, "email", "") or "",
                 "account_id": str(getattr(mailbox_account, "account_id", "") or ""),
             }
-            if isinstance(mailbox_extra.get("provider_account"), dict):
-                snapshot["provider_account"] = mailbox_extra["provider_account"]
-            if isinstance(mailbox_extra.get("provider_resource"), dict):
-                snapshot["provider_resource"] = mailbox_extra["provider_resource"]
         return snapshot
 
     def _attach_identity_metadata(self, account: Account, identity=None) -> Account:

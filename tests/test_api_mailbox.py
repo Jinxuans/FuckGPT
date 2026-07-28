@@ -172,3 +172,18 @@ def test_api_mailbox_account_metadata_keeps_flysms_runtime_credentials(tmp_path)
     assert credentials["token"] == "tok_secret"
     assert credentials["referer"] == "https://flysms.xyz/icloud/pickup"
     assert credentials["provider"] == "flysms"
+
+
+def test_api_mailbox_legacy_used_ledger_no_longer_decides_availability(tmp_path):
+    state_file = tmp_path / "state.json"
+    state_file.write_text(
+        json.dumps({"used": {"user@example.com": {"email": "user@example.com"}}}),
+        encoding="utf-8",
+    )
+    mailbox = ApiMailboxPool(
+        pool_text="user@example.com----https://mail.example/code",
+        state_file=str(state_file),
+    )
+
+    assert mailbox.get_email().email == "user@example.com"
+    assert json.loads(state_file.read_text(encoding="utf-8"))["used"]

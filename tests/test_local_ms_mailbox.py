@@ -1,5 +1,8 @@
+import json
+
 from core.base_mailbox import MailboxAccount
 from core.local_ms_mailbox import LocalMicrosoftMailboxPool, parse_local_ms_pool_rows
+from core.mailbox_lifecycle import MailboxAllocationLifecycle
 
 
 def test_parse_local_ms_pool_rows_accepts_gujumpgate_hotmail_format():
@@ -63,6 +66,20 @@ def test_local_ms_pool_records_gujumpgate_source_metadata(tmp_path):
     assert provider_resource["metadata"]["source"] == "gujumpgate_hotmail"
 
 
+def test_local_ms_pool_legacy_used_file_no_longer_decides_availability(tmp_path):
+    state_file = tmp_path / "state.json"
+    state_file.write_text(
+        json.dumps({"used": {"user@example.com": {"email": "user@example.com"}}}),
+        encoding="utf-8",
+    )
+    pool = LocalMicrosoftMailboxPool(
+        pool_text="user@example.com----mail-pass----client-id----refresh-token",
+        state_file=str(state_file),
+    )
+
+    assert pool.get_email().email == "user@example.com"
+
+
 def test_local_ms_pool_allocates_six_outlook_child_addresses_per_parent(tmp_path):
     pool = LocalMicrosoftMailboxPool(
         pool_text="parent@outlook.com----mail-pass----client-id----refresh-token",
@@ -70,7 +87,17 @@ def test_local_ms_pool_allocates_six_outlook_child_addresses_per_parent(tmp_path
         alias_count=6,
     )
 
-    accounts = [pool.get_email() for _ in range(6)]
+    lifecycle = MailboxAllocationLifecycle()
+    accounts = []
+    for index in range(6):
+        account = pool.get_email()
+        lifecycle.allocate(
+            mailbox_account=account,
+            provider="local_ms_pool",
+            platform="chatgpt",
+            attempt_id=f"task:{index}",
+        )
+        accounts.append(account)
 
     assert [item.email for item in accounts] == [
         f"parent+reg{index}@outlook.com" for index in range(1, 7)

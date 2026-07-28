@@ -104,7 +104,7 @@ def test_chatgpt_register_task_succeeds_after_successful_registration(monkeypatc
     monkeypatch.setattr(
         tasks_module,
         "save_account",
-        lambda account: type("SavedAccount", (), {"id": 123})(),
+        lambda account, **kwargs: type("SavedAccount", (), {"id": 123})(),
     )
     monkeypatch.setattr("core.base_mailbox.create_mailbox", lambda *args, **kwargs: object())
 
@@ -203,7 +203,7 @@ def test_register_task_enables_hotmail007_prefetch(monkeypatch):
     monkeypatch.setattr(
         tasks_module,
         "save_account",
-        lambda account: type("SavedAccount", (), {"id": 123})(),
+        lambda account, **kwargs: type("SavedAccount", (), {"id": 123})(),
     )
     monkeypatch.setattr(
         "core.mailbox_store.MailboxStore",
@@ -255,7 +255,7 @@ def test_register_task_cancel_does_not_wait_for_blocked_worker(monkeypatch):
     monkeypatch.setattr(
         tasks_module,
         "save_account",
-        lambda account: type("SavedAccount", (), {"id": 123})(),
+        lambda account, **kwargs: type("SavedAccount", (), {"id": 123})(),
     )
     monkeypatch.setattr(
         "core.mailbox_store.MailboxStore",
@@ -316,7 +316,7 @@ def test_register_task_cancel_stops_scheduling_new_workers(monkeypatch):
     monkeypatch.setattr(
         tasks_module,
         "save_account",
-        lambda account: type("SavedAccount", (), {"id": 123})(),
+        lambda account, **kwargs: type("SavedAccount", (), {"id": 123})(),
     )
     monkeypatch.setattr(
         "core.mailbox_store.MailboxStore",
@@ -364,7 +364,7 @@ def test_register_task_uploads_each_saved_account_immediately(monkeypatch):
 
     saved_ids = iter((123, 124))
 
-    def save(account):
+    def save(account, **kwargs):
         account_id = next(saved_ids)
         events.append(("saved", account_id))
         return type("SavedAccount", (), {"id": account_id})()
@@ -454,7 +454,7 @@ def test_register_task_separates_platform_and_mailbox_proxies(monkeypatch):
     monkeypatch.setattr(
         tasks_module,
         "save_account",
-        lambda account: type("SavedAccount", (), {"id": 123})(),
+        lambda account, **kwargs: type("SavedAccount", (), {"id": 123})(),
     )
     monkeypatch.setattr("core.base_mailbox.create_mailbox", fake_create_mailbox)
 
@@ -673,7 +673,7 @@ def test_register_task_uses_fixed_mailbox_address(monkeypatch):
     monkeypatch.setattr(
         tasks_module,
         "save_account",
-        lambda account: type("SavedAccount", (), {"id": 456})(),
+        lambda account, **kwargs: type("SavedAccount", (), {"id": 456})(),
     )
 
     logger = _FakeLogger()
@@ -695,7 +695,57 @@ def test_register_task_uses_fixed_mailbox_address(monkeypatch):
     assert captured["mailbox_address_id"] == "addr_fixed"
     assert captured["register_email"] == "fixed@example.com"
     assert captured["provided_mailbox_email"] == "fixed@example.com"
-    assert captured["linked"] == (456, "fixed@example.com")
+    assert "linked" not in captured
+
+
+def test_register_task_failure_releases_canonical_mailbox_allocation(monkeypatch):
+    captured = {}
+
+    class FakePlatform:
+        _last_identity = type(
+            "Identity",
+            (),
+            {"metadata": {"mailbox_allocation_id": "mba_failure"}},
+        )()
+
+        def register(self, email=None, password=None):
+            raise RuntimeError("registration failed")
+
+    monkeypatch.setattr(tasks_module, "get", lambda platform_name: object)
+    monkeypatch.setattr(
+        tasks_module,
+        "_build_platform_instance",
+        lambda *args, **kwargs: FakePlatform(),
+    )
+    monkeypatch.setattr("core.base_mailbox.create_mailbox", lambda *args, **kwargs: object())
+
+    def fake_release(self, allocation_id, *, outcome, reason=""):
+        captured.update(
+            allocation_id=allocation_id,
+            outcome=outcome,
+            reason=reason,
+        )
+        return True
+
+    monkeypatch.setattr("core.mailbox_lifecycle.MailboxAllocationLifecycle.release", fake_release)
+
+    logger = _FakeLogger(task_id="task-release-failure")
+    tasks_module._execute_register_task(
+        {
+            "platform": "chatgpt",
+            "count": 1,
+            "concurrency": 1,
+            "executor_type": "headless",
+            "extra": {"identity_provider": "mailbox", "mail_provider": "api_mailbox"},
+        },
+        logger,
+    )
+
+    assert captured == {
+        "allocation_id": "mba_failure",
+        "outcome": "failed",
+        "reason": "registration failed",
+    }
 
 
 def test_register_api_rejects_protocol_without_outlook_pool(client):

@@ -15,7 +15,6 @@ import re
 import threading
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse, urlunparse
 
@@ -158,39 +157,24 @@ class ApiMailboxPool(BaseMailbox):
             raise RuntimeError("API 邮箱池未解析到有效邮箱")
         return entries
 
-    def _state(self) -> dict:
-        try:
-            return json.loads(self.state_file.read_text(encoding="utf-8"))
-        except Exception:
-            return {"used": {}}
-
-    def _save_state(self, state: dict) -> None:
-        self.state_file.parent.mkdir(parents=True, exist_ok=True)
-        self.state_file.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
-
-    def _source_id(self) -> str:
-        return hashlib.sha256(self.pool_text.encode("utf-8")).hexdigest()[:16]
-
     def _available_entry(self) -> ApiMailboxEntry:
+        from core.mailbox_lifecycle import MailboxAllocationLifecycle
+
         entries = self._entries()
-        used = set((self._state().get("used") or {}).keys())
+        lifecycle = MailboxAllocationLifecycle()
         for entry in entries:
-            if self.allow_reuse or entry.key not in used:
+            if lifecycle.is_available(
+                provider_name="api_mailbox",
+                resource_identifier=entry.key,
+            ):
                 return entry
         raise RuntimeError(f"API 邮箱池已用尽: total={len(entries)}")
 
     def _reserve(self, entry: ApiMailboxEntry) -> None:
-        if self.allow_reuse:
-            return
-        state = self._state()
-        used = dict(state.get("used") or {})
-        used[entry.key] = {
-            "email": entry.email,
-            "reserved_at": datetime.now(timezone.utc).isoformat(),
-            "source_id": self._source_id(),
-        }
-        state["used"] = used
-        self._save_state(state)
+        # Allocation state is owned by MailboxAllocationLifecycle.  Keep this
+        # method as a no-op for compatibility with callers that subclassed the
+        # old pool implementation; the legacy JSON ledger is never written.
+        return None
 
     def peek_email(self) -> str:
         return self._available_entry().email

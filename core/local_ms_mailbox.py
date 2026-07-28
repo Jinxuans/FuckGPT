@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import csv
 import email as email_lib
-import hashlib
 import imaplib
 import json
 import re
@@ -19,7 +18,6 @@ import ssl
 import threading
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from email.header import decode_header
 from email.utils import getaddresses
 from pathlib import Path
@@ -280,20 +278,6 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
             raise RuntimeError("本地微软邮箱池未解析到有效邮箱")
         return entries
 
-    def _state(self) -> dict:
-        try:
-            return json.loads(self.state_file.read_text(encoding="utf-8"))
-        except Exception:
-            return {"used": {}}
-
-    def _save_state(self, state: dict) -> None:
-        self.state_file.parent.mkdir(parents=True, exist_ok=True)
-        self.state_file.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
-
-    def _source_id(self) -> str:
-        material = f"{self.pool_file}\n{self.pool_text}".encode("utf-8")
-        return hashlib.sha256(material).hexdigest()[:16]
-
     def _candidate_email(self, entry: LocalMicrosoftMailboxEntry, alias_index: int) -> str:
         if self.alias_count <= 1:
             return entry.email
@@ -323,26 +307,20 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
         return candidates
 
     def _reserve(self, candidate: LocalMicrosoftMailboxCandidate) -> None:
-        if self.allow_reuse:
-            return
-        state = self._state()
-        used = dict(state.get("used") or {})
-        used[candidate.key] = {
-            "email": candidate.email,
-            "parent_email": candidate.entry.email,
-            "alias_index": candidate.alias_index,
-            "reserved_at": datetime.now(timezone.utc).isoformat(),
-            "source_id": self._source_id(),
-        }
-        state["used"] = used
-        self._save_state(state)
+        # Canonical allocation state is persisted by
+        # MailboxAllocationLifecycle after the provider returns this resource.
+        return None
 
     def _available_candidate(self) -> LocalMicrosoftMailboxCandidate:
+        from core.mailbox_lifecycle import MailboxAllocationLifecycle
+
         candidates = self._candidates()
-        state = self._state()
-        used = set((state.get("used") or {}).keys())
+        lifecycle = MailboxAllocationLifecycle()
         for candidate in candidates:
-            if self.allow_reuse or candidate.key not in used:
+            if lifecycle.is_available(
+                provider_name="local_ms_pool",
+                resource_identifier=candidate.key,
+            ):
                 return candidate
         raise RuntimeError(f"本地微软邮箱池已用尽: total={len(candidates)}")
 

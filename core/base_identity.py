@@ -1,6 +1,7 @@
 """注册身份提供者抽象。"""
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+import threading
 from typing import Any, Optional
 
 
@@ -76,43 +77,59 @@ class BaseIdentityProvider(ABC):
 class MailboxIdentityProvider(BaseIdentityProvider):
     identity_provider = "mailbox"
 
-    def _record_allocated_mailbox(self, mailbox_account: Any) -> None:
-        try:
-            from core.mailbox_store import MailboxStore
+    _allocation_lock = threading.Lock()
 
-            result = MailboxStore().record_allocated_mailbox(
-                platform=self.extra.get("_platform_name", "") or "chatgpt",
-                mailbox_account=mailbox_account,
-                provider=self.extra.get("mail_provider", ""),
-            )
-            log_fn = self.extra.get("_log_fn")
-            address = ((result or {}).get("address") or {}).get("address") if result else ""
-            if callable(log_fn) and address:
-                log_fn(f"邮箱资源已预记录: {address}")
-        except Exception as exc:
-            log_fn = self.extra.get("_log_fn")
-            if callable(log_fn):
-                log_fn(f"邮箱资源预记录失败: {exc}")
+    def _allocate_mailbox(self, mailbox_account: Any):
+        from core.mailbox_lifecycle import MailboxAllocationLifecycle
+
+        lifecycle = MailboxAllocationLifecycle()
+        allocation = lifecycle.allocate(
+            platform=self.extra.get("_platform_name", "") or "chatgpt",
+            mailbox_account=mailbox_account,
+            provider=self.extra.get("mail_provider", ""),
+            attempt_id=self.extra.get("_registration_attempt_id", ""),
+            task_id=self.extra.get("_task_id", ""),
+            subtask_id=self.extra.get("_subtask_id", ""),
+        )
+        log_fn = self.extra.get("_log_fn")
+        if callable(log_fn):
+            log_fn(f"邮箱资源已分配: {allocation.address}")
+        return allocation
 
     def resolve(self, requested_email: Optional[str] = None) -> IdentityMaterial:
         requested_email = (requested_email or "").strip()
         if not self.mailbox:
             return IdentityMaterial(identity_provider=self.identity_provider, email=requested_email)
 
-        mail_acct = self.mailbox.get_email()
-        self._record_allocated_mailbox(mail_acct)
+        # Provider selection and canonical allocation form one process-local
+        # critical section. SQLite's active-allocation unique index remains the
+        # cross-process guard.
+        with self._allocation_lock:
+            mail_acct = self.mailbox.get_email()
+            allocation = self._allocate_mailbox(mail_acct)
         email = getattr(mail_acct, "email", "") or ""
         if not requested_email and not email:
             provider_name = getattr(self.mailbox, "__class__", type(self.mailbox)).__name__
             raise ValueError(f"{provider_name} 未返回可用邮箱，请检查 mailbox provider 配置或服务状态")
         if requested_email and email and requested_email != email:
             raise ValueError(f"传入邮箱 {requested_email} 与当前邮箱 provider 返回的 {email} 不一致")
-        before_ids = self.mailbox.get_current_ids(mail_acct) if mail_acct else set()
+        try:
+            before_ids = self.mailbox.get_current_ids(mail_acct) if mail_acct else set()
+        except Exception as exc:
+            from core.mailbox_lifecycle import ALLOCATION_FAILED, MailboxAllocationLifecycle
+
+            MailboxAllocationLifecycle().release(allocation.id, outcome=ALLOCATION_FAILED, reason=str(exc))
+            raise
         return IdentityMaterial(
             identity_provider=self.identity_provider,
             email=requested_email or email,
             mailbox_account=mail_acct,
             before_ids=before_ids,
+            metadata={
+                "mailbox_allocation_id": allocation.id,
+                "mailbox_resource_id": allocation.resource_id,
+                "registration_attempt_id": allocation.attempt_id,
+            },
         )
 
 

@@ -689,6 +689,8 @@ def _build_platform_instance(
     platform_proxy: str | None = None,
     mailbox_proxy: str | None = None,
     shared_mailbox=None,
+    task_id: str = "",
+    subtask_id: str = "",
 ):
     from core.base_identity import normalize_identity_provider
     from core.base_mailbox import create_mailbox
@@ -698,6 +700,11 @@ def _build_platform_instance(
     extra = dict(payload.get("extra") or {})
     extra["_log_fn"] = logger.log
     extra["mailbox_proxy"] = mailbox_proxy or ""
+    extra["_task_id"] = str(task_id or "")
+    extra["_subtask_id"] = str(subtask_id or "")
+    extra["_registration_attempt_id"] = (
+        f"{task_id}:{subtask_id}" if task_id and subtask_id else ""
+    )
     config = RegisterConfig(
         executor_type=executor_type,
         captcha_solver=captcha_solver,
@@ -1067,7 +1074,12 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
         nonlocal uploaded_count
         if logger.is_cancel_requested():
             return "__cancel_requested__"
-        logger.set_subtask(f"worker_{index + 1}", f"Worker {index + 1}")
+        subtask_id = f"worker_{index + 1}"
+        logger.set_subtask(subtask_id, f"Worker {index + 1}")
+        platform = None
+        allocation_id = ""
+        allocation_succeeded = False
+        failure_reason = ""
         try:
             platform = _build_platform_instance(
                 platform_name,
@@ -1076,6 +1088,8 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
                 platform_proxy=platform_proxy,
                 mailbox_proxy=mailbox_proxy,
                 shared_mailbox=shared_mailbox,
+                task_id=task_id,
+                subtask_id=subtask_id,
             )
             logger.log(f"开始注册第 {index + 1}/{count} 个账号")
             logger.log(
@@ -1089,19 +1103,25 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
             if logger.is_cancel_requested():
                 return "__cancel_requested__"
             account = platform.register(email=email, password=password)
+            from core.mailbox_lifecycle import MailboxAllocationLifecycle
+
+            allocation_id = MailboxAllocationLifecycle.allocation_id_from_account(account)
             if logger.is_cancel_requested():
                 return "__cancel_requested__"
-            saved_account = save_account(account)
-            saved_account_id = int(saved_account.id)
-            try:
-                from core.mailbox_store import MailboxStore
-
-                MailboxStore().record_registration_link(
-                    account_id=saved_account_id,
-                    platform_account=account,
-                )
-            except Exception as mailbox_link_exc:
-                logger.log(f"邮箱资源绑定记录失败: {mailbox_link_exc}", level="warning")
+            with Session(engine) as registration_session:
+                saved_account = save_account(account, session=registration_session, commit=False)
+                saved_account_id = int(saved_account.id)
+                if allocation_id:
+                    MailboxAllocationLifecycle().succeed_in_session(
+                        registration_session,
+                        allocation_id,
+                        account_id=saved_account_id,
+                        account_email=account.email,
+                        platform=account.platform,
+                    )
+                registration_session.commit()
+            if allocation_id:
+                allocation_succeeded = True
             if platform_proxy and platform_proxy_mode == PROXY_MODE_PROXY_SERVICE:
                 proxy_pool.report_success(platform_proxy)
             if mailbox_proxy and mailbox_proxy_mode == PROXY_MODE_PROXY_SERVICE and mailbox_proxy != platform_proxy:
@@ -1182,6 +1202,7 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
                 item["codex_oauth"] = post_codex_oauth or {"ok": False, "skipped": True}
             return item
         except Exception as exc:
+            failure_reason = str(exc)
             if logger.is_cancel_requested() or str(exc) == "任务已取消":
                 return "__cancel_requested__"
             if platform_proxy and platform_proxy_mode == PROXY_MODE_PROXY_SERVICE:
@@ -1193,6 +1214,23 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
             logger.log(f"注册失败: {error}", level="error")
             return error
         finally:
+            if platform is not None and not allocation_id:
+                from core.mailbox_lifecycle import MailboxAllocationLifecycle
+
+                allocation_id = MailboxAllocationLifecycle.allocation_id_from_platform(platform)
+            if allocation_id and not allocation_succeeded:
+                from core.mailbox_lifecycle import (
+                    ALLOCATION_CANCELLED,
+                    ALLOCATION_FAILED,
+                    MailboxAllocationLifecycle,
+                )
+
+                cancelled = logger.is_cancel_requested() or failure_reason == "任务已取消"
+                MailboxAllocationLifecycle().release(
+                    allocation_id,
+                    outcome=ALLOCATION_CANCELLED if cancelled else ALLOCATION_FAILED,
+                    reason=failure_reason or ("任务已取消" if cancelled else "注册未成功"),
+                )
             logger.clear_subtask()
 
     success = 0

@@ -198,6 +198,9 @@ class AccountsRepository:
             model = session.get(AccountModel, account_id)
             if not model:
                 return False
+            from core.mailbox_lifecycle import MailboxAllocationLifecycle
+
+            MailboxAllocationLifecycle().archive_account_mailbox(account_id)
             purge_account_graph(session, account_id)
             session.delete(model)
             session.commit()

@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from sqlalchemy import UniqueConstraint, inspect
+from sqlalchemy import Index, UniqueConstraint, inspect, text
 from sqlmodel import Field, SQLModel, Session, create_engine, select
 
 
@@ -126,6 +126,130 @@ class ProviderResourceModel(SQLModel, table=True):
 
     def set_metadata(self, data: dict):
         self.metadata_json = json.dumps(data or {}, ensure_ascii=False)
+
+
+class MailboxProviderAccountModel(SQLModel, table=True):
+    """Provider login credentials shared by one or more mailbox addresses."""
+
+    __tablename__ = "mailbox_provider_accounts"
+    __table_args__ = (
+        UniqueConstraint("provider_name", "login_identifier", name="uq_mailbox_provider_accounts_login"),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    provider_name: str = Field(index=True)
+    login_identifier: str = Field(index=True)
+    display_name: str = ""
+    credentials_json: str = "{}"
+    metadata_json: str = "{}"
+    created_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow)
+
+    def get_credentials(self) -> dict:
+        return json.loads(self.credentials_json or "{}")
+
+    def set_credentials(self, data: dict):
+        self.credentials_json = json.dumps(data or {}, ensure_ascii=False)
+
+    def get_metadata(self) -> dict:
+        return json.loads(self.metadata_json or "{}")
+
+    def set_metadata(self, data: dict):
+        self.metadata_json = json.dumps(data or {}, ensure_ascii=False)
+
+
+class MailboxResourceModel(SQLModel, table=True):
+    """Canonical mailbox resource, independent from any GPT account."""
+
+    __tablename__ = "mailbox_resources"
+    __table_args__ = (
+        UniqueConstraint("provider_name", "resource_identifier", name="uq_mailbox_resources_provider_identifier"),
+        UniqueConstraint("provider_name", "address", name="uq_mailbox_resources_provider_address"),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    provider_account_id: int = Field(index=True, foreign_key="mailbox_provider_accounts.id")
+    provider_name: str = Field(index=True)
+    resource_identifier: str = Field(index=True)
+    address: str = Field(index=True)
+    parent_address: str = ""
+    status: str = Field(default="available", index=True)
+    provider_resource_json: str = "{}"
+    metadata_json: str = "{}"
+    created_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow)
+
+    def get_provider_resource(self) -> dict:
+        return json.loads(self.provider_resource_json or "{}")
+
+    def set_provider_resource(self, data: dict):
+        self.provider_resource_json = json.dumps(data or {}, ensure_ascii=False)
+
+    def get_metadata(self) -> dict:
+        return json.loads(self.metadata_json or "{}")
+
+    def set_metadata(self, data: dict):
+        self.metadata_json = json.dumps(data or {}, ensure_ascii=False)
+
+
+class MailboxAllocationModel(SQLModel, table=True):
+    """One registration attempt's claim of a mailbox resource."""
+
+    __tablename__ = "mailbox_allocations"
+    __table_args__ = (
+        UniqueConstraint("attempt_id", name="uq_mailbox_allocations_attempt"),
+        Index(
+            "uq_mailbox_allocations_active_resource",
+            "resource_id",
+            unique=True,
+            sqlite_where=text("status = 'active'"),
+        ),
+    )
+
+    id: str = Field(primary_key=True)
+    resource_id: int = Field(index=True, foreign_key="mailbox_resources.id")
+    attempt_id: str = Field(index=True)
+    task_id: str = Field(default="", index=True)
+    subtask_id: str = ""
+    platform: str = Field(default="chatgpt", index=True)
+    status: str = Field(default="active", index=True)
+    reason: str = ""
+    account_id: Optional[int] = Field(default=None, index=True, foreign_key="accounts.id")
+    started_at: datetime = Field(default_factory=_utcnow)
+    finished_at: Optional[datetime] = None
+    updated_at: datetime = Field(default_factory=_utcnow)
+
+
+class MailboxAccountLinkModel(SQLModel, table=True):
+    """One-to-one successful GPT account to primary verification mailbox link."""
+
+    __tablename__ = "mailbox_account_links"
+    __table_args__ = (
+        UniqueConstraint("resource_id", name="uq_mailbox_account_links_resource"),
+        UniqueConstraint("allocation_id", name="uq_mailbox_account_links_allocation"),
+        UniqueConstraint("account_id", name="uq_mailbox_account_links_account"),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    resource_id: int = Field(index=True, foreign_key="mailbox_resources.id")
+    allocation_id: str = Field(index=True, foreign_key="mailbox_allocations.id")
+    account_id: Optional[int] = Field(default=None, index=True, foreign_key="accounts.id")
+    account_id_snapshot: int = Field(index=True)
+    account_email: str = ""
+    platform: str = Field(default="chatgpt", index=True)
+    linked_at: datetime = Field(default_factory=_utcnow)
+    archived_at: Optional[datetime] = None
+
+
+class DataMigrationModel(SQLModel, table=True):
+    __tablename__ = "data_migrations"
+
+    key: str = Field(primary_key=True)
+    completed_at: datetime = Field(default_factory=_utcnow)
+    detail_json: str = "{}"
+
+    def set_detail(self, data: dict):
+        self.detail_json = json.dumps(data or {}, ensure_ascii=False)
 
 
 class ProviderDefinitionModel(SQLModel, table=True):
@@ -269,43 +393,51 @@ class ProxyModel(SQLModel, table=True):
     last_checked: Optional[datetime] = None
 
 
-def save_account(account) -> 'AccountModel':
-    """从 base_platform.Account 存入数据库（同平台同邮箱则更新）"""
+def _save_account_in_session(session: Session, account) -> 'AccountModel':
     from core.account_graph import sync_platform_account_graph
 
-    with Session(engine) as session:
-        existing = session.exec(
-            select(AccountModel)
-            .where(AccountModel.platform == account.platform)
-            .where(AccountModel.email == account.email)
-        ).first()
-        if existing:
-            existing.password = account.password
-            existing.user_id = account.user_id or ""
-            existing.updated_at = _utcnow()
-            session.add(existing)
+    existing = session.exec(
+        select(AccountModel)
+        .where(AccountModel.platform == account.platform)
+        .where(AccountModel.email == account.email)
+    ).first()
+    if existing:
+        existing.password = account.password
+        existing.user_id = account.user_id or ""
+        existing.updated_at = _utcnow()
+        session.add(existing)
+        session.flush()
+        sync_platform_account_graph(session, existing, account)
+        session.flush()
+        return existing
+    model = AccountModel(
+        platform=account.platform,
+        email=account.email,
+        password=account.password,
+        user_id=account.user_id or "",
+    )
+    session.add(model)
+    session.flush()
+    sync_platform_account_graph(session, model, account)
+    session.flush()
+    return model
+
+
+def save_account(account, *, session: Session | None = None, commit: bool = True) -> 'AccountModel':
+    """Persist an account; optionally join a caller-owned transaction."""
+
+    if session is not None:
+        model = _save_account_in_session(session, account)
+        if commit:
             session.commit()
-            session.refresh(existing)
-            sync_platform_account_graph(session, existing, account)
-            session.commit()
-            # The graph write commits the session and expires ORM attributes.
-            # Reload before leaving the context so callers can safely read the
-            # returned model (especially its primary key) after detachment.
-            session.refresh(existing)
-            return existing
-        m = AccountModel(
-            platform=account.platform,
-            email=account.email,
-            password=account.password,
-            user_id=account.user_id or "",
-        )
-        session.add(m)
-        session.commit()
-        session.refresh(m)
-        sync_platform_account_graph(session, m, account)
-        session.commit()
-        session.refresh(m)
-        return m
+            session.refresh(model)
+        return model
+
+    with Session(engine) as owned_session:
+        model = _save_account_in_session(owned_session, account)
+        owned_session.commit()
+        owned_session.refresh(model)
+        return model
 
 
 LEGACY_ACCOUNT_COLUMNS = (
@@ -417,6 +549,16 @@ def init_db():
         _cleanup_empty_provider_settings()
         sync_all_account_graphs(session)
         session.commit()
+
+    # Any active allocation that survived a process restart has no live
+    # registration worker. Preserve the attempt as interrupted and return its
+    # mailbox immediately, as required by the domain policy.
+    from core.mailbox_lifecycle import MailboxAllocationLifecycle
+
+    mailbox_lifecycle = MailboxAllocationLifecycle()
+    if not os.getenv("PYTEST_CURRENT_TEST"):
+        mailbox_lifecycle.migrate_legacy_json_once()
+    mailbox_lifecycle.interrupt_active()
 
 
 def _ensure_column(table: str, column: str, col_type: str):

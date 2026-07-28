@@ -305,10 +305,12 @@ def test_identity_provider_prerecords_mailbox_before_current_ids_failure(monkeyp
     with pytest.raises(RuntimeError, match="ids failed"):
         provider.resolve()
 
-    assert MailboxStore().list_addresses()[0]["address"] == "failed-after-buy@hotmail.com"
-    assert MailboxStore().list_addresses()[0]["reserved_for"]["status"] == "allocated"
+    resources = MailboxStore().list_resources()
+    assert resources[0]["address"] == "failed-after-buy@hotmail.com"
+    assert resources[0]["status"] == "available"
+    assert resources[0]["allocation_status"] == "failed"
     assert MailboxStore().list_links() == []
-    assert logs == ["邮箱资源已预记录: failed-after-buy@hotmail.com"]
+    assert logs == ["邮箱资源已分配: failed-after-buy@hotmail.com"]
 
 
 def test_mailbox_api_manages_json_resources(client, monkeypatch, tmp_path):
