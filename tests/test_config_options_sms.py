@@ -9,6 +9,9 @@ def test_config_options_exposes_smsbower_catalog(client):
     assert "sms_providers" in data
     assert "sms_settings" in data
     assert "sms_drivers" in data
+    assert {"smsbower", "herosms", "smspool", "fivesim", "smstome"}.issubset(
+        {item["value"] for item in data["sms_providers"]}
+    )
     smsbower = next(item for item in data["sms_providers"] if item["value"] == "smsbower")
     field_keys = {item["key"] for item in smsbower["fields"]}
     fields = {item["key"]: item for item in smsbower["fields"]}
@@ -17,8 +20,22 @@ def test_config_options_exposes_smsbower_catalog(client):
     assert "smsbower_min_price" in field_keys
     assert "smsbower_buy_max_attempts" in field_keys
     assert "smsbower_buy_retry_interval" in field_keys
+    assert "smsbower_number_api" in field_keys
+    assert "smsbower_otp_timeout_seconds" in field_keys
+    assert {
+        "smsbower_provider_ids",
+        "smsbower_except_provider_ids",
+        "smsbower_phone_exception",
+        "smsbower_user_id",
+    }.issubset(field_keys)
     assert "smsbower_ref" not in field_keys
-    assert fields["smsbower_default_country"]["label"] == "默认国家 ID"
+    assert fields["smsbower_default_service"]["type"] == "async-select"
+    assert fields["smsbower_default_service"]["default_value"] == "dr"
+    assert fields["smsbower_default_country"]["label"] == "默认国家/地区"
+    assert fields["smsbower_default_country"]["type"] == "async-select"
+    assert fields["smsbower_number_api"]["default_value"] == "getNumber"
+    assert len(fields["smsbower_number_api"]["options"]) == 2
+    assert fields["smsbower_otp_timeout_seconds"]["default_value"] == "120"
     assert fields["smsbower_buy_max_attempts"]["default_value"] == "20"
     assert fields["smsbower_buy_retry_interval"]["default_value"] == "3"
 
@@ -61,6 +78,100 @@ def test_sms_provider_test_fetches_balance_without_purchase(client, monkeypatch)
     assert data["balance"] == 12.34
     assert "账户余额：12.34" in data["message"]
     assert calls == ["secret-key"]
+
+
+def test_sms_provider_options_load_services_and_countries(client, monkeypatch):
+    from core.smsbower_sms import SMSBowerClient
+
+    monkeypatch.setattr(
+        SMSBowerClient,
+        "list_service_options",
+        lambda self: [{"value": "dr", "label": "OpenAI (ChatGPT) (dr)"}],
+    )
+    monkeypatch.setattr(
+        SMSBowerClient,
+        "list_country_options",
+        lambda self: [{"value": "0", "label": "Russia (RU · +7)"}],
+    )
+
+    base = {
+        "provider_type": "sms",
+        "provider_key": "smsbower",
+        "config": {},
+        "auth": {"smsbower_api_key": "secret-key"},
+    }
+    services = client.post(
+        "/api/provider-settings/options",
+        json={**base, "field_key": "smsbower_default_service"},
+    )
+    countries = client.post(
+        "/api/provider-settings/options",
+        json={**base, "field_key": "smsbower_default_country"},
+    )
+
+    assert services.status_code == 200
+    assert services.json()["options"] == [{"value": "dr", "label": "OpenAI (ChatGPT) (dr)"}]
+    assert countries.status_code == 200
+    assert countries.json()["options"] == [{"value": "0", "label": "Russia (RU · +7)"}]
+
+
+def test_sms_provider_options_require_api_key(client):
+    response = client.post(
+        "/api/provider-settings/options",
+        json={
+            "provider_type": "sms",
+            "provider_key": "smsbower",
+            "field_key": "smsbower_default_country",
+            "config": {},
+            "auth": {},
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"ok": False, "error": "请先填写 SMSBower API Key", "options": []}
+
+
+def test_smspool_options_dispatch_without_api_key(client, monkeypatch):
+    from core.smspool_sms import SMSPoolClient
+
+    monkeypatch.setattr(
+        SMSPoolClient,
+        "list_service_options",
+        lambda self: [{"value": "671", "label": "OpenAI / ChatGPT (671)"}],
+    )
+    response = client.post(
+        "/api/provider-settings/options",
+        json={
+            "provider_type": "sms",
+            "provider_key": "smspool",
+            "field_key": "smspool_default_service",
+            "config": {},
+            "auth": {},
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["options"] == [{"value": "671", "label": "OpenAI / ChatGPT (671)"}]
+
+
+def test_fivesim_provider_test_uses_registry_balance(client, monkeypatch):
+    from core.fivesim_sms import FiveSimClient
+
+    monkeypatch.setattr(FiveSimClient, "get_balance", lambda self: 8.75)
+    response = client.post(
+        "/api/provider-settings/test",
+        json={
+            "provider_type": "sms",
+            "provider_key": "fivesim",
+            "config": {},
+            "auth": {"fivesim_api_key": "secret-token"},
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["ok"] is True
+    assert response.json()["balance"] == 8.75
+    assert "5sim 连接成功" in response.json()["message"]
 
 
 def test_proxy_provider_test_masks_credentials_and_checks_origin(client, monkeypatch):

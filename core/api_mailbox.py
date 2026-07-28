@@ -2,7 +2,9 @@
 
 Each configured row has the form ``email----api_url``.  The URL is treated as
 an opaque secret because it commonly contains the mailbox password or token in
-its query string.
+its query string.  flysms pickup links are also supported as
+``email---token---pickup_url`` and are translated to their read-only latest
+message endpoint.
 """
 
 from __future__ import annotations
@@ -15,7 +17,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 
 import requests
 
@@ -30,6 +32,9 @@ DEFAULT_CODE_PATTERN = r"(?<!#)(?<!\d)(\d{6})(?!\d)"
 class ApiMailboxEntry:
     email: str
     api_url: str
+    token: str = ""
+    referer: str = ""
+    provider: str = "generic"
 
     @property
     def key(self) -> str:
@@ -40,8 +45,29 @@ def _truthy(value: object) -> bool:
     return str(value or "").strip().lower() in {"1", "true", "yes", "on", "y"}
 
 
+_FLYSMS_HOSTS = {"flysms.xyz", "www.flysms.xyz", "flysms.top", "www.flysms.top"}
+
+
+def _strip_fragment(url: str) -> str:
+    parsed = urlparse(url)
+    return urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, parsed.query, ""))
+
+
+def _flysms_api_url(pickup_url: str) -> str:
+    parsed = urlparse(pickup_url)
+    host = parsed.netloc.lower()
+    if host not in _FLYSMS_HOSTS:
+        raise ValueError("token 取件格式目前仅支持 flysms.xyz/flysms.top")
+    path = parsed.path.rstrip("/")
+    if not path.endswith("/pickup"):
+        raise ValueError("flysms 取件 URL 应为 .../pickup 页面地址")
+    base_path = path[: -len("/pickup")]
+    api_path = f"{base_path}/api/pickup/messages/latest" if base_path else "/api/pickup/messages/latest"
+    return urlunparse((parsed.scheme, parsed.netloc, api_path, "", "", ""))
+
+
 def parse_api_mailbox_rows(text: str) -> list[ApiMailboxEntry]:
-    """Parse one ``email----api_url`` mailbox entry per line."""
+    """Parse one API mailbox entry per line."""
 
     entries: list[ApiMailboxEntry] = []
     seen: set[str] = set()
@@ -49,15 +75,39 @@ def parse_api_mailbox_rows(text: str) -> list[ApiMailboxEntry]:
         line = raw_line.strip().strip("\ufeff")
         if not line or line.startswith("#") or line.startswith("//"):
             continue
-        email, separator, api_url = line.partition("----")
-        email = email.strip()
-        api_url = api_url.strip()
-        if not separator or "@" not in email or not api_url:
-            raise ValueError(f"API 邮箱第 {line_number} 行格式错误，应为：邮箱----完整 API URL")
-        parsed = urlparse(api_url)
-        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-            raise ValueError(f"API 邮箱第 {line_number} 行 URL 无效，仅支持 http/https")
-        entry = ApiMailboxEntry(email=email, api_url=api_url)
+        if "----" in line:
+            email, _, api_url = line.partition("----")
+            email = email.strip()
+            api_url = api_url.strip()
+            if "@" not in email or not api_url:
+                raise ValueError(f"API 邮箱第 {line_number} 行格式错误，应为：邮箱----完整 API URL 或 邮箱---token---flysms取件URL")
+            parsed = urlparse(api_url)
+            if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+                raise ValueError(f"API 邮箱第 {line_number} 行 URL 无效，仅支持 http/https")
+            entry = ApiMailboxEntry(email=email, api_url=api_url)
+        elif "---" in line:
+            parts = [part.strip() for part in line.split("---", 2)]
+            if len(parts) != 3:
+                raise ValueError(f"API 邮箱第 {line_number} 行格式错误，应为：邮箱---token---flysms取件URL")
+            email, token, pickup_url = parts
+            if "@" not in email or not token or not pickup_url:
+                raise ValueError(f"API 邮箱第 {line_number} 行格式错误，应为：邮箱---token---flysms取件URL")
+            parsed = urlparse(pickup_url)
+            if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+                raise ValueError(f"API 邮箱第 {line_number} 行 URL 无效，仅支持 http/https")
+            try:
+                api_url = _flysms_api_url(pickup_url)
+            except ValueError as exc:
+                raise ValueError(f"API 邮箱第 {line_number} 行格式错误：{exc}") from exc
+            entry = ApiMailboxEntry(
+                email=email,
+                api_url=api_url,
+                token=token,
+                referer=_strip_fragment(pickup_url),
+                provider="flysms",
+            )
+        else:
+            raise ValueError(f"API 邮箱第 {line_number} 行格式错误，应为：邮箱----完整 API URL 或 邮箱---token---flysms取件URL")
         if entry.key in seen:
             continue
         seen.add(entry.key)
@@ -102,7 +152,7 @@ class ApiMailboxPool(BaseMailbox):
 
     def _entries(self) -> list[ApiMailboxEntry]:
         if not self.pool_text.strip():
-            raise RuntimeError("API 邮箱池为空，请按“邮箱----完整 API URL”格式填写")
+            raise RuntimeError("API 邮箱池为空，请按“邮箱----完整 API URL”或“邮箱---token---flysms取件URL”格式填写")
         entries = parse_api_mailbox_rows(self.pool_text)
         if not entries:
             raise RuntimeError("API 邮箱池未解析到有效邮箱")
@@ -149,6 +199,13 @@ class ApiMailboxPool(BaseMailbox):
         with self._lock:
             entry = self._available_entry()
             self._reserve(entry)
+        credentials = {"email": entry.email, "api_url": entry.api_url}
+        if entry.token:
+            credentials["token"] = entry.token
+        if entry.referer:
+            credentials["referer"] = entry.referer
+        if entry.provider:
+            credentials["provider"] = entry.provider
         return MailboxAccount(
             email=entry.email,
             account_id=entry.key,
@@ -158,8 +215,8 @@ class ApiMailboxPool(BaseMailbox):
                     "provider_name": "api_mailbox",
                     "login_identifier": entry.email,
                     "display_name": entry.email,
-                    "credentials": {"email": entry.email, "api_url": entry.api_url},
-                    "metadata": {"source": "email_api_url"},
+                    "credentials": credentials,
+                    "metadata": {"source": "email_api_url", "api_mailbox_provider": entry.provider},
                 },
                 "provider_resource": {
                     "provider_type": "mailbox",
@@ -171,6 +228,7 @@ class ApiMailboxPool(BaseMailbox):
                     "metadata": {
                         "email": entry.email,
                         "source": "email_api_url",
+                        "api_mailbox_provider": entry.provider,
                         "reserved": not self.allow_reuse,
                     },
                 },
@@ -184,7 +242,13 @@ class ApiMailboxPool(BaseMailbox):
         email = str(credentials.get("email") or account.email or "").strip()
         api_url = str(credentials.get("api_url") or "").strip()
         if email and api_url:
-            return ApiMailboxEntry(email=email, api_url=api_url)
+            return ApiMailboxEntry(
+                email=email,
+                api_url=api_url,
+                token=str(credentials.get("token") or "").strip(),
+                referer=str(credentials.get("referer") or "").strip(),
+                provider=str(credentials.get("provider") or "generic").strip() or "generic",
+            )
         account_key = str(account.email or "").strip().lower()
         for entry in self._entries():
             if entry.key == account_key:
@@ -192,9 +256,15 @@ class ApiMailboxPool(BaseMailbox):
         raise RuntimeError(f"API 邮箱池未找到账号: {account.email}")
 
     def _request(self, entry: ApiMailboxEntry) -> tuple[object | None, str]:
+        headers = {"Accept": "application/json, text/plain, */*", "User-Agent": "FuckGPT/api-mailbox"}
+        if entry.provider == "flysms" and entry.token:
+            headers["Authorization"] = f"Bearer {entry.token}"
+            headers["X-Mailbox-Email"] = entry.email
+            if entry.referer:
+                headers["Referer"] = entry.referer
         response = self.session.get(
             entry.api_url,
-            headers={"Accept": "application/json, text/plain, */*", "User-Agent": "FuckGPT/api-mailbox"},
+            headers=headers,
             proxies=self.proxy,
             timeout=self.request_timeout,
         )
@@ -205,6 +275,12 @@ class ApiMailboxPool(BaseMailbox):
         except Exception:
             payload = None
         return payload, raw
+
+    def _sleep_interruptibly(self, seconds: float) -> None:
+        deadline = time.monotonic() + max(float(seconds or 0), 0)
+        while time.monotonic() < deadline:
+            self.raise_if_cancelled()
+            time.sleep(min(0.5, max(deadline - time.monotonic(), 0)))
 
     @staticmethod
     def _match_code(value: object, pattern: re.Pattern[str]) -> str:
@@ -342,6 +418,7 @@ class ApiMailboxPool(BaseMailbox):
         deadline = time.monotonic() + timeout
         last_error = ""
         while time.monotonic() < deadline:
+            self.raise_if_cancelled()
             try:
                 payload, raw = self._request(entry)
                 code = self._extract_code(payload, raw, code_pattern=code_pattern)
@@ -352,7 +429,8 @@ class ApiMailboxPool(BaseMailbox):
                 seen.update(signatures)
             except Exception as exc:
                 last_error = str(exc).strip() or exc.__class__.__name__
-            time.sleep(self.poll_interval)
+            if self.poll_interval > 0:
+                self._sleep_interruptibly(self.poll_interval)
         suffix = f"，最后错误: {last_error}" if last_error else ""
         raise TimeoutError(f"等待 API 邮箱验证码超时 ({timeout}s){suffix}")
 
@@ -368,6 +446,7 @@ class ApiMailboxPool(BaseMailbox):
         deadline = time.monotonic() + timeout
         last_error = ""
         while time.monotonic() < deadline:
+            self.raise_if_cancelled()
             try:
                 payload, raw = self._request(entry)
                 link = _extract_verification_link(raw, keyword)
@@ -377,6 +456,7 @@ class ApiMailboxPool(BaseMailbox):
                 seen.update(self._signatures(payload, raw))
             except Exception as exc:
                 last_error = str(exc).strip() or exc.__class__.__name__
-            time.sleep(self.poll_interval)
+            if self.poll_interval > 0:
+                self._sleep_interruptibly(self.poll_interval)
         suffix = f"，最后错误: {last_error}" if last_error else ""
         raise TimeoutError(f"等待 API 邮箱验证链接超时 ({timeout}s){suffix}")

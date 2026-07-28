@@ -40,7 +40,7 @@ class SMSBowerError(RuntimeError):
 
 
 def _string(value: object) -> str:
-    return str(value or "").strip()
+    return "" if value is None else str(value).strip()
 
 
 def _float_value(value: object, default: float, *, minimum: float = 0.0) -> float:
@@ -59,6 +59,14 @@ def _int_value(value: object, default: int, *, minimum: int = 0) -> int:
     return max(result, minimum)
 
 
+def _first_string(mapping: dict[str, Any], *keys: str) -> str:
+    for key in keys:
+        value = mapping.get(key)
+        if value is not None and str(value).strip() != "":
+            return str(value).strip()
+    return ""
+
+
 class SMSBowerClient(BaseSmsProvider):
     """SMSBower API 客户端。
 
@@ -69,6 +77,10 @@ class SMSBowerClient(BaseSmsProvider):
     * ``set_status`` 及便捷方法：取消、完成、重试等状态流转。
     """
 
+    provider_key = "smsbower"
+    provider_label = "SMSBower"
+    lock_ref = True
+
     def __init__(
         self,
         *,
@@ -78,6 +90,12 @@ class SMSBowerClient(BaseSmsProvider):
         default_country: str | int = "",
         default_max_price: str | float = "",
         default_min_price: str | float = "",
+        default_provider_ids: str = "",
+        default_except_provider_ids: str = "",
+        default_phone_exception: str = "",
+        default_user_id: str = "",
+        default_ref: str = DEFAULT_REF,
+        number_api: str = "getNumber",
         request_timeout: float | str = 15,
         poll_interval: float | str = 3,
         proxy: str | None = None,
@@ -90,6 +108,12 @@ class SMSBowerClient(BaseSmsProvider):
         self.default_country = _string(default_country)
         self.default_max_price = _string(default_max_price)
         self.default_min_price = _string(default_min_price)
+        self.default_provider_ids = _string(default_provider_ids)
+        self.default_except_provider_ids = _string(default_except_provider_ids)
+        self.default_phone_exception = _string(default_phone_exception)
+        self.default_user_id = _string(default_user_id)
+        self.default_ref = DEFAULT_REF if self.lock_ref else _string(default_ref)
+        self.number_api = "getNumberV2" if _string(number_api).lower() in {"getnumberv2", "v2", "2"} else "getNumber"
         self.request_timeout = _float_value(request_timeout, 15, minimum=0.5)
         self.poll_interval = _float_value(poll_interval, 3, minimum=0)
         self.proxy = {"http": proxy, "https": proxy} if proxy else None
@@ -98,18 +122,33 @@ class SMSBowerClient(BaseSmsProvider):
 
     @classmethod
     def from_config(cls, config: dict) -> "SMSBowerClient":
-        return cls(
+        client = cls(
             api_key=config.get("smsbower_api_key", ""),
             base_url=config.get("smsbower_base_url", DEFAULT_BASE_URL),
             default_service=config.get("smsbower_default_service", ""),
             default_country=config.get("smsbower_default_country", ""),
             default_max_price=config.get("smsbower_max_price", ""),
             default_min_price=config.get("smsbower_min_price", ""),
+            default_provider_ids=config.get("smsbower_provider_ids", ""),
+            default_except_provider_ids=config.get("smsbower_except_provider_ids", ""),
+            default_phone_exception=config.get("smsbower_phone_exception", ""),
+            default_user_id=config.get("smsbower_user_id", ""),
+            default_ref=DEFAULT_REF,
+            number_api=config.get("smsbower_number_api", "getNumber"),
             request_timeout=config.get("smsbower_request_timeout", 15),
             poll_interval=config.get("smsbower_poll_interval", 3),
             proxy=config.get("proxy") or config.get("sms_proxy") or None,
             log_fn=config.get("_log_fn"),
         )
+        client.buy_max_attempts = _int_value(config.get("smsbower_buy_max_attempts"), 20, minimum=1)
+        client.buy_retry_interval = _float_value(config.get("smsbower_buy_retry_interval"), 3, minimum=0)
+        client.otp_timeout_seconds = _int_value(config.get("smsbower_otp_timeout_seconds"), 120, minimum=1)
+        return client
+
+    def configuration_error(self) -> str:
+        if not self.api_key:
+            return "SMSBower API Key 未配置"
+        return ""
 
     def set_logger(self, log_fn) -> None:
         self._log_fn = log_fn if callable(log_fn) else None
@@ -145,7 +184,7 @@ class SMSBowerClient(BaseSmsProvider):
             response = self.session.get(
                 self.base_url,
                 params=query,
-                headers={"Accept": "application/json, text/plain, */*", "User-Agent": "FuckGPT/smsbower"},
+                headers={"Accept": "application/json, text/plain, */*", "User-Agent": "freeAgentIdentity/smsbower"},
                 proxies=self.proxy,
                 timeout=self.request_timeout,
             )
@@ -230,7 +269,9 @@ class SMSBowerClient(BaseSmsProvider):
         country: str = "",
         **options,
     ) -> SmsActivation:
-        service = _string(service) or self.default_service
+        if self.number_api == "getNumberV2":
+            return self.get_number_v2(service=service, country=country, **options)
+        service = (_string(service) or self.default_service).lower()
         country = _string(country) or self.default_country
         if not service:
             raise SMSBowerError("SMSBower service 未配置")
@@ -238,7 +279,6 @@ class SMSBowerClient(BaseSmsProvider):
             raise SMSBowerError("SMSBower country 未配置")
 
         params = self._number_params(service, country, options)
-        self._log(f"SMSBower 开始购买手机号：service={service}, country={country}")
         raw = self._request("getNumber", params)
         activation = self._activation_from_text(raw, service=service, country=country)
         self._log(
@@ -252,7 +292,7 @@ class SMSBowerClient(BaseSmsProvider):
         country: str = "",
         **options,
     ) -> SmsActivation:
-        service = _string(service) or self.default_service
+        service = (_string(service) or self.default_service).lower()
         country = _string(country) or self.default_country
         if not service:
             raise SMSBowerError("SMSBower service 未配置")
@@ -260,7 +300,6 @@ class SMSBowerClient(BaseSmsProvider):
             raise SMSBowerError("SMSBower country 未配置")
 
         params = self._number_params(service, country, options)
-        self._log(f"SMSBower 开始购买手机号 V2：service={service}, country={country}")
         raw = self._request("getNumberV2", params)
         if raw.startswith("{"):
             activation = self._activation_from_json(raw, service=service, country=country)
@@ -280,11 +319,21 @@ class SMSBowerClient(BaseSmsProvider):
             "phone_exception": "phoneException",
             "user_id": "userID",
         }
-        params: dict[str, Any] = {"service": service, "country": country, "ref": DEFAULT_REF}
+        params: dict[str, Any] = {"service": service, "country": country}
         if self.default_max_price:
             params["maxPrice"] = self.default_max_price
         if self.default_min_price:
             params["minPrice"] = self.default_min_price
+        configured_options = {
+            "providerIds": self.default_provider_ids,
+            "exceptProviderIds": self.default_except_provider_ids,
+            "phoneException": self.default_phone_exception,
+            "userID": self.default_user_id,
+            "ref": self.default_ref,
+        }
+        params.update({key: value for key, value in configured_options.items() if value})
+        if not self.lock_ref:
+            option_map["ref"] = "ref"
         for source_key, target_key in option_map.items():
             value = options.get(source_key, options.get(target_key))
             if value not in (None, ""):
@@ -299,8 +348,6 @@ class SMSBowerClient(BaseSmsProvider):
         status = self._status_from_text(raw)
         if status.code:
             self._log(f"SMSBower 收到验证码：activationId={activation_id}, code={status.code}")
-        else:
-            self._log(f"SMSBower 查码状态：activationId={activation_id}, status={status.raw}")
         return status
 
     def set_status(self, activation_id: str, status: int | str) -> str:
@@ -347,3 +394,58 @@ class SMSBowerClient(BaseSmsProvider):
         if not service:
             raise SMSBowerError("SMSBower service 未配置")
         return self._request("getTopCountriesByService", {"service": service})
+
+    @staticmethod
+    def _catalog_items(raw: str, *keys: str) -> list[dict[str, Any]]:
+        """Normalize the catalog response variants used by SMSBower."""
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise SMSBowerError("SMSBower 目录响应不是有效 JSON") from exc
+        if isinstance(payload, list):
+            return [item for item in payload if isinstance(item, dict)]
+        if not isinstance(payload, dict):
+            return []
+        for key in (*keys, "data", "items", "result"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                return [item for item in value if isinstance(item, dict)]
+            if isinstance(value, dict):
+                return [item for item in value.values() if isinstance(item, dict)]
+        if payload and all(isinstance(item, dict) for item in payload.values()):
+            return list(payload.values())
+        return []
+
+    def list_country_options(self) -> list[dict[str, str]]:
+        items = self._catalog_items(self.get_countries(), "countries")
+        options: list[dict[str, str]] = []
+        for item in items:
+            value = _first_string(item, "activate_org_code", "country", "id")
+            if not value:
+                continue
+            title = _string(item.get("title") or item.get("name") or item.get("eng")) or value
+            iso = _string(item.get("iso") or item.get("short_name") or item.get("country_code")).upper()
+            prefix = _string(item.get("prefix"))
+            details = " · ".join(part for part in (iso, f"+{prefix}" if prefix else "") if part)
+            options.append({
+                "value": value,
+                "label": f"{title} ({details or value})",
+                "english_name": title,
+                "localized_name": _string(item.get("chn")),
+                "region_code": iso,
+                "dial_code": f"+{prefix}" if prefix else "",
+            })
+        return sorted(options, key=lambda item: item["label"].casefold())
+
+    def list_service_options(self) -> list[dict[str, str]]:
+        items = self._catalog_items(self.get_services_list(), "services")
+        options: list[dict[str, str]] = []
+        for item in items:
+            if str(item.get("is_active", "1")).lower() in {"0", "false", "no"}:
+                continue
+            value = _first_string(item, "activate_org_code", "service", "code")
+            if not value:
+                continue
+            title = _string(item.get("title") or item.get("name")) or value
+            options.append({"value": value, "label": f"{title} ({value})"})
+        return sorted(options, key=lambda item: item["label"].casefold())

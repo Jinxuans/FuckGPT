@@ -99,6 +99,32 @@ def test_smsbower_get_number_v2_parses_json_activation():
     assert session.calls[0][1]["params"]["action"] == "getNumberV2"
 
 
+def test_smsbower_number_api_config_can_route_regular_purchase_to_v2():
+    payload = json.dumps(
+        {
+            "activationId": "778",
+            "phoneNumber": 15551234568,
+            "activationCost": "0.35",
+            "activationOperator": "carrier",
+        }
+    )
+    client = SMSBowerClient.from_config(
+        {
+            "smsbower_api_key": "secret-key",
+            "smsbower_default_service": "DR",
+            "smsbower_default_country": "0",
+            "smsbower_number_api": "getNumberV2",
+        }
+    )
+    client.session = FakeSession([payload])
+
+    activation = client.get_number()
+
+    assert activation.activation_id == "778"
+    assert activation.service == "dr"
+    assert client.session.calls[0][1]["params"]["action"] == "getNumberV2"
+
+
 def test_smsbower_configured_price_bounds_are_used_and_can_be_overridden():
     session = FakeSession(["ACCESS_NUMBER:12345:+15551234567", "ACCESS_NUMBER:67890:+15557654321"])
     client = SMSBowerClient.from_config(
@@ -121,6 +147,76 @@ def test_smsbower_configured_price_bounds_are_used_and_can_be_overridden():
     assert session.calls[1][1]["params"]["maxPrice"] == "0.40"
     assert session.calls[1][1]["params"]["minPrice"] == "0.20"
     assert session.calls[1][1]["params"]["ref"] == "531498"
+
+
+def test_smsbower_configured_purchase_filters_are_used_and_can_be_overridden():
+    session = FakeSession(["ACCESS_NUMBER:12345:+15551234567", "ACCESS_NUMBER:67890:+15557654321"])
+    client = SMSBowerClient.from_config(
+        {
+            "smsbower_api_key": "secret-key",
+            "smsbower_default_service": "DR",
+            "smsbower_default_country": "0",
+            "smsbower_provider_ids": "1,2",
+            "smsbower_except_provider_ids": "3",
+            "smsbower_phone_exception": "7918,7900111",
+            "smsbower_user_id": "reseller-1",
+            "smsbower_ref": "custom-ref",
+        }
+    )
+    client.session = session
+
+    client.get_number()
+    client.get_number(provider_ids="9", ref="override-ref")
+
+    assert session.calls[0][1]["params"] == {
+        "api_key": "secret-key",
+        "action": "getNumber",
+        "service": "dr",
+        "country": "0",
+        "providerIds": "1,2",
+        "exceptProviderIds": "3",
+        "phoneException": "7918,7900111",
+        "userID": "reseller-1",
+        "ref": "531498",
+    }
+    assert session.calls[1][1]["params"]["providerIds"] == "9"
+    assert session.calls[1][1]["params"]["ref"] == "531498"
+
+
+def test_smsbower_catalog_options_use_api_codes_and_readable_labels():
+    countries = json.dumps(
+        {
+            "status": "success",
+            "countries": [
+                {"title": "Russia", "iso": "RU", "prefix": 7, "activate_org_code": 0},
+                {"title": "United States", "iso": "US", "prefix": 1, "activate_org_code": 187},
+            ],
+        }
+    )
+    services = json.dumps(
+        {
+            "status": "success",
+            "services": [
+                {"title": "OpenAI (ChatGPT)", "activate_org_code": "dr", "is_active": 1},
+                {"title": "Disabled", "activate_org_code": "xx", "is_active": 0},
+            ],
+        }
+    )
+    client = SMSBowerClient(api_key="secret-key", session=FakeSession([countries, services]))
+
+    assert client.list_country_options() == [
+        {
+            "value": "0", "label": "Russia (RU · +7)", "english_name": "Russia",
+            "localized_name": "", "region_code": "RU", "dial_code": "+7",
+        },
+        {
+            "value": "187", "label": "United States (US · +1)", "english_name": "United States",
+            "localized_name": "", "region_code": "US", "dial_code": "+1",
+        },
+    ]
+    assert client.list_service_options() == [
+        {"value": "dr", "label": "OpenAI (ChatGPT) (dr)"},
+    ]
 
 
 def test_smsbower_status_and_set_status_responses_are_normalized():
@@ -202,7 +298,7 @@ def test_smsbower_is_exposed_in_provider_catalog_and_registry():
     drivers = repository.list_driver_templates("sms")
 
     assert {item.provider_key for item in definitions} == set(SUPPORTED_SMS_PROVIDER_KEYS)
-    assert {item["driver_type"] for item in drivers} == {"smsbower"}
+    assert {item["driver_type"] for item in drivers} == set(SUPPORTED_SMS_PROVIDER_KEYS)
     assert "smsbower" in list_registered("sms")
     provider = create_provider("sms", "smsbower", {"smsbower_api_key": "secret-key"})
     assert isinstance(provider, SMSBowerClient)

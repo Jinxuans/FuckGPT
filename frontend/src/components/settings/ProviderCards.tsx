@@ -5,7 +5,7 @@ import type { TranslationKey } from '@/lib/i18n'
 import type { ProviderOption, ProviderSetting } from '@/lib/config-options'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
-import { Save, Eye, EyeOff, X, Pencil, Plus, Trash2, FlaskConical, Search } from 'lucide-react'
+import { Save, Eye, EyeOff, X, Pencil, Plus, Trash2, FlaskConical, Search, RefreshCw } from 'lucide-react'
 import { invalidateConfigOptionsCache } from '@/lib/app-data'
 
 const CATEGORY_GROUPS = [
@@ -38,9 +38,39 @@ function Toggle({ checked, onChange, disabled }: { checked: boolean; onChange: (
 /* ------------------------------------------------------------------ */
 /*  Searchable Select                                                  */
 /* ------------------------------------------------------------------ */
+type SearchableOption = { value: string; label: string; searchText?: string }
+
+function localizeCountryOption(item: any, fallbackLabel: string, language: string): SearchableOption {
+  const value = String(item?.value ?? item?.id ?? item?.country ?? '')
+  const regionCode = String(item?.region_code ?? item?.iso ?? '').trim().toUpperCase()
+  const dialCode = String(item?.dial_code ?? '').trim()
+  const englishName = String(item?.english_name ?? item?.name ?? '').trim()
+  const providerLocalizedName = String(item?.localized_name ?? '').trim()
+  let regionName = ''
+  if (/^[A-Z]{2}$/.test(regionCode)) {
+    try {
+      regionName = new Intl.DisplayNames([language], { type: 'region' }).of(regionCode) || ''
+    } catch {
+      regionName = ''
+    }
+  }
+  const isChinese = language === 'zh-CN'
+  const name = isChinese
+    ? providerLocalizedName || regionName || englishName || fallbackLabel || value
+    : englishName || regionName || fallbackLabel || value
+  const details = [regionCode, dialCode].filter(Boolean).join(' · ') || value
+  return {
+    value,
+    label: `${name}${isChinese ? `（${details}）` : ` (${details})`}`,
+    searchText: [fallbackLabel, englishName, providerLocalizedName, regionCode, dialCode, value]
+      .filter(Boolean)
+      .join(' '),
+  }
+}
+
 function SearchableSelect({ value, options, placeholder, onChange }: {
   value: string
-  options: Array<{ value: string; label: string }>
+  options: SearchableOption[]
   placeholder?: string
   onChange: (v: string) => void
 }) {
@@ -51,10 +81,14 @@ function SearchableSelect({ value, options, placeholder, onChange }: {
   const inputRef = useRef<HTMLInputElement>(null)
 
   const filtered = search
-    ? options.filter(o => o.label.toLowerCase().includes(search.toLowerCase()) || o.value.includes(search))
+    ? options.filter(o =>
+        o.label.toLowerCase().includes(search.toLowerCase())
+        || o.searchText?.toLowerCase().includes(search.toLowerCase())
+        || o.value.includes(search)
+      )
     : options
 
-  const selectedLabel = options.find(o => o.value === value)?.label || ''
+  const selectedLabel = options.find(o => o.value.toLowerCase() === value.toLowerCase())?.label || value
 
   useEffect(() => {
     const handler = (e: MouseEvent) => {
@@ -69,10 +103,12 @@ function SearchableSelect({ value, options, placeholder, onChange }: {
   }, [open])
 
   return (
-    <div ref={containerRef} className="relative">
+    <div ref={containerRef} className="relative min-w-0 flex-1">
       <button
         type="button"
         onClick={() => { setOpen(!open); setSearch('') }}
+        aria-haspopup="listbox"
+        aria-expanded={open}
         className="control-surface w-full text-left flex items-center justify-between"
       >
         <span className={selectedLabel ? 'text-[var(--text-primary)]' : 'text-[var(--text-muted)]'}>
@@ -83,7 +119,7 @@ function SearchableSelect({ value, options, placeholder, onChange }: {
         </svg>
       </button>
       {open && (
-        <div className="absolute z-50 mt-1 w-full rounded-lg border border-[var(--border)] bg-[var(--bg-pane)] shadow-lg">
+        <div role="listbox" className="absolute z-50 mt-1 w-full rounded-lg border border-[var(--border)] bg-[var(--bg-pane)] shadow-lg">
           <div className="p-2 border-b border-[var(--border)]">
             <div className="relative">
               <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-[var(--text-muted)]" />
@@ -92,6 +128,9 @@ function SearchableSelect({ value, options, placeholder, onChange }: {
                 type="text"
                 value={search}
                 onChange={e => setSearch(e.target.value)}
+                onKeyDown={e => {
+                  if (e.key === 'Escape') setOpen(false)
+                }}
                 placeholder={t('providers.searchPlaceholder')}
                 className="w-full rounded-md border border-[var(--border)] bg-[var(--bg-base)] pl-8 pr-3 py-1.5 text-sm text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none focus:ring-1 focus:ring-[var(--accent)]"
               />
@@ -104,6 +143,8 @@ function SearchableSelect({ value, options, placeholder, onChange }: {
               <button
                 key={o.value}
                 type="button"
+                role="option"
+                aria-selected={o.value.toLowerCase() === value.toLowerCase()}
                 onClick={() => { onChange(o.value); setOpen(false); setSearch('') }}
                 className={`w-full text-left px-3 py-1.5 text-sm hover:bg-[var(--chip-bg)] ${
                   o.value === value ? 'bg-[var(--accent)]/10 text-[var(--accent)] font-medium' : 'text-[var(--text-primary)]'
@@ -128,12 +169,12 @@ function EditModal({
   provider: ProviderOption; setting: ProviderSetting | null; providerType: string
   onClose: () => void; onSaved: () => void
 }) {
-  const { t } = useI18n()
+  const { t, language } = useI18n()
   const fields = provider.fields || []
   const [form, setForm] = useState<Record<string, string>>(() => {
     const data: Record<string, string> = {}
     for (const field of fields) {
-      data[field.key] = (setting?.auth?.[field.key] || '') || (setting?.config?.[field.key] || '')
+      data[field.key] = (setting?.auth?.[field.key] || '') || (setting?.config?.[field.key] || '') || field.default_value || ''
     }
     return data
   })
@@ -144,46 +185,83 @@ function EditModal({
   const [testResult, setTestResult] = useState<{ ok: boolean; message?: string; error?: string } | null>(null)
   const [asyncOptions, setAsyncOptions] = useState<Record<string, Array<{ value: string; label: string }>>>({})
   const [asyncLoading, setAsyncLoading] = useState<Record<string, boolean>>({})
+  const [asyncErrors, setAsyncErrors] = useState<Record<string, string>>({})
 
-  // 加载 async-select 字段的选项
-  useEffect(() => {
-    for (const field of fields) {
-      if (field.type === 'async-select' && field.asyncUrl && !asyncOptions[field.key]) {
-        setAsyncLoading(prev => ({ ...prev, [field.key]: true }))
-        apiFetch(field.asyncUrl)
-          .then((data: any) => {
-            const valueKey = field.asyncValueKey || 'value'
-            const labelKey = field.asyncLabelKey || 'label'
-            // 支持多种响应格式
-            let items: any[] = []
-            if (Array.isArray(data)) items = data
-            else if (data?.countries) items = data.countries
-            else if (data?.services) items = data.services
-            else if (data?.data) items = Array.isArray(data.data) ? data.data : []
-
-            const options = items.map((item: any) => {
-              if (typeof item === 'object') {
-                const v = String(item[valueKey] ?? item.id ?? item.country ?? '')
-                const l = String(item[labelKey] ?? item.name ?? item.title ?? item.eng ?? v)
-                return { value: v, label: l ? `${l} (${v})` : v }
-              }
-              return { value: String(item), label: String(item) }
-            }).filter(o => o.value)
-            setAsyncOptions(prev => ({ ...prev, [field.key]: options }))
-          })
-          .catch(() => setAsyncOptions(prev => ({ ...prev, [field.key]: [] })))
-          .finally(() => setAsyncLoading(prev => ({ ...prev, [field.key]: false })))
-      }
-    }
-  }, []) // eslint-disable-line react-hooks/exhaustive-deps
-
-  const handleSave = async () => {
+  const splitFormValues = () => {
     const config: Record<string, string> = {}
     const auth: Record<string, string> = {}
     for (const field of fields) {
       if (field.category === 'auth') auth[field.key] = form[field.key] || ''
       else config[field.key] = form[field.key] || ''
     }
+    return { config, auth }
+  }
+
+  const loadAsyncOptions = async (field: (typeof fields)[number]) => {
+    if (!field.asyncUrl) return
+    setAsyncLoading(prev => ({ ...prev, [field.key]: true }))
+    setAsyncErrors(prev => ({ ...prev, [field.key]: '' }))
+    try {
+      const { config, auth } = splitFormValues()
+      const data = await apiFetch(field.asyncUrl, {
+        method: 'POST',
+        body: JSON.stringify({
+          provider_type: providerType,
+          provider_key: provider.value,
+          field_key: field.key,
+          config,
+          auth,
+        }),
+      })
+      if (data?.ok === false) throw new Error(data.error || t('providers.optionsLoadFailed'))
+      const valueKey = field.asyncValueKey || 'value'
+      const labelKey = field.asyncLabelKey || 'label'
+      let items: any[] = []
+      if (Array.isArray(data)) items = data
+      else if (Array.isArray(data?.options)) items = data.options
+      else if (Array.isArray(data?.countries)) items = data.countries
+      else if (Array.isArray(data?.services)) items = data.services
+      else if (Array.isArray(data?.data)) items = data.data
+
+      const options = items.map((item: any) => {
+        if (typeof item === 'object') {
+          const value = String(item[valueKey] ?? item.id ?? item.country ?? '')
+          const fallbackLabel = String(item[labelKey] ?? item.name ?? item.title ?? item.eng ?? value)
+          if (item.region_code || item.localized_name || item.dial_code) {
+            return localizeCountryOption({ ...item, value }, fallbackLabel, language)
+          }
+          return { value, label: fallbackLabel, searchText: fallbackLabel }
+        }
+        return { value: String(item), label: String(item) }
+      }).filter(option => option.value)
+      const currentValue = form[field.key] || ''
+      if (currentValue && !options.some(option => option.value.toLowerCase() === currentValue.toLowerCase())) {
+        options.unshift({ value: currentValue, label: `${currentValue} (${t('providers.currentValue')})` })
+      }
+      setAsyncOptions(prev => ({ ...prev, [field.key]: options }))
+    } catch (error: any) {
+      setAsyncErrors(prev => ({
+        ...prev,
+        [field.key]: error?.message || t('providers.optionsLoadFailed'),
+      }))
+    } finally {
+      setAsyncLoading(prev => ({ ...prev, [field.key]: false }))
+    }
+  }
+
+  // 加载 async-select 字段的选项
+  useEffect(() => {
+    const requiresCredential = provider.value === 'smsbower' || provider.value === 'herosms'
+    const hasCredential = fields.some(field => field.category === 'auth' && Boolean(form[field.key]))
+    for (const field of fields) {
+      if (field.type === 'async-select' && field.asyncUrl && (!requiresCredential || hasCredential)) {
+        void loadAsyncOptions(field)
+      }
+    }
+  }, []) // eslint-disable-line react-hooks/exhaustive-deps
+
+  const handleSave = async () => {
+    const { config, auth } = splitFormValues()
     setSaving(true)
     try {
       if (setting) {
@@ -213,12 +291,7 @@ function EditModal({
   }
 
   const handleTest = async () => {
-    const config: Record<string, string> = {}
-    const auth: Record<string, string> = {}
-    for (const field of fields) {
-      if (field.category === 'auth') auth[field.key] = form[field.key] || ''
-      else config[field.key] = form[field.key] || ''
-    }
+    const { config, auth } = splitFormValues()
     setTesting(true)
     setTestResult(null)
     try {
@@ -246,7 +319,7 @@ function EditModal({
             <h2 className="text-base font-semibold text-[var(--text-primary)]">{provider.label}</h2>
             {provider.description && <p className="mt-0.5 text-xs text-[var(--text-muted)]">{provider.description}</p>}
           </div>
-          <button onClick={onClose} className="text-[var(--text-muted)] hover:text-[var(--text-primary)]"><X className="h-4 w-4" /></button>
+          <button onClick={onClose} aria-label={t('common.close')} className="text-[var(--text-muted)] hover:text-[var(--text-primary)]"><X className="h-4 w-4" /></button>
         </div>
         <div className="flex-1 overflow-y-auto px-5 py-4 space-y-4">
           {fields.length === 0 ? (
@@ -269,16 +342,29 @@ function EditModal({
                       </span>
                     </div>
                   ) : field.type === 'async-select' ? (
-                    asyncLoading[field.key] ? (
-                      <div className="control-surface text-[var(--text-muted)] text-sm py-2">{t('common.loading')}</div>
-                    ) : (
-                      <SearchableSelect
-                        value={form[field.key] || ''}
-                        options={asyncOptions[field.key] || []}
-                        placeholder={field.placeholder}
-                        onChange={v => setForm(f => ({ ...f, [field.key]: v }))}
-                      />
-                    )
+                    <div>
+                      <div className="flex items-start gap-2">
+                        <SearchableSelect
+                          value={form[field.key] || ''}
+                          options={asyncOptions[field.key] || []}
+                          placeholder={asyncLoading[field.key] ? t('common.loading') : field.placeholder}
+                          onChange={v => setForm(f => ({ ...f, [field.key]: v }))}
+                        />
+                        <button
+                          type="button"
+                          onClick={() => void loadAsyncOptions(field)}
+                          disabled={asyncLoading[field.key]}
+                          className="table-action-btn h-[37px] w-[37px] p-0"
+                          title={t('providers.reloadOptions')}
+                          aria-label={t('providers.reloadOptions')}
+                        >
+                          <RefreshCw className={`h-3.5 w-3.5 ${asyncLoading[field.key] ? 'animate-spin' : ''}`} />
+                        </button>
+                      </div>
+                      {asyncErrors[field.key] && (
+                        <p className="mt-1.5 text-xs text-red-500">{asyncErrors[field.key]}</p>
+                      )}
+                    </div>
                   ) : field.type === 'select' && field.options?.length ? (
                     <select value={form[field.key] || ''} onChange={e => setForm(f => ({ ...f, [field.key]: e.target.value }))} className="control-surface appearance-none">
                       {field.options.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
@@ -324,16 +410,16 @@ function EditModal({
         )}
 
         {/* Footer */}
-        <div className="flex gap-2 border-t border-[var(--border)] px-5 py-3">
-          <Button onClick={handleSave} disabled={saving} className="flex-1">
+        <div className="flex gap-1.5 border-t border-[var(--border)] px-3 py-3 sm:gap-2 sm:px-5">
+          <Button onClick={handleSave} disabled={saving} className="min-w-0 flex-1 whitespace-nowrap">
             <Save className="h-3.5 w-3.5 mr-1.5" />
             {saved ? `${t('common.saved')} ✓` : saving ? t('common.saving') : t('common.save')}
           </Button>
-          <Button variant="outline" onClick={handleTest} disabled={testing || fields.length === 0} className="flex-1">
+          <Button variant="outline" onClick={handleTest} disabled={testing || fields.length === 0} className="min-w-0 flex-1 whitespace-nowrap">
             <FlaskConical className="h-3.5 w-3.5 mr-1.5" />
             {testing ? t('providers.testing') : t('providers.testConnection')}
           </Button>
-          <Button variant="outline" onClick={onClose}>{t('common.cancel')}</Button>
+          <Button variant="outline" onClick={onClose} className="whitespace-nowrap">{t('common.cancel')}</Button>
         </div>
       </div>
     </div>
@@ -459,7 +545,7 @@ export default function ProviderCards({ providerType, catalog, settings, onReloa
 
     return (
       <div key={key}>
-        <div className="flex items-center gap-3 rounded-lg border border-[var(--border)] bg-[var(--bg-card)] px-4 py-3">
+        <div className="flex flex-col items-stretch gap-3 rounded-lg border border-[var(--border)] bg-[var(--bg-card)] px-4 py-3 sm:flex-row sm:items-center">
           {/* Left: name + desc + badge */}
           <div className="min-w-0 flex-1">
             <div className="flex items-center gap-2">
@@ -467,12 +553,12 @@ export default function ProviderCards({ providerType, catalog, settings, onReloa
               {isDefault && <Badge variant="success">{t('providers.default')}</Badge>}
             </div>
             {provider.description && (
-              <p className="mt-0.5 text-xs text-[var(--text-muted)] line-clamp-1">{provider.description}</p>
+              <p className="mt-0.5 text-xs text-[var(--text-muted)] line-clamp-2 sm:line-clamp-1">{provider.description}</p>
             )}
           </div>
 
           {/* Right: actions */}
-          <div className="flex items-center gap-2 shrink-0">
+          <div className="flex min-w-0 flex-wrap items-center justify-end gap-1.5 sm:shrink-0 sm:gap-2">
             <button
               onClick={() => hasFields && isEnabled ? setEditTarget({ provider, setting }) : undefined}
               disabled={!hasFields || !isEnabled}

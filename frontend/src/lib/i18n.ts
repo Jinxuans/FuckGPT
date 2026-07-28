@@ -136,7 +136,7 @@ const ZH_MESSAGES = {
   "settings.provider.mailboxUsage":
     "只有在注册身份选择“系统邮箱”时，才会使用这里的邮箱服务配置。列表行内可以直接查看详情、编辑、设默认和删除。",
   "settings.provider.smsUsage":
-    "用于后续自动绑定手机号流程。当前只负责保存 SMSBower 配置；测试按钮只做本地配置校验，不会购买手机号。",
+    "用于 Codex OAuth 的 add_phone 自动绑定流程。支持 SMSBower、HeroSMS、SMSPool、5sim 和 SMSToMe；测试连接不会购买手机号。",
   "settings.provider.proxyUsage":
     "用于保存 API 提取或旋转网关代理配置。当前 ChatGPT 注册任务仍需在注册弹窗选择或填写代理；批量检测会自动尝试已启用的代理服务。",
   "settings.provider.captchaUsage":
@@ -309,6 +309,9 @@ const ZH_MESSAGES = {
   "accounts.outlookPoolRequired": "协议注册必须填写 Outlook 账号池",
   "accounts.outlookAliasHint": "每个 Outlook 母邮箱自动分配 6 个 +reg 子邮箱，并按收件人隔离验证码。",
   "accounts.protocolVerificationSummary": "内置 Sentinel + Outlook 邮箱 OTP",
+  "accounts.preferPasswordRegistration": "优先使用密码注册",
+  "accounts.preferPasswordRegistrationHint":
+    "默认开启，浏览器会主动进入密码创建页。关闭后保留邮箱验证码入口；若服务端仍要求密码，流程会继续自动处理。",
   "accounts.autoUploadSub2Api": "注册成功后上传 Agent Identity 到 Sub2API",
   "accounts.autoUploadSub2ApiHint":
     "每个账号注册成功后立即上传；使用 Sub2API Admin API Key，不会保存到任务或本地配置。",
@@ -350,6 +353,9 @@ const ZH_MESSAGES = {
   "providers.selectPlaceholder": "请选择...",
   "providers.searchPlaceholder": "搜索...",
   "providers.noMatches": "无匹配结果",
+  "providers.reloadOptions": "重新加载选项",
+  "providers.optionsLoadFailed": "选项加载失败",
+  "providers.currentValue": "当前值",
   "providers.testRequestFailed": "测试请求失败",
   "providers.testFailed": "测试失败",
   "providers.noConfig": "此服务无需额外配置。",
@@ -561,7 +567,7 @@ const EN_MESSAGES: Record<TranslationKey, string> = {
   "settings.provider.mailboxUsage":
     "Mailbox services are used only when the registration identity is “System Mailbox”. Rows support details, editing, default selection, and deletion.",
   "settings.provider.smsUsage":
-    "Reserved for automatic phone binding. This page currently saves SMSBower settings only; the test button validates local config and will not purchase a number.",
+    "Used by Codex OAuth during add_phone. Supports SMSBower, HeroSMS, SMSPool, 5sim, and SMSToMe; connection tests never purchase a number.",
   "settings.provider.proxyUsage":
     "Save API extraction or rotating gateway proxy settings. ChatGPT registration still uses the proxy chosen in the registration dialog; batch checks can automatically try enabled proxy services.",
   "settings.provider.captchaUsage":
@@ -744,6 +750,9 @@ const EN_MESSAGES: Record<TranslationKey, string> = {
   "accounts.outlookPoolRequired": "Outlook account pool is required for protocol registration",
   "accounts.outlookAliasHint": "Each parent Outlook inbox is assigned six +reg child addresses, with OTPs isolated by recipient.",
   "accounts.protocolVerificationSummary": "Built-in Sentinel + Outlook email OTP",
+  "accounts.preferPasswordRegistration": "Prefer password registration",
+  "accounts.preferPasswordRegistrationHint":
+    "Enabled by default. The browser proactively opens the password creation page. When disabled, it keeps the email-code entry path; a server-requested password step is still handled automatically.",
   "accounts.autoUploadSub2Api": "Upload Agent Identity to Sub2API after registration",
   "accounts.autoUploadSub2ApiHint":
     "Uploads each account immediately after it registers successfully using a Sub2API Admin API Key; it is never saved to the task or local settings.",
@@ -788,6 +797,9 @@ const EN_MESSAGES: Record<TranslationKey, string> = {
   "providers.selectPlaceholder": "Select...",
   "providers.searchPlaceholder": "Search...",
   "providers.noMatches": "No matching results",
+  "providers.reloadOptions": "Reload options",
+  "providers.optionsLoadFailed": "Failed to load options",
+  "providers.currentValue": "Current value",
   "providers.testRequestFailed": "Test request failed",
   "providers.testFailed": "Test failed",
   "providers.noConfig": "This service does not require extra configuration.",

@@ -9,6 +9,7 @@ export type ProviderField = {
   key: string
   label: string
   placeholder?: string
+  default_value?: string
   secret?: boolean
   category?: string
   hint?: string

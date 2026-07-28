@@ -58,6 +58,39 @@ class ProviderTestRequest(BaseModel):
     auth: dict[str, str] = Field(default_factory=dict)
 
 
+class ProviderOptionsRequest(ProviderTestRequest):
+    field_key: str
+
+
+@router.post("/options")
+def list_provider_options(body: ProviderOptionsRequest):
+    """Load provider-owned select options using the credentials in the edit form."""
+    if body.provider_type != "sms":
+        return {"ok": False, "error": "当前 provider 不支持动态选项", "options": []}
+
+    from infrastructure.provider_definitions_repository import ProviderDefinitionsRepository
+    from providers.registry import create_provider, load_all
+
+    definition = ProviderDefinitionsRepository().get_by_key("sms", body.provider_key)
+    if not definition:
+        return {"ok": False, "error": f"未找到 provider 定义: {body.provider_key}", "options": []}
+    try:
+        load_all()
+        client = create_provider("sms", definition.driver_type or body.provider_key, {**body.config, **body.auth})
+        if body.field_key.endswith("_default_service"):
+            options = client.list_service_options()
+        elif body.field_key.endswith("_default_country") or body.field_key == "smstome_country_slugs":
+            options = client.list_country_options()
+        else:
+            return {"ok": False, "error": f"不支持的选项字段: {body.field_key}", "options": []}
+        return {"ok": True, "options": options}
+    except Exception as exc:  # noqa: BLE001
+        message = str(exc)
+        if body.provider_key == "smsbower" and "API Key 未配置" in message:
+            return {"ok": False, "error": "请先填写 SMSBower API Key", "options": []}
+        return {"ok": False, "error": f"{definition.label} 选项加载失败: {message}", "options": []}
+
+
 @router.post("/test")
 def test_provider(body: ProviderTestRequest):
     """测试 provider 配置是否正确。"""
@@ -76,7 +109,7 @@ def test_provider(body: ProviderTestRequest):
     elif body.provider_type == "captcha":
         return {"ok": True, "message": "验证码服务暂不支持在线测试，请在注册任务中验证"}
     elif body.provider_type == "sms":
-        return _test_sms(definition.driver_type or body.provider_key, extra)
+        return _test_sms(definition.driver_type or body.provider_key, extra, definition.label)
     elif body.provider_type == "proxy":
         return _test_proxy(definition.driver_type or body.provider_key, extra)
     return {"ok": False, "error": f"不支持测试的 provider 类型: {body.provider_type}"}
@@ -116,27 +149,29 @@ def _test_mailbox(driver_type: str, extra: dict, definition) -> dict:
         }
 
 
-def _test_sms(driver_type: str, extra: dict) -> dict:
+def _test_sms(driver_type: str, extra: dict, label: str = "短信服务") -> dict:
     """通过余额接口测试短信 provider 配置，不购买手机号。"""
-    if driver_type != "smsbower":
-        return {"ok": False, "error": f"未找到短信驱动: {driver_type}"}
+    from providers.registry import create_provider, load_all
 
-    from core.smsbower_sms import DEFAULT_BASE_URL, SMSBowerClient
-
-    client = SMSBowerClient.from_config(extra)
-    if not client.api_key:
-        return {"ok": False, "error": "SMSBower API Key 未配置"}
     try:
+        load_all()
+        client = create_provider("sms", driver_type, extra)
+        configuration_error = getattr(client, "configuration_error", lambda: "")()
+        if configuration_error:
+            return {"ok": False, "error": configuration_error}
+        if hasattr(client, "test_connection"):
+            details = client.test_connection()
+            return {"ok": True, **dict(details or {})}
         balance = client.get_balance()
         balance_text = f"{balance:g}"
         return {
             "ok": True,
-            "message": f"SMSBower 连接成功，账户余额：{balance_text}",
+            "message": f"{label} 连接成功，账户余额：{balance_text}",
             "balance": balance,
-            "base_url": client.base_url or DEFAULT_BASE_URL,
+            "base_url": getattr(client, "base_url", ""),
         }
     except Exception as exc:  # noqa: BLE001
-        return {"ok": False, "error": f"SMSBower 连接失败: {str(exc)}"}
+        return {"ok": False, "error": f"{label} 连接失败: {str(exc)}"}
 
 
 def _mask_proxy(proxy_url: str) -> str:
