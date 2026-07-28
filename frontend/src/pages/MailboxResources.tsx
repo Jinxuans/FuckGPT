@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { Ban, Copy, RefreshCw, RotateCcw, Search, Trash2, UserPlus, X } from "lucide-react";
+import { Copy, RefreshCw, RotateCcw, Search, Trash2, UserPlus, X } from "lucide-react";
 import { apiFetch } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
@@ -61,6 +61,9 @@ type MailboxResource = {
   chatgpt_account_id?: number | null;
   chatgpt_account_email?: string;
   link_id?: string;
+  allocation_id?: string;
+  allocation_status?: string;
+  allocation_reason?: string;
   updated_at?: string;
   created_at?: string;
 };
@@ -90,15 +93,24 @@ const statusOptions = [
   { value: "all", label: "全部状态" },
   { value: "available", label: "空闲" },
   { value: "allocated", label: "已分配" },
-  { value: "registered", label: "已注册" },
+  { value: "bound", label: "已绑定" },
+  { value: "expired", label: "已过期" },
+  { value: "archived", label: "已归档" },
   { value: "disabled", label: "禁用" },
 ];
 
 function statusLabel(status?: string) {
   const normalized = String(status || "").toLowerCase();
-  if (normalized === "registered") return "已注册";
+  if (normalized === "bound" || normalized === "registered") return "已绑定";
   if (normalized === "allocated") return "已分配";
   if (normalized === "available") return "空闲";
+  if (normalized === "expired") return "已过期";
+  if (normalized === "archived") return "已归档";
+  if (normalized === "active") return "进行中";
+  if (normalized === "succeeded") return "成功";
+  if (normalized === "failed") return "失败（已回池）";
+  if (normalized === "cancelled") return "已取消（已回池）";
+  if (normalized === "interrupted") return "已中断（已回池）";
   if (normalized === "disabled" || normalized === "inactive") return "禁用";
   if (normalized === "error") return "异常";
   return status || "未知";
@@ -106,18 +118,20 @@ function statusLabel(status?: string) {
 
 function statusPillClass(status?: string) {
   const normalized = String(status || "").toLowerCase();
-  if (normalized === "registered") return "bg-emerald-500/10 text-emerald-500 ring-emerald-500/20";
+  if (normalized === "bound" || normalized === "registered") return "bg-emerald-500/10 text-emerald-500 ring-emerald-500/20";
   if (normalized === "allocated") return "bg-amber-500/10 text-amber-500 ring-amber-500/20";
-  if (normalized === "disabled" || normalized === "inactive" || normalized === "error") return "bg-red-500/10 text-red-500 ring-red-500/20";
+  if (["disabled", "inactive", "error", "expired"].includes(normalized)) return "bg-red-500/10 text-red-500 ring-red-500/20";
+  if (normalized === "archived") return "bg-slate-500/10 text-slate-400 ring-slate-500/20";
   if (normalized === "available") return "bg-blue-500/10 text-blue-500 ring-blue-500/20";
   return "bg-[var(--text-primary)]/5 text-[var(--text-secondary)] ring-[var(--border)]";
 }
 
 function statusDotClass(status?: string) {
   const normalized = String(status || "").toLowerCase();
-  if (normalized === "registered") return "bg-emerald-500 shadow-[0_0_4px_rgba(16,185,129,0.6)]";
+  if (normalized === "bound" || normalized === "registered") return "bg-emerald-500 shadow-[0_0_4px_rgba(16,185,129,0.6)]";
   if (normalized === "allocated") return "bg-amber-500 shadow-[0_0_4px_rgba(245,158,11,0.6)]";
-  if (normalized === "disabled" || normalized === "inactive" || normalized === "error") return "bg-red-500 shadow-[0_0_4px_rgba(239,68,68,0.6)]";
+  if (["disabled", "inactive", "error", "expired"].includes(normalized)) return "bg-red-500 shadow-[0_0_4px_rgba(239,68,68,0.6)]";
+  if (normalized === "archived") return "bg-slate-400";
   if (normalized === "available") return "bg-blue-500";
   return "bg-gray-400";
 }
@@ -212,7 +226,7 @@ function ActionMenu({
     setOpen(false);
     onAction(resource, action);
   };
-  const canRegister = resource.status !== "registered" && !resource.chatgpt_account_id && resource.mailbox_status !== "disabled";
+  const canRegister = resource.status === "available" && !resource.chatgpt_account_id;
 
   return (
     <div className="flex items-center justify-end gap-2">
@@ -238,32 +252,15 @@ function ActionMenu({
             用此邮箱注册
           </button>
           <button
-            onClick={() => run("bind")}
-            disabled={Boolean(resource.chatgpt_account_id)}
-            className="w-full px-3 py-2 text-left text-xs text-[var(--text-secondary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)] disabled:opacity-40"
-          >
-            绑定账号
-          </button>
-          <button
-            onClick={() => run("unlink")}
-            disabled={!resource.chatgpt_account_id}
-            className="w-full px-3 py-2 text-left text-xs text-[var(--text-secondary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)] disabled:opacity-40"
-          >
-            解绑账号
-          </button>
-          <button
             onClick={() => run("release")}
-            disabled={!resource.reserved || resource.status === "registered"}
+            disabled={resource.status !== "allocated"}
             className="w-full px-3 py-2 text-left text-xs text-[var(--text-secondary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)] disabled:opacity-40"
           >
             释放邮箱
           </button>
-          <button onClick={() => run("disable")} className="w-full px-3 py-2 text-left text-xs text-[var(--text-secondary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]">
-            禁用邮箱
-          </button>
           <div className="my-1 border-t border-[var(--border)]/70" />
           <button onClick={() => run("delete")} className="w-full px-3 py-2 text-left text-xs text-[#f0b0b0] transition-colors hover:bg-[rgba(239,68,68,0.08)] hover:text-[#ffd5d5]">
-            删除记录
+            归档记录
           </button>
         </div>,
         document.body,
@@ -461,6 +458,15 @@ function DetailModal({
                       <div className="mt-1 break-all text-xs text-[var(--text-muted)]">{resource.chatgpt_account_email}</div>
                     ) : null}
                   </div>
+                  <div>
+                    <div className="text-xs text-[var(--text-muted)]">最近分配历史</div>
+                    <div className="mt-1 text-[var(--text-primary)]">
+                      {resource.allocation_status ? statusLabel(resource.allocation_status) : "暂无"}
+                    </div>
+                    {resource.allocation_reason ? (
+                      <div className="mt-1 break-all text-xs text-[var(--text-muted)]">{resource.allocation_reason}</div>
+                    ) : null}
+                  </div>
                   <div className="grid gap-3 sm:grid-cols-2">
                     <div>
                       <div className="text-xs text-[var(--text-muted)]">地址类型</div>
@@ -535,6 +541,7 @@ export default function MailboxResources() {
   const visibleResources = useMemo(() => {
     const needle = search.trim().toLowerCase();
     return payload.resources.filter((item) => {
+      if (statusFilter === "all" && item.status === "archived") return false;
       if (statusFilter !== "all" && item.status !== statusFilter) return false;
       if (providerFilter !== "all" && item.provider !== providerFilter) return false;
       if (needle) {
@@ -558,7 +565,7 @@ export default function MailboxResources() {
   const visibleIds = useMemo(() => visibleResources.map((item) => item.id), [visibleResources]);
   const allVisibleSelected = visibleIds.length > 0 && visibleIds.every((id) => selectedIds.has(id));
   const selectedCount = selectedIds.size;
-  const selectedRegistrableCount = selectedResources.filter((item) => item.status !== "registered" && !item.chatgpt_account_id && item.mailbox_status !== "disabled").length;
+  const selectedRegistrableCount = selectedResources.filter((item) => item.status === "available" && !item.chatgpt_account_id).length;
 
   useEffect(() => {
     setSelectedIds((current) => {
@@ -622,45 +629,8 @@ export default function MailboxResources() {
     await load();
   };
 
-  const unlinkResource = async (resource: MailboxResource) => {
-    const link = linkByAddressId.get(resource.mailbox_address_id);
-    if (!link) return;
-    if (!confirm(`解绑 ${resource.address} 与 ChatGPT #${link.account_id}？`)) return;
-    await apiFetch(`/mailboxes/accounts/${link.account_id}/link?platform=${encodeURIComponent(link.platform)}&purpose=${encodeURIComponent(link.purpose || "verification")}`, {
-      method: "DELETE",
-    });
-    await load();
-  };
-
-  const bindResource = async (resource: MailboxResource) => {
-    if (!resource.mailbox_address_id) return;
-    const accountId = window.prompt("ChatGPT 账号 ID");
-    if (!accountId) return;
-    const accountEmail = window.prompt("ChatGPT 账号邮箱，可留空") || "";
-    await apiFetch("/mailboxes/account-link", {
-      method: "POST",
-      body: JSON.stringify({
-        platform: "chatgpt",
-        account_id: Number(accountId),
-        account_email: accountEmail,
-        mailbox_address_id: resource.mailbox_address_id,
-        purpose: "verification",
-      }),
-    });
-    await load();
-  };
-
-  const disableMailbox = async (resource: MailboxResource) => {
-    if (!confirm(`禁用邮箱来源 ${resource.parent_email || resource.address}？`)) return;
-    await apiFetch(`/mailboxes/accounts/${resource.mailbox_account_id}`, {
-      method: "PATCH",
-      body: JSON.stringify({ status: "disabled" }),
-    });
-    await load();
-  };
-
   const deleteMailbox = async (resource: MailboxResource) => {
-    if (!confirm(`删除邮箱来源 ${resource.parent_email || resource.address}？该来源下地址和绑定都会删除。`)) return;
+    if (!confirm(`归档邮箱 ${resource.address}？资源会从日常使用中隐藏，但分配和绑定历史会保留。`)) return;
     await apiFetch(`/mailboxes/accounts/${resource.mailbox_account_id}`, { method: "DELETE" });
     if (detail?.id === resource.id) setDetail(null);
     await load();
@@ -678,7 +648,7 @@ export default function MailboxResources() {
 
   const registerWithMailbox = async (resource: MailboxResource) => {
     if (!resource.mailbox_address_id) return;
-    if (resource.status === "registered" || resource.chatgpt_account_id) {
+    if (resource.status === "bound" || resource.status === "registered" || resource.chatgpt_account_id) {
       throw new Error("该邮箱已注册或已绑定账号");
     }
     if (!confirm(`使用 ${resource.address} 注册 ChatGPT？`)) return;
@@ -720,7 +690,7 @@ export default function MailboxResources() {
         return;
       }
       if (action === "register") {
-        const candidates = items.filter((item) => item.status !== "registered" && !item.chatgpt_account_id && item.mailbox_status !== "disabled");
+        const candidates = items.filter((item) => item.status === "available" && !item.chatgpt_account_id);
         if (candidates.length === 0) throw new Error("选中项里没有可注册邮箱");
         if (!confirm(`使用 ${candidates.length} 个选中邮箱创建注册任务？`)) return;
         const results = await Promise.allSettled(candidates.map(createRegisterTask));
@@ -735,28 +705,18 @@ export default function MailboxResources() {
         return;
       }
       if (action === "release") {
-        const candidates = items.filter((item) => item.reserved && item.status !== "registered");
+        const candidates = items.filter((item) => item.status === "allocated");
         if (candidates.length === 0) throw new Error("选中项里没有可释放邮箱");
         if (!confirm(`释放 ${candidates.length} 个选中邮箱？`)) return;
         await Promise.all(candidates.map((item) => apiFetch(`/mailboxes/addresses/${item.mailbox_address_id}/release`, { method: "POST" })));
         setNotice(`已释放 ${candidates.length} 个邮箱`);
       }
-      if (action === "disable") {
-        const accountIds = Array.from(new Set(items.map((item) => item.mailbox_account_id).filter(Boolean)));
-        if (accountIds.length === 0) throw new Error("选中项里没有可禁用来源");
-        if (!confirm(`禁用 ${accountIds.length} 个邮箱来源？`)) return;
-        await Promise.all(accountIds.map((id) => apiFetch(`/mailboxes/accounts/${id}`, {
-          method: "PATCH",
-          body: JSON.stringify({ status: "disabled" }),
-        })));
-        setNotice(`已禁用 ${accountIds.length} 个邮箱来源`);
-      }
       if (action === "delete") {
         const accountIds = Array.from(new Set(items.map((item) => item.mailbox_account_id).filter(Boolean)));
-        if (accountIds.length === 0) throw new Error("选中项里没有可删除来源");
-        if (!confirm(`删除 ${accountIds.length} 个邮箱来源？该来源下地址和绑定都会删除。`)) return;
+        if (accountIds.length === 0) throw new Error("选中项里没有可归档资源");
+        if (!confirm(`归档 ${accountIds.length} 个邮箱资源？分配和绑定历史会保留。`)) return;
         await Promise.all(accountIds.map((id) => apiFetch(`/mailboxes/accounts/${id}`, { method: "DELETE" })));
-        setNotice(`已删除 ${accountIds.length} 个邮箱来源`);
+        setNotice(`已归档 ${accountIds.length} 个邮箱资源`);
       }
       setSelectedIds(new Set());
       await load();
@@ -774,10 +734,7 @@ export default function MailboxResources() {
       if (action === "copy") await copyAddress(resource.address);
       if (action === "messages") await fetchMessages(resource);
       if (action === "register") await registerWithMailbox(resource);
-      if (action === "bind") await bindResource(resource);
-      if (action === "unlink") await unlinkResource(resource);
       if (action === "release") await releaseAddress(resource);
-      if (action === "disable") await disableMailbox(resource);
       if (action === "delete") await deleteMailbox(resource);
     } catch (exc: any) {
       setError(exc?.message || "操作失败");
@@ -839,7 +796,7 @@ export default function MailboxResources() {
           <div className="flex flex-wrap items-center gap-2 text-xs text-[var(--text-muted)]">
             <span className="rounded border border-[var(--border)] bg-[var(--bg-card)] px-2 py-1">共 {payload.resources.length}</span>
             {selectedCount ? <span className="rounded border border-[var(--accent-edge)] bg-[var(--accent-soft)] px-2 py-1 text-[var(--text-primary)]">已选 {selectedCount}</span> : null}
-            <span className="rounded border border-[var(--border)] bg-[var(--bg-card)] px-2 py-1">已注册 {counts.registered || 0}</span>
+            <span className="rounded border border-[var(--border)] bg-[var(--bg-card)] px-2 py-1">已绑定 {counts.bound || counts.registered || 0}</span>
             <span className="rounded border border-[var(--border)] bg-[var(--bg-card)] px-2 py-1">已分配 {counts.allocated || 0}</span>
             <span className="rounded border border-[var(--border)] bg-[var(--bg-card)] px-2 py-1">空闲 {counts.available || 0}</span>
           </div>
@@ -860,13 +817,9 @@ export default function MailboxResources() {
               <RotateCcw className="mr-1.5 h-3.5 w-3.5" />
               释放
             </Button>
-            <Button variant="outline" size="sm" onClick={() => runBulkAction("disable")} disabled={Boolean(bulkAction)} className="h-7 px-2.5 text-xs">
-              <Ban className="mr-1.5 h-3.5 w-3.5" />
-              禁用来源
-            </Button>
             <Button variant="outline" size="sm" onClick={() => runBulkAction("delete")} disabled={Boolean(bulkAction)} className="h-7 px-2.5 text-xs text-red-400 hover:text-red-300">
               <Trash2 className="mr-1.5 h-3.5 w-3.5" />
-              删除来源
+              归档资源
             </Button>
             <Button variant="ghost" size="sm" onClick={() => setSelectedIds(new Set())} disabled={Boolean(bulkAction)} className="h-7 px-2.5 text-xs">
               取消选择
