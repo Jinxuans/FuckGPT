@@ -117,7 +117,6 @@ def test_provider(body: ProviderTestRequest):
 
 def _test_mailbox(driver_type: str, extra: dict, definition) -> dict:
     """尝试用给定配置创建一个邮箱，验证配置是否正确。"""
-    import traceback
     from core.base_mailbox import MAILBOX_FACTORY_REGISTRY
 
     factory = MAILBOX_FACTORY_REGISTRY.get(driver_type)
@@ -142,10 +141,17 @@ def _test_mailbox(driver_type: str, extra: dict, definition) -> dict:
             "email": account.email,
         }
     except Exception as exc:
+        message = str(exc)
+        for key, value in extra.items():
+            key_lower = str(key or "").lower()
+            if not any(marker in key_lower for marker in ("key", "token", "secret", "password", "bearer", "auth")):
+                continue
+            secret = str(value or "")
+            if secret:
+                message = message.replace(secret, "***")
         return {
             "ok": False,
-            "error": f"测试失败: {str(exc)}",
-            "detail": traceback.format_exc()[-500:],
+            "error": f"测试失败: {message}",
         }
 
 
