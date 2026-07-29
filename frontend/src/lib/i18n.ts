@@ -312,21 +312,6 @@ const ZH_MESSAGES = {
   "accounts.preferPasswordRegistration": "优先使用密码注册",
   "accounts.preferPasswordRegistrationHint":
     "默认开启，浏览器会主动进入密码创建页。关闭后保留邮箱验证码入口；若服务端仍要求密码，流程会继续自动处理。",
-  "accounts.autoUploadSub2Api": "注册成功后上传 Agent Identity 到 Sub2API",
-  "accounts.autoUploadSub2ApiHint":
-    "每个账号注册成功后立即上传；使用 Sub2API Admin API Key，不会保存到任务或本地配置。",
-  "accounts.configureSub2Api": "配置 Sub2API 地址和 API Key",
-  "accounts.sub2ApiConfigTitle": "Sub2API 上传配置",
-  "accounts.sub2ApiConfigHint": "填写受信任的 Sub2API 管理端地址。默认本机端口为 8080。",
-  "accounts.sub2ApiUrl": "Sub2API 地址",
-  "accounts.sub2ApiAdminApiKey": "Sub2API Admin API Key",
-  "accounts.sub2ApiApiKeyHint": "将以 X-API-Key 请求管理端导入接口；密钥仅保留在当前弹窗内存中。",
-  "accounts.saveSub2ApiConfig": "保存配置",
-  "accounts.sub2ApiConfigRequired": "请先填写 Sub2API 地址和 Admin API Key",
-  "accounts.agentIdentityUploading": "正在生成并上传 Agent Identity 到 Sub2API…",
-  "accounts.agentIdentityUploaded": "已上传 {count} 个 Agent Identity 到 Sub2API",
-  "accounts.agentIdentityUploadFailed": "Sub2API 上传失败",
-  "accounts.agentIdentityNoSuccessfulAccounts": "任务中没有可上传的成功账号",
 
   "advanced.solver.statusChecking": "检测中",
   "advanced.solver.running": "运行中",
@@ -753,21 +738,6 @@ const EN_MESSAGES: Record<TranslationKey, string> = {
   "accounts.preferPasswordRegistration": "Prefer password registration",
   "accounts.preferPasswordRegistrationHint":
     "Enabled by default. The browser proactively opens the password creation page. When disabled, it keeps the email-code entry path; a server-requested password step is still handled automatically.",
-  "accounts.autoUploadSub2Api": "Upload Agent Identity to Sub2API after registration",
-  "accounts.autoUploadSub2ApiHint":
-    "Uploads each account immediately after it registers successfully using a Sub2API Admin API Key; it is never saved to the task or local settings.",
-  "accounts.configureSub2Api": "Configure Sub2API URL and API Key",
-  "accounts.sub2ApiConfigTitle": "Sub2API Upload Configuration",
-  "accounts.sub2ApiConfigHint": "Enter a trusted Sub2API admin URL. The default local port is 8080.",
-  "accounts.sub2ApiUrl": "Sub2API URL",
-  "accounts.sub2ApiAdminApiKey": "Sub2API Admin API Key",
-  "accounts.sub2ApiApiKeyHint": "The key is sent as X-API-Key to the admin import endpoint and remains only in this dialog's memory.",
-  "accounts.saveSub2ApiConfig": "Save Configuration",
-  "accounts.sub2ApiConfigRequired": "Enter the Sub2API URL and Admin API Key first",
-  "accounts.agentIdentityUploading": "Generating and uploading Agent Identity to Sub2API…",
-  "accounts.agentIdentityUploaded": "Uploaded {count} Agent Identity account(s) to Sub2API",
-  "accounts.agentIdentityUploadFailed": "Sub2API upload failed",
-  "accounts.agentIdentityNoSuccessfulAccounts": "This task has no successful accounts to upload",
 
   "advanced.solver.statusChecking": "Checking",
   "advanced.solver.running": "Running",

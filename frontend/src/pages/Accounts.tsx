@@ -258,13 +258,9 @@ function RegisterModal({
   const [platformProxyValue, setPlatformProxyValue] = useState('')
   const [outlookPoolText, setOutlookPoolText] = useState('')
   const [preferPasswordRegistration, setPreferPasswordRegistration] = useState(true)
-  const [autoUploadSub2Api, setAutoUploadSub2Api] = useState(false)
   const [autoCodexOAuth, setAutoCodexOAuth] = useState(false)
   const [codexOAuthBrowserMode, setCodexOAuthBrowserMode] = useState('headless')
   const [keepCodexBrowserOpen, setKeepCodexBrowserOpen] = useState(false)
-  const [sub2ApiConfigOpen, setSub2ApiConfigOpen] = useState(false)
-  const [sub2ApiUrl, setSub2ApiUrl] = useState('http://127.0.0.1:8080')
-  const [sub2ApiApiKey, setSub2ApiApiKey] = useState('')
   const [startError, setStartError] = useState('')
   const [selection, setSelection] = useState({
     identityProvider: 'mailbox',
@@ -371,13 +367,8 @@ function RegisterModal({
     setStarting(true)
     setStartError('')
     try {
-      if (autoUploadSub2Api && (!sub2ApiUrl.trim() || !sub2ApiApiKey.trim())) {
-        setSub2ApiConfigOpen(true)
-        throw new Error(t('accounts.sub2ApiConfigRequired'))
-      }
       const extra: Record<string, any> = {
         identity_provider: selection.identityProvider,
-        auto_upload_sub2api_agent_identity: autoUploadSub2Api,
         auto_codex_oauth_after_register: autoCodexOAuth,
         codex_oauth_browser_mode: codexOAuthBrowserMode,
         codex_oauth_keep_browser_open: keepCodexBrowserOpen,
@@ -410,8 +401,6 @@ function RegisterModal({
           platform_proxy_value: platformProxyValue.trim(),
           mailbox_proxy_mode: 'follow_platform',
           mailbox_proxy_value: '',
-          sub2api_url: autoUploadSub2Api ? sub2ApiUrl.trim() : null,
-          sub2api_api_key: autoUploadSub2Api ? sub2ApiApiKey.trim() : null,
           extra,
         }),
       })
@@ -551,38 +540,6 @@ function RegisterModal({
                   <label className="flex cursor-pointer items-start gap-3">
                     <input
                       type="checkbox"
-                      checked={autoUploadSub2Api}
-                      onChange={(event) => {
-                        const enabled = event.target.checked
-                        setAutoUploadSub2Api(enabled)
-                        if (enabled) setSub2ApiConfigOpen(true)
-                      }}
-                      className="mt-0.5 h-4 w-4 accent-[var(--accent)]"
-                    />
-                    <span>
-                      <span className="block text-sm font-medium text-[var(--text-primary)]">
-                        {t('accounts.autoUploadSub2Api')}
-                      </span>
-                      <span className="mt-1 block text-xs text-[var(--text-muted)]">
-                        {t('accounts.autoUploadSub2ApiHint')}
-                      </span>
-                    </span>
-                  </label>
-                  {autoUploadSub2Api ? (
-                    <button
-                      type="button"
-                      onClick={() => setSub2ApiConfigOpen(true)}
-                      className="mt-3 text-xs text-[var(--accent)] hover:underline"
-                    >
-                      {t('accounts.configureSub2Api')}
-                    </button>
-                  ) : null}
-                </div>
-
-                <div className="rounded-xl border border-[var(--border)] bg-[var(--bg-pane)]/45 px-4 py-3">
-                  <label className="flex cursor-pointer items-start gap-3">
-                    <input
-                      type="checkbox"
                       checked={autoCodexOAuth}
                       onChange={(event) => setAutoCodexOAuth(event.target.checked)}
                       className="mt-0.5 h-4 w-4 accent-[var(--accent)]"
@@ -684,7 +641,7 @@ function RegisterModal({
 
                 <Button
                   onClick={start}
-                  disabled={starting || !selection.identityProvider || !selection.executorType || (selection.executorType === 'protocol' && !outlookPoolText.trim()) || (autoUploadSub2Api && (!sub2ApiUrl.trim() || !sub2ApiApiKey.trim()))}
+                  disabled={starting || !selection.identityProvider || !selection.executorType || (selection.executorType === 'protocol' && !outlookPoolText.trim())}
                   className="w-full"
                 >
                   {starting ? t('accounts.starting') : t('accounts.startAutoRegister')}
@@ -705,63 +662,6 @@ function RegisterModal({
           </Button>
         </div>
       </div>
-      {sub2ApiConfigOpen ? (
-        <div
-          className="fixed inset-0 z-[120] flex items-center justify-center bg-black/60 p-4"
-          onClick={(event) => {
-            event.stopPropagation()
-            setSub2ApiConfigOpen(false)
-          }}
-        >
-          <div
-            className="w-full max-w-md rounded-2xl border border-[var(--border)] bg-[var(--bg-card)] p-5 shadow-xl"
-            onClick={(event) => event.stopPropagation()}
-          >
-            <h3 className="text-base font-semibold text-[var(--text-primary)]">
-              {t('accounts.sub2ApiConfigTitle')}
-            </h3>
-            <p className="mt-1 text-xs text-[var(--text-muted)]">
-              {t('accounts.sub2ApiConfigHint')}
-            </p>
-            <label className="mt-4 block text-xs text-[var(--text-muted)]">
-              {t('accounts.sub2ApiUrl')}
-              <input
-                type="url"
-                value={sub2ApiUrl}
-                onChange={(event) => setSub2ApiUrl(event.target.value)}
-                placeholder="http://127.0.0.1:8080"
-                className="control-surface control-surface-compact mt-1 w-full font-mono text-xs"
-              />
-            </label>
-            <label className="mt-3 block text-xs text-[var(--text-muted)]">
-              {t('accounts.sub2ApiAdminApiKey')}
-              <input
-                type="password"
-                value={sub2ApiApiKey}
-                onChange={(event) => setSub2ApiApiKey(event.target.value)}
-                autoComplete="off"
-                placeholder="sk-..."
-                className="control-surface control-surface-compact mt-1 w-full font-mono text-xs"
-              />
-            </label>
-            <div className="mt-2 text-xs text-[var(--text-muted)]">
-              {t('accounts.sub2ApiApiKeyHint')}
-            </div>
-            <div className="mt-5 flex justify-end gap-2">
-              <Button variant="outline" size="sm" onClick={() => setSub2ApiConfigOpen(false)}>
-                {t('common.cancel')}
-              </Button>
-              <Button
-                size="sm"
-                disabled={!sub2ApiUrl.trim() || !sub2ApiApiKey.trim()}
-                onClick={() => setSub2ApiConfigOpen(false)}
-              >
-                {t('accounts.saveSub2ApiConfig')}
-              </Button>
-            </div>
-          </div>
-        </div>
-      ) : null}
     </div>
   )
 
@@ -1620,7 +1520,6 @@ function ExportMenu({
     { key: 'csv', label: '导出 CSV' },
     { key: 'any2api', label: '导出 Any2Api' },
     { key: 'sub2api', label: '导出 Sub2Api' },
-    { key: 'sub2api-agent-identity', label: '导出 Agent Identity (Sub2Api)' },
     { key: 'codex', label: '导出 Codex' },
     { key: 'cpa', label: '导出 CPA' },
   ]
