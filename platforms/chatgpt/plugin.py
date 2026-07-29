@@ -388,7 +388,13 @@ class _CodexSmsPhoneCallback:
     def mark_send_succeeded(self) -> None:
         if self.activation is None or self.sent:
             return
-        self.provider.mark_sms_sent(self.activation.activation_id)
+        try:
+            self.provider.mark_sms_sent(self.activation.activation_id)
+        except Exception as exc:
+            message = str(exc or "")
+            if "BAD_STATUS" not in message and "状态码无效" not in message:
+                raise
+            self._log(f"Codex OAuth 接码平台不接受已发送状态，继续轮询验证码: {message}")
         self.sent = True
 
     def mark_send_failed(self, reason: str = "") -> None:

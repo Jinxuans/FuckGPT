@@ -71,7 +71,16 @@ class FallbackMailbox(BaseMailbox):
         self._accounts: dict[str, BaseMailbox] = {}
 
     def _resolve(self, account: MailboxAccount) -> BaseMailbox:
-        provider_key = str((account.extra or {}).get("mailbox_provider_key") or "")
+        extra = account.extra or {}
+        provider_key = str(extra.get("mailbox_provider_key") or "").strip()
+        if not provider_key:
+            for context_key in ("provider_account", "provider_resource"):
+                context = extra.get(context_key)
+                if not isinstance(context, dict):
+                    continue
+                provider_key = str(context.get("provider_name") or context.get("provider_key") or "").strip()
+                if provider_key:
+                    break
         for key, mailbox in self.providers:
             if key == provider_key:
                 return mailbox

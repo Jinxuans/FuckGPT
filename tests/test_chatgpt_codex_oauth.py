@@ -22,6 +22,7 @@ from platforms.chatgpt.codex_oauth import (
     _detect_codex_next_step_from_dom,
     _do_add_phone_attempt,
     _resume_oauth_after_add_phone_success,
+    _submit_add_phone_number,
     build_codex_authorize_url,
     _drive_codex_oauth_page,
     _handle_account_chooser,
@@ -926,6 +927,226 @@ def test_phone_input_contains_accepts_formatted_local_number():
     assert actual == "+56 9 7123 4527"
 
 
+def test_submit_add_phone_number_clicks_structural_submit_in_phone_form(monkeypatch):
+    events = []
+
+    class Target:
+        def is_visible(self, **kwargs):
+            return True
+
+        def is_enabled(self, **kwargs):
+            return True
+
+        def click(self, **kwargs):
+            events.append(("click", kwargs.get("no_wait_after")))
+
+    class Locator:
+        def nth(self, index):
+            events.append(("nth", index))
+            return Target()
+
+    class Page:
+        def locator(self, selector):
+            events.append(("locator", selector))
+            return Locator()
+
+    monkeypatch.setattr(
+        "platforms.chatgpt.codex_oauth._inspect_add_phone_submission",
+        lambda *args: {"targetIndex": 2},
+    )
+    monkeypatch.setattr("platforms.chatgpt.codex_oauth._capture_add_phone_structure", lambda *args, **kwargs: "")
+    monkeypatch.setattr(
+        "platforms.chatgpt.codex_oauth._add_phone_submit_progress_state",
+        lambda *args: {"url": "https://auth.openai.com/add-phone", "phoneVisible": True},
+    )
+
+    result = _submit_add_phone_number(
+        Page(),
+        'input[type="tel"]',
+        log=lambda message: None,
+    )
+
+    assert result and "nth=2" in result
+    assert ("nth", 2) in events
+    assert ("click", True) in events
+
+
+def test_submit_add_phone_number_does_not_repeat_after_timeout_with_progress(monkeypatch):
+    events = []
+    states = iter(
+        [
+            {"url": "https://auth.openai.com/add-phone", "phoneVisible": True, "busy": False},
+            {"url": "https://auth.openai.com/add-phone", "phoneVisible": True, "busy": True},
+        ]
+    )
+
+    class Target:
+        def is_visible(self, **kwargs):
+            return True
+
+        def is_enabled(self, **kwargs):
+            return True
+
+        def click(self, **kwargs):
+            events.append("click")
+            raise RuntimeError("click timeout")
+
+    class Locator:
+        def nth(self, index):
+            return Target()
+
+    class Page:
+        def locator(self, selector):
+            events.append(("locator", selector))
+            return Locator()
+
+    monkeypatch.setattr(
+        "platforms.chatgpt.codex_oauth._inspect_add_phone_submission",
+        lambda *args: {"targetIndex": 0},
+    )
+    monkeypatch.setattr("platforms.chatgpt.codex_oauth._capture_add_phone_structure", lambda *args, **kwargs: "")
+    monkeypatch.setattr("platforms.chatgpt.codex_oauth._add_phone_submit_progress_state", lambda *args: next(states))
+    monkeypatch.setattr("platforms.chatgpt.codex_oauth.time.sleep", lambda seconds: None)
+    monkeypatch.setattr(
+        "platforms.chatgpt.codex_oauth._request_submit_add_phone_form",
+        lambda *args: (_ for _ in ()).throw(AssertionError("must not submit twice")),
+    )
+
+    result = _submit_add_phone_number(
+        Page(),
+        'input[type="tel"]',
+        log=lambda message: None,
+    )
+
+    assert result and "progress-after-click" in result
+    assert events.count("click") == 1
+
+
+def test_submit_add_phone_number_uses_enter_after_intercepted_click(monkeypatch):
+    events = []
+    base = {"url": "https://auth.openai.com/add-phone", "phoneVisible": True, "busy": False}
+    states = iter([base, dict(base), dict(base), {**base, "busy": True}])
+
+    class SubmitTarget:
+        def is_visible(self, **kwargs):
+            return True
+
+        def is_enabled(self, **kwargs):
+            return True
+
+        def click(self, **kwargs):
+            events.append("click")
+            raise RuntimeError("another element intercepts pointer events")
+
+    class PhoneTarget:
+        def is_visible(self, **kwargs):
+            return True
+
+        def is_enabled(self, **kwargs):
+            return True
+
+        def focus(self, **kwargs):
+            events.append("focus")
+
+        def press(self, key, **kwargs):
+            events.append(("press", key))
+
+    class Locator:
+        def __init__(self, target):
+            self.target = target
+
+        @property
+        def first(self):
+            return self.target
+
+        def nth(self, index):
+            return self.target
+
+    class Page:
+        def locator(self, selector):
+            if selector == 'input[type="tel"]':
+                return Locator(PhoneTarget())
+            return Locator(SubmitTarget())
+
+    monkeypatch.setattr(
+        "platforms.chatgpt.codex_oauth._inspect_add_phone_submission",
+        lambda *args: {"targetIndex": 0},
+    )
+    monkeypatch.setattr("platforms.chatgpt.codex_oauth._capture_add_phone_structure", lambda *args, **kwargs: "")
+    monkeypatch.setattr("platforms.chatgpt.codex_oauth._add_phone_submit_progress_state", lambda *args: next(states))
+    monkeypatch.setattr("platforms.chatgpt.codex_oauth.time.sleep", lambda seconds: None)
+    monkeypatch.setattr(
+        "platforms.chatgpt.codex_oauth._request_submit_add_phone_form",
+        lambda *args: (_ for _ in ()).throw(AssertionError("requestSubmit should not be needed")),
+    )
+
+    result = _submit_add_phone_number(
+        Page(),
+        'input[type="tel"]',
+        log=lambda message: None,
+    )
+
+    assert result == 'input[type="tel"] press=Enter'
+    assert events == ["click", "focus", ("press", "Enter")]
+
+
+def test_submit_add_phone_number_uses_request_submit_as_last_fallback(monkeypatch):
+    events = []
+    base = {"url": "https://auth.openai.com/add-phone", "phoneVisible": True, "busy": False}
+
+    class Target:
+        def is_visible(self, **kwargs):
+            return True
+
+        def is_enabled(self, **kwargs):
+            return True
+
+        def click(self, **kwargs):
+            events.append("click")
+            raise RuntimeError("click timeout")
+
+        def focus(self, **kwargs):
+            events.append("focus")
+
+        def press(self, key, **kwargs):
+            events.append(("press", key))
+
+    class Locator:
+        @property
+        def first(self):
+            return Target()
+
+        def nth(self, index):
+            return Target()
+
+    class Page:
+        def locator(self, selector):
+            return Locator()
+
+    monkeypatch.setattr(
+        "platforms.chatgpt.codex_oauth._inspect_add_phone_submission",
+        lambda *args: {"targetIndex": 0},
+    )
+    monkeypatch.setattr("platforms.chatgpt.codex_oauth._capture_add_phone_structure", lambda *args, **kwargs: "")
+    monkeypatch.setattr("platforms.chatgpt.codex_oauth._add_phone_submit_progress_state", lambda *args: dict(base))
+    monkeypatch.setattr("platforms.chatgpt.codex_oauth.time.sleep", lambda seconds: None)
+
+    def request_submit(*args):
+        events.append("requestSubmit")
+        return {"ok": True, "method": "form.requestSubmit"}
+
+    monkeypatch.setattr("platforms.chatgpt.codex_oauth._request_submit_add_phone_form", request_submit)
+
+    result = _submit_add_phone_number(
+        Page(),
+        'input[type="tel"]',
+        log=lambda message: None,
+    )
+
+    assert result == "form.requestSubmit"
+    assert events == ["click", "focus", ("press", "Enter"), "requestSubmit"]
+
+
 def test_select_text_message_delivery_prefers_sms_over_whatsapp(monkeypatch):
     class Page:
         def evaluate(self, script, keyword):
@@ -1054,6 +1275,27 @@ def test_add_phone_retries_send_via_whatsapp_on_fallback_prompt(monkeypatch):
     _do_add_phone_attempt(Page(), PhoneCallback(), log=lambda message: None, resume_url="")
 
     assert events == ["send", "select_whatsapp", "send", "send_succeeded"]
+
+
+def test_codex_phone_callback_treats_bad_sent_status_as_nonfatal():
+    logs = []
+
+    class Provider:
+        def mark_sms_sent(self, activation_id):
+            assert activation_id == "activation-1"
+            raise RuntimeError("SMSBower setStatus失败: 状态码无效 (BAD_STATUS)")
+
+    callback = _CodexSmsPhoneCallback(Provider(), log_fn=logs.append)
+    callback.activation = SmsActivation(
+        activation_id="activation-1",
+        phone_number="+573171000000",
+        provider="smsbower",
+    )
+
+    callback.mark_send_succeeded()
+
+    assert callback.sent is True
+    assert any("继续轮询验证码" in message for message in logs)
 
 
 def test_add_phone_retries_new_number_when_chinese_in_use_error(monkeypatch):

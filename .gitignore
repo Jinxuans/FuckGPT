@@ -73,6 +73,7 @@ docs/REFACTOR-PLAN.md
 /.codex-test-tmp/
 /.tools/
 /*.zip
+/output/playwright/
 
 # 敏感文件
 *.har

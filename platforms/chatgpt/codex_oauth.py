@@ -4,6 +4,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import secrets
 import sys
 import threading
@@ -247,6 +248,11 @@ PHONE_SEND_SELECTORS = [
     'button:has-text("发送")',
     'input[type="submit"]',
 ]
+
+PHONE_STRUCTURAL_SUBMIT_SELECTOR = (
+    'button[type="submit"], input[type="submit"], '
+    'form button:not([type]), button[form]:not([type])'
+)
 
 PHONE_TEXT_MESSAGE_SELECTORS = [
     'label:has-text("Text Message")',
@@ -924,13 +930,19 @@ def _delivery_option_state(page, keyword: str) -> dict[str, Any]:
                   && rect.width > 0 && rect.height > 0;
               };
               const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
-              const matches = (text) => {
+              const matches = (text, metadata) => {
                 const lowered = normalize(text).toLowerCase();
+                const stable = normalize(metadata).toLowerCase();
                 if (keyword === 'sms') {
-                  return (lowered.includes('text message') || lowered === 'sms' || lowered.includes('短信'))
-                    && !lowered.includes('whatsapp');
+                  return (
+                    /(^|[^a-z])(sms|text[-_ ]?message)([^a-z]|$)/i.test(stable)
+                    || lowered.includes('text message')
+                    || lowered === 'sms'
+                    || lowered.includes('短信')
+                    || lowered.includes('문자 메시지')
+                  ) && !stable.includes('whatsapp') && !lowered.includes('whatsapp');
                 }
-                return lowered.includes('whatsapp');
+                return stable.includes('whatsapp') || lowered.includes('whatsapp');
               };
               const candidates = [];
               const radios = Array.from(document.querySelectorAll('input[type="radio"]'));
@@ -945,7 +957,15 @@ def _delivery_option_state(page, keyword: str) -> dict[str, Any]:
                 } else if (el.matches('label')) {
                   input = el.querySelector('input[type="radio"]') || (el.htmlFor ? document.getElementById(el.htmlFor) : null);
                 }
-                if (!matches(text)) continue;
+                const metadata = [el, input].filter(Boolean).flatMap((node) => [
+                  node.getAttribute('value'),
+                  node.getAttribute('name'),
+                  node.getAttribute('id'),
+                  node.getAttribute('data-testid'),
+                  node.getAttribute('data-value'),
+                  node.getAttribute('aria-label'),
+                ]).filter(Boolean).join(' ');
+                if (!matches(text, metadata)) continue;
                 const radioIndex = input ? radios.indexOf(input) : -1;
                 if (radioIndex >= 0 && !radioIndices.includes(radioIndex)) radioIndices.push(radioIndex);
                 candidates.push({
@@ -969,6 +989,324 @@ def _delivery_option_state(page, keyword: str) -> dict[str, Any]:
         return result if isinstance(result, dict) else {}
     except Exception:
         return {}
+
+
+def _redact_add_phone_capture_text(value: Any) -> str:
+    text = str(value or "").replace("\r", " ").replace("\n", " ").strip()
+    text = re.sub(r"https?://[^\s]+", "[url]", text, flags=re.IGNORECASE)
+    text = re.sub(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", "[email]", text, flags=re.IGNORECASE)
+    text = re.sub(r"(?<!\d)\+?\d[\d\s().-]{6,}\d(?!\d)", "[phone]", text)
+    text = re.sub(r"\b\d{4,}\b", "[digits]", text)
+    return text[:240]
+
+
+def _inspect_add_phone_submission(page, phone_selector: str) -> dict[str, Any]:
+    """Return an allowlisted, value-free description of the phone form."""
+    try:
+        result = page.evaluate(
+            r"""
+            ({ phoneSelector, submitSelector }) => {
+              const visible = (el) => {
+                if (!el) return false;
+                const style = window.getComputedStyle(el);
+                const rect = el.getBoundingClientRect();
+                return style.display !== 'none' && style.visibility !== 'hidden'
+                  && rect.width > 0 && rect.height > 0;
+              };
+              const disabled = (el) => Boolean(
+                el.disabled || el.matches(':disabled') || el.getAttribute('aria-disabled') === 'true'
+              );
+              const redact = (value) => String(value || '')
+                .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, '[email]')
+                .replace(/\+?\d[\d\s().-]{6,}\d/g, '[phone]')
+                .replace(/\b\d{4,}\b/g, '[digits]')
+                .replace(/\s+/g, ' ')
+                .trim()
+                .slice(0, 100);
+              const phone = document.querySelector(phoneSelector);
+              const phoneForm = phone?.form || phone?.closest('form') || null;
+              const submitters = Array.from(document.querySelectorAll(submitSelector));
+              const submits = submitters.map((el, index) => {
+                const owner = el.form || el.closest('form') || null;
+                const style = window.getComputedStyle(el);
+                const rect = el.getBoundingClientRect();
+                const centerX = rect.left + (rect.width / 2);
+                const centerY = rect.top + (rect.height / 2);
+                const hit = rect.width > 0 && rect.height > 0
+                  ? document.elementFromPoint(centerX, centerY)
+                  : null;
+                return {
+                  index,
+                  tag: el.tagName.toLowerCase(),
+                  type: String(el.getAttribute('type') || '').slice(0, 30),
+                  name: String(el.getAttribute('name') || '').slice(0, 80),
+                  id: String(el.id || '').slice(0, 80),
+                  role: String(el.getAttribute('role') || '').slice(0, 40),
+                  testId: String(el.getAttribute('data-testid') || '').slice(0, 80),
+                  text: redact(el.innerText || el.textContent || el.value),
+                  visible: visible(el),
+                  disabled: disabled(el),
+                  busy: el.getAttribute('aria-busy') === 'true'
+                    || el.getAttribute('data-loading') === 'true'
+                    || el.getAttribute('data-state') === 'loading',
+                  pointerEvents: String(style.pointerEvents || ''),
+                  hasForm: Boolean(owner),
+                  sameForm: Boolean(phoneForm && owner === phoneForm),
+                  hitMatches: Boolean(hit && (hit === el || el.contains(hit))),
+                  hitTag: hit ? hit.tagName.toLowerCase() : '',
+                };
+              });
+              const eligible = submits.filter((item) => item.visible && !item.disabled);
+              const target = phoneForm
+                ? eligible.find((item) => item.sameForm)
+                : (eligible.length === 1 ? eligible[0] : null);
+              const dialogs = Array.from(document.querySelectorAll('[role="dialog"], [role="alertdialog"], [role="listbox"]'))
+                .filter(visible)
+                .slice(0, 5)
+                .map((el) => ({
+                  role: String(el.getAttribute('role') || ''),
+                  text: redact(el.innerText || el.textContent),
+                }));
+              return {
+                page: {
+                  url: `${location.origin}${location.pathname}`,
+                  lang: String(document.documentElement.lang || '').slice(0, 30),
+                  title: redact(document.title),
+                },
+                phone: {
+                  present: Boolean(phone),
+                  type: String(phone?.getAttribute('type') || '').slice(0, 30),
+                  name: String(phone?.getAttribute('name') || '').slice(0, 80),
+                  id: String(phone?.id || '').slice(0, 80),
+                  autocomplete: String(phone?.getAttribute('autocomplete') || '').slice(0, 50),
+                  visible: visible(phone),
+                  disabled: phone ? disabled(phone) : false,
+                  readOnly: Boolean(phone?.readOnly),
+                  hasForm: Boolean(phoneForm),
+                  formId: String(phoneForm?.id || '').slice(0, 80),
+                },
+                submits,
+                targetIndex: target ? target.index : null,
+                dialogs,
+              };
+            }
+            """,
+            {"phoneSelector": phone_selector, "submitSelector": PHONE_STRUCTURAL_SUBMIT_SELECTOR},
+        )
+        return result if isinstance(result, dict) else {}
+    except Exception:
+        return {}
+
+
+def _capture_add_phone_structure(
+    page,
+    phone_selector: str,
+    *,
+    stage: str,
+    click_error: Any = "",
+) -> str:
+    """Persist only allowlisted DOM metadata when explicitly enabled."""
+    capture_root = str(os.environ.get("CODEX_OAUTH_SAFE_CAPTURE_DIR") or "").strip()
+    if not capture_root:
+        return ""
+    try:
+        payload = _inspect_add_phone_submission(page, phone_selector)
+        payload["capturedAt"] = datetime.now(timezone.utc).isoformat()
+        payload["stage"] = re.sub(r"[^a-z0-9_-]+", "-", str(stage or "state").lower()).strip("-")[:50]
+        if click_error:
+            payload["clickError"] = _redact_add_phone_capture_text(click_error)
+        root = Path(capture_root)
+        root.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
+        path = root / f"codex_add_phone_{stamp}_{os.getpid()}.json"
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        return str(path.resolve())
+    except Exception:
+        return ""
+
+
+def _add_phone_submit_progress_state(page, phone_selector: str) -> dict[str, Any]:
+    try:
+        result = page.evaluate(
+            r"""
+            ({ phoneSelector, submitSelector }) => {
+              const visible = (el) => {
+                if (!el) return false;
+                const style = window.getComputedStyle(el);
+                const rect = el.getBoundingClientRect();
+                return style.display !== 'none' && style.visibility !== 'hidden'
+                  && rect.width > 0 && rect.height > 0;
+              };
+              const phone = document.querySelector(phoneSelector);
+              const codeInputs = Array.from(document.querySelectorAll(
+                'input[autocomplete="one-time-code"], input[name*="code" i], input[id*="code" i], input[data-testid*="otp" i]'
+              )).filter((el) => el !== phone && visible(el));
+              const phoneForm = phone?.form || phone?.closest('form') || null;
+              const submitters = Array.from(document.querySelectorAll(submitSelector));
+              const relevant = submitters.filter((el) => {
+                const owner = el.form || el.closest('form') || null;
+                return phoneForm ? owner === phoneForm : visible(el);
+              });
+              const busy = relevant.some((el) => Boolean(
+                el.disabled || el.matches(':disabled')
+                || el.getAttribute('aria-disabled') === 'true'
+                || el.getAttribute('aria-busy') === 'true'
+                || el.getAttribute('data-loading') === 'true'
+                || el.getAttribute('data-state') === 'loading'
+              ));
+              const alerts = Array.from(document.querySelectorAll('[role="alert"], [aria-live="assertive"]'))
+                .filter((el) => visible(el) && String(el.innerText || el.textContent || '').trim());
+              return {
+                url: `${location.origin}${location.pathname}${location.hash}`,
+                otpVisible: codeInputs.length > 0,
+                phoneVisible: visible(phone),
+                phoneLocked: Boolean(phone && (phone.disabled || phone.readOnly)),
+                busy,
+                alertCount: alerts.length,
+                alertLength: alerts.reduce((total, el) => total + String(el.innerText || el.textContent || '').length, 0),
+              };
+            }
+            """,
+            {"phoneSelector": phone_selector, "submitSelector": PHONE_STRUCTURAL_SUBMIT_SELECTOR},
+        )
+        return result if isinstance(result, dict) else {}
+    except Exception:
+        return {}
+
+
+def _add_phone_submission_progressed(before: dict[str, Any], after: dict[str, Any]) -> bool:
+    if not after:
+        return False
+    return bool(
+        (after.get("url") and after.get("url") != before.get("url"))
+        or (after.get("otpVisible") and not before.get("otpVisible"))
+        or (not after.get("phoneVisible", True) and before.get("phoneVisible", True))
+        or (after.get("phoneLocked") and not before.get("phoneLocked"))
+        or (after.get("busy") and not before.get("busy"))
+        or int(after.get("alertCount") or 0) > int(before.get("alertCount") or 0)
+        or int(after.get("alertLength") or 0) > int(before.get("alertLength") or 0)
+    )
+
+
+def _request_submit_add_phone_form(page, phone_selector: str) -> dict[str, Any]:
+    try:
+        result = page.evaluate(
+            r"""
+            ({ phoneSelector, submitSelector }) => {
+              const visible = (el) => {
+                if (!el) return false;
+                const style = window.getComputedStyle(el);
+                const rect = el.getBoundingClientRect();
+                return style.display !== 'none' && style.visibility !== 'hidden'
+                  && rect.width > 0 && rect.height > 0;
+              };
+              const enabled = (el) => Boolean(
+                el && !el.disabled && !el.matches(':disabled') && el.getAttribute('aria-disabled') !== 'true'
+              );
+              const phone = document.querySelector(phoneSelector);
+              const form = phone?.form || phone?.closest('form') || null;
+              const submitters = Array.from(document.querySelectorAll(submitSelector));
+              const eligible = submitters.filter((el) => visible(el) && enabled(el));
+              const submitter = form
+                ? eligible.find((el) => (el.form || el.closest('form') || null) === form)
+                : (eligible.length === 1 ? eligible[0] : null);
+              if (!submitter) return { ok: false, reason: 'no-structural-submitter' };
+              if (!form) {
+                submitter.click();
+                return { ok: true, method: 'element.click' };
+              }
+              if ((submitter.form || submitter.closest('form') || null) !== form) {
+                return { ok: false, reason: 'form-owner-mismatch' };
+              }
+              if (typeof form.checkValidity === 'function' && !form.checkValidity()) {
+                return {
+                  ok: false,
+                  reason: 'form-invalid',
+                  invalidCount: Array.from(form.elements || []).filter((el) => el.willValidate && !el.validity.valid).length,
+                };
+              }
+              if (typeof form.requestSubmit !== 'function') {
+                return { ok: false, reason: 'request-submit-unavailable' };
+              }
+              form.requestSubmit(submitter);
+              return { ok: true, method: 'form.requestSubmit' };
+            }
+            """,
+            {"phoneSelector": phone_selector, "submitSelector": PHONE_STRUCTURAL_SUBMIT_SELECTOR},
+        )
+        return result if isinstance(result, dict) else {}
+    except Exception as exc:
+        return {"ok": False, "reason": _redact_add_phone_capture_text(exc)}
+
+
+def _submit_add_phone_number(
+    page,
+    phone_selector: str,
+    *,
+    log: Callable[[str], None],
+    timeout: int = 8,
+    stage: str = "send",
+) -> str | None:
+    structure = _inspect_add_phone_submission(page, phone_selector)
+    capture_path = _capture_add_phone_structure(page, phone_selector, stage=f"{stage}-before")
+    if capture_path:
+        log(f"Codex OAuth add_phone: 已保存脱敏结构快照 {capture_path}")
+
+    target_index = structure.get("targetIndex")
+    if isinstance(target_index, int) and not isinstance(target_index, bool):
+        before = _add_phone_submit_progress_state(page, phone_selector)
+        click_error: Exception | None = None
+        try:
+            target = page.locator(PHONE_STRUCTURAL_SUBMIT_SELECTOR).nth(target_index)
+            target.click(timeout=min(max(int(timeout * 1000), 1000), 4000), no_wait_after=True)
+            return f"{PHONE_STRUCTURAL_SUBMIT_SELECTOR} nth={target_index}"
+        except Exception as exc:
+            click_error = exc
+            log(
+                "Codex OAuth add_phone: 结构化 submit 常规点击失败，观察页面状态后尝试表单兜底: "
+                f"{_redact_add_phone_capture_text(exc)}"
+            )
+        if click_error is not None:
+            time.sleep(0.8)
+            after = _add_phone_submit_progress_state(page, phone_selector)
+            if _add_phone_submission_progressed(before, after):
+                log("Codex OAuth add_phone: submit 点击虽返回异常，但页面已进入下一状态，不重复提交")
+                return f"{PHONE_STRUCTURAL_SUBMIT_SELECTOR} progress-after-click"
+            capture_path = _capture_add_phone_structure(
+                page,
+                phone_selector,
+                stage=f"{stage}-click-failed",
+                click_error=click_error,
+            )
+            if capture_path:
+                log(f"Codex OAuth add_phone: 已保存点击失败脱敏结构快照 {capture_path}")
+    else:
+        legacy_selector = _click_first_no_wait(page, PHONE_SEND_SELECTORS, timeout=timeout)
+        if legacy_selector:
+            return legacy_selector
+
+    before_enter = _add_phone_submit_progress_state(page, phone_selector)
+    try:
+        phone_input = page.locator(phone_selector).first
+        if phone_input.is_visible(timeout=500) and phone_input.is_enabled(timeout=500):
+            phone_input.focus(timeout=1000)
+            phone_input.press("Enter", timeout=2000)
+            time.sleep(0.8)
+            after_enter = _add_phone_submit_progress_state(page, phone_selector)
+            if _add_phone_submission_progressed(before_enter, after_enter):
+                log("Codex OAuth add_phone: 已通过手机号输入框 Enter 提交所属表单")
+                return f"{phone_selector} press=Enter"
+    except Exception as exc:
+        log(f"Codex OAuth add_phone: Enter 提交失败: {_redact_add_phone_capture_text(exc)}")
+
+    request_result = _request_submit_add_phone_form(page, phone_selector)
+    if request_result.get("ok"):
+        method = str(request_result.get("method") or "requestSubmit")
+        log(f"Codex OAuth add_phone: 已通过 {method} 提交手机号表单")
+        return method
+    reason = str(request_result.get("reason") or "unknown")
+    log(f"Codex OAuth add_phone: 表单结构化提交失败: {reason[:160]}")
+    return None
 
 
 def _select_delivery_radio_with_keyboard(page, state: dict[str, Any], keyword: str) -> bool:
@@ -1260,7 +1598,13 @@ def _do_add_phone_attempt(
     _select_text_message_delivery(page, log)
     time.sleep(0.5)
 
-    send_selector = _click_first_no_wait(page, PHONE_SEND_SELECTORS, timeout=8)
+    send_selector = _submit_add_phone_number(
+        page,
+        phone_selector,
+        log=log,
+        timeout=8,
+        stage="sms-send",
+    )
     if not send_selector:
         controls = _summarize_add_phone_controls(page)
         log(f"Codex OAuth add_phone: 未找到可见且可点击的发送按钮，页面控件={controls}")
@@ -1274,7 +1618,13 @@ def _do_add_phone_attempt(
         if not _select_whatsapp_delivery(page, log):
             raise RuntimeError(f"手机号提交失败，且未找到 WhatsApp 选项: {error_text[:200]}")
         time.sleep(0.5)
-        whatsapp_send_selector = _click_first_no_wait(page, PHONE_SEND_SELECTORS, timeout=8)
+        whatsapp_send_selector = _submit_add_phone_number(
+            page,
+            phone_selector,
+            log=log,
+            timeout=8,
+            stage="whatsapp-send",
+        )
         if not whatsapp_send_selector:
             raise RuntimeError("切换 WhatsApp 后未找到发送验证码按钮")
         log(f"Codex OAuth add_phone: 已点击 WhatsApp 发送按钮 {whatsapp_send_selector}")
