@@ -26,25 +26,13 @@ class RegisterTaskRequest(BaseModel):
     mailbox_proxy_value: str = ""
     executor_type: Literal["protocol", "headless", "headed"] = "headless"
     captcha_solver: str = "auto"
-    sub2api_url: Optional[str] = None
-    sub2api_api_key: Optional[str] = None
     extra: dict = Field(default_factory=dict)
 
 
 @router.post("/register")
 def create_register_task(body: RegisterTaskRequest):
-    payload = body.model_dump(exclude={"sub2api_url", "sub2api_api_key"})
+    payload = body.model_dump()
     extra = dict(body.extra or {})
-    upload_config = None
-    if bool(extra.get("auto_upload_sub2api_agent_identity")):
-        sub2api_url = str(body.sub2api_url or "").strip()
-        sub2api_api_key = str(body.sub2api_api_key or "").strip()
-        if not sub2api_url or not sub2api_api_key:
-            raise HTTPException(400, "自动上传 Sub2API 需要地址和 Admin API Key")
-        upload_config = {
-            "sub2api_url": sub2api_url,
-            "api_key": sub2api_api_key,
-        }
     extra["identity_provider"] = "mailbox"
     mail_provider = str(extra.get("mail_provider") or "").strip()
     mailbox_address_id = str(extra.get("mailbox_address_id") or "").strip()
@@ -82,11 +70,6 @@ def create_register_task(body: RegisterTaskRequest):
     payload["extra"] = extra
     if mail_provider:
         extra["mail_provider"] = mail_provider
-    if upload_config:
-        return command_service.create_register_task(
-            payload,
-            sub2api_upload=upload_config,
-        )
     return command_service.create_register_task(payload)
 
 

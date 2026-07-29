@@ -9,8 +9,6 @@ from application.tasks import (
     TASK_STATUS_FAILED,
     TASK_STATUS_INTERRUPTED,
     TERMINAL_TASK_STATUSES,
-    register_sub2api_upload_configs_guard,
-    set_register_sub2api_upload_config,
     create_register_task,
     get_task,
     list_task_events,
@@ -20,23 +18,8 @@ from services.task_runtime import task_runtime
 
 
 class TaskCommandsService:
-    def create_register_task(
-        self,
-        payload: dict,
-        *,
-        sub2api_upload: dict[str, str] | None = None,
-    ) -> dict:
-        # Keep the key out of the persistent task payload.  The shared guard
-        # prevents the runtime from claiming this task before its volatile
-        # upload config has been attached.
-        with register_sub2api_upload_configs_guard():
-            task = create_register_task(payload)
-            if sub2api_upload:
-                set_register_sub2api_upload_config(
-                    str(task["id"]),
-                    sub2api_url=sub2api_upload.get("sub2api_url", ""),
-                    api_key=sub2api_upload.get("api_key", ""),
-                )
+    def create_register_task(self, payload: dict) -> dict:
+        task = create_register_task(payload)
         task_runtime.wake_up()
         return task
 

@@ -69,41 +69,6 @@ STOP_REQUEST_TASK_STATUSES = TERMINAL_TASK_STATUSES | {TASK_STATUS_CANCEL_REQUES
 _task_locks: dict[str, threading.Lock] = {}
 _task_locks_guard = threading.Lock()
 
-# Sub2API Admin keys are intentionally volatile.  The browser submits them
-# when creating a task, but they are never put in task payloads, the SQLite
-# database, result data, or task logs.  The shared lock also makes attaching
-# the config atomic with task creation, before a worker may claim the task.
-_register_sub2api_upload_configs: dict[str, dict[str, str]] = {}
-_register_sub2api_upload_configs_guard = threading.RLock()
-
-
-def register_sub2api_upload_configs_guard() -> threading.RLock:
-    return _register_sub2api_upload_configs_guard
-
-
-def set_register_sub2api_upload_config(
-    task_id: str,
-    *,
-    sub2api_url: str,
-    api_key: str,
-) -> None:
-    with _register_sub2api_upload_configs_guard:
-        _register_sub2api_upload_configs[task_id] = {
-            "sub2api_url": str(sub2api_url or "").strip(),
-            "api_key": str(api_key or "").strip(),
-        }
-
-
-def get_register_sub2api_upload_config(task_id: str) -> dict[str, str] | None:
-    with _register_sub2api_upload_configs_guard:
-        config = _register_sub2api_upload_configs.get(task_id)
-        return dict(config) if config else None
-
-
-def clear_register_sub2api_upload_config(task_id: str) -> None:
-    with _register_sub2api_upload_configs_guard:
-        _register_sub2api_upload_configs.pop(task_id, None)
-
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
@@ -830,8 +795,6 @@ def execute_task(task_id: str) -> None:
 
     if logger.is_cancel_requested():
         logger.finish(TASK_STATUS_CANCELLED, error="任务在启动后立即被取消")
-        if task_type == TASK_TYPE_REGISTER:
-            clear_register_sub2api_upload_config(task_id)
         return
 
     handlers: dict[str, Callable[[dict[str, Any], TaskLogger], None]] = {
@@ -844,11 +807,7 @@ def execute_task(task_id: str) -> None:
     if not handler:
         logger.finish(TASK_STATUS_FAILED, error=f"未知任务类型: {task_type}")
         return
-    try:
-        handler(payload, logger)
-    finally:
-        if task_type == TASK_TYPE_REGISTER:
-            clear_register_sub2api_upload_config(task_id)
+    handler(payload, logger)
 
 
 def _resolve_registration_proxy_for_platform(
@@ -941,27 +900,6 @@ def _bounded_int(value: Any, default: int, *, minimum: int = 1, maximum: int | N
     return result
 
 
-def _upload_registered_chatgpt_account_to_sub2api(
-    account_id: int,
-    *,
-    sub2api_url: str,
-    api_key: str,
-) -> dict:
-    """Send exactly one newly saved Agent Identity to Sub2API."""
-    from application.account_exports import AccountExportsService
-    from domain.accounts import AccountExportSelection
-
-    return AccountExportsService().upload_chatgpt_agent_identity_to_sub2api(
-        AccountExportSelection(
-            platform="chatgpt",
-            ids=[int(account_id)],
-            select_all=False,
-        ),
-        sub2api_url=sub2api_url,
-        api_key=api_key,
-    )
-
-
 def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
     from core.proxy_pool import proxy_pool
 
@@ -973,12 +911,6 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
     extra = dict(payload.get("extra") or {})
     extra["_log_fn"] = logger.log
     task_id = str(getattr(logger, "task_id", "") or "")
-    sub2api_upload_enabled = bool(extra.get("auto_upload_sub2api_agent_identity"))
-    sub2api_upload_config = (
-        get_register_sub2api_upload_config(task_id)
-        if sub2api_upload_enabled and task_id
-        else None
-    )
     platform_proxy, platform_proxy_mode = _registration_platform_proxy(payload, proxy_pool.get_next)
     mailbox_proxy, mailbox_proxy_mode = _registration_mailbox_proxy(
         payload,
@@ -989,11 +921,6 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
     payload["extra"] = extra
 
     logger.set_progress(0, count)
-    if sub2api_upload_enabled and not sub2api_upload_config:
-        logger.log(
-            "已启用 Sub2API 自动上传，但当前任务缺少临时上传凭据；注册账号不会上传",
-            level="warning",
-        )
     try:
         get(platform_name)
     except Exception as exc:
@@ -1066,12 +993,7 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
         logger.finish(TASK_STATUS_FAILED, error=f"邮箱初始化失败: {exc}")
         return
 
-    upload_lock = threading.Lock()
-    uploaded_count = 0
-    upload_failures: list[str] = []
-
     def _do_one(index: int) -> dict[str, Any] | str:
-        nonlocal uploaded_count
         if logger.is_cancel_requested():
             return "__cancel_requested__"
         subtask_id = f"worker_{index + 1}"
@@ -1170,28 +1092,6 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
                         f"{account.email} 注册成功，但 Codex OAuth 授权失败: {post_codex_oauth.get('error') or 'unknown'}",
                         level="warning",
                     )
-            if sub2api_upload_config:
-                if logger.is_cancel_requested():
-                    return "__cancel_requested__"
-                logger.log(f"正在上传 {account.email} 的 Agent Identity 到 Sub2API")
-                try:
-                    _upload_registered_chatgpt_account_to_sub2api(
-                        saved_account_id,
-                        sub2api_url=sub2api_upload_config["sub2api_url"],
-                        api_key=sub2api_upload_config["api_key"],
-                    )
-                except Exception as upload_exc:
-                    upload_error = str(upload_exc)
-                    with upload_lock:
-                        upload_failures.append(upload_error)
-                    logger.log(
-                        f"{account.email} 的 Agent Identity 上传失败：{upload_error}",
-                        level="error",
-                    )
-                else:
-                    with upload_lock:
-                        uploaded_count += 1
-                    logger.log(f"{account.email} 的 Agent Identity 已上传到 Sub2API")
             logger.record_success()
             logger.log(f"注册成功: {account.email}")
             item = {
@@ -1294,14 +1194,7 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
         "fail": len(errors),
         "account_ids": [item["account_id"] for item in registered_accounts],
         "accounts": registered_accounts,
-        "auto_upload_sub2api_agent_identity": sub2api_upload_enabled,
     }
-    if sub2api_upload_enabled:
-        result_data["sub2api_agent_identity_upload"] = {
-            "submitted": uploaded_count,
-            "failed": len(upload_failures),
-            "errors": upload_failures,
-        }
     logger.set_result_data(result_data)
     logger.log(f"完成: 成功 {success} 个, 失败 {len(errors)} 个", event_type="summary")
     if logger.is_cancel_requested():
