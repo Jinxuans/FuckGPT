@@ -49,23 +49,24 @@ def _timestamp_name(prefix: str, suffix: str) -> str:
     return f"{prefix}_{timestamp}.{suffix}"
 
 
-def _credential_value(item: AccountRecord, *keys: str) -> str:
+def _credential_value(item: AccountRecord, *keys: str, scope: str = "platform") -> str:
     for key in keys:
         for credential in item.credentials or []:
-            if credential.get("scope") == "platform" and credential.get("key") == key and credential.get("value"):
+            if (
+                credential.get("scope") == scope
+                and credential.get("key") == key
+                and credential.get("value")
+            ):
                 return str(credential["value"])
     return ""
 
 
-def _legacy_extra_value(item: AccountRecord, *keys: str) -> str:
-    legacy_extra = (item.overview or {}).get("legacy_extra")
-    if not isinstance(legacy_extra, dict):
+def _codex_view_value(item: AccountRecord, key: str) -> str:
+    codex = (item.account_view or {}).get("codex")
+    if not isinstance(codex, dict):
         return ""
-    for key in keys:
-        value = legacy_extra.get(key)
-        if value not in (None, ""):
-            return str(value)
-    return ""
+    value = codex.get(key)
+    return str(value) if value not in (None, "") else ""
 
 
 def _mailbox_provider_name(item: AccountRecord) -> str:
@@ -212,41 +213,38 @@ def _make_sub2api_json(item: AccountRecord) -> dict:
 def _make_cockpit_token(item: AccountRecord) -> dict:
     chatgpt_payload = _chatgpt_export_payload(item)
     access_token = (
-        _credential_value(item, "codex_access_token")
-        or _legacy_extra_value(item, "codex_access_token")
+        _credential_value(item, "codex_access_token", scope="codex")
         or chatgpt_payload["access_token"]
     )
     refresh_token = (
-        _credential_value(item, "codex_refresh_token")
-        or _legacy_extra_value(item, "codex_refresh_token")
+        _credential_value(item, "codex_refresh_token", scope="codex")
         or chatgpt_payload["refresh_token"]
     )
     id_token = (
-        _credential_value(item, "codex_id_token")
-        or _legacy_extra_value(item, "codex_id_token")
+        _credential_value(item, "codex_id_token", scope="codex")
         or chatgpt_payload["id_token"]
     )
     auth_info = _chatgpt_auth_info(access_token, id_token)
     account_id = (
-        _credential_value(item, "codex_account_id")
-        or _legacy_extra_value(item, "codex_account_id")
+        _codex_view_value(item, "account_id")
+        or _credential_value(item, "codex_account_id", scope="codex")
         or str(auth_info.get("chatgpt_account_id", "") or auth_info.get("account_id", "") or "")
         or chatgpt_payload["account_id"]
     )
     email = (
-        _credential_value(item, "codex_email")
-        or _legacy_extra_value(item, "codex_email")
+        _codex_view_value(item, "email")
+        or _credential_value(item, "codex_email", scope="codex")
         or chatgpt_payload["email"]
     )
     last_refresh = (
-        _credential_value(item, "codex_last_refresh")
-        or _legacy_extra_value(item, "codex_last_refresh")
+        _codex_view_value(item, "last_refresh")
+        or _credential_value(item, "codex_last_refresh", scope="codex")
         or chatgpt_payload["last_refresh"]
         or ""
     )
     expired = (
-        _credential_value(item, "codex_expires_at")
-        or _legacy_extra_value(item, "codex_expires_at")
+        _codex_view_value(item, "expires_at")
+        or _credential_value(item, "codex_expires_at", scope="codex")
         or ""
     )
     if not expired and access_token:

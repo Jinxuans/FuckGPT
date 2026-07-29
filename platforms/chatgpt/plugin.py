@@ -1,6 +1,7 @@
 """ChatGPT / Codex CLI 平台插件"""
 import secrets
 import time
+from datetime import datetime, timezone
 
 from core.base_platform import BasePlatform, Account, AccountStatus, RegisterConfig
 from core.base_mailbox import BaseMailbox
@@ -40,13 +41,15 @@ def _resolve_registration_auth_mode(extra: dict | None) -> str:
     if direct:
         return direct
     overview = payload.get("account_overview") if isinstance(payload.get("account_overview"), dict) else {}
-    legacy = overview.get("legacy_extra") if isinstance(overview.get("legacy_extra"), dict) else {}
-    stored = str(legacy.get("registration_auth_mode") or "").strip().lower()
-    if stored:
-        return stored
-    profile = payload.get("profile") if isinstance(payload.get("profile"), dict) else legacy.get("profile")
+    structured = str(overview.get("registration_auth_mode") or "").strip().lower()
+    if structured:
+        return structured
+    profile = payload.get("profile") if isinstance(payload.get("profile"), dict) else overview.get("profile")
     profile = profile if isinstance(profile, dict) else {}
-    amr = [str(item or "").strip().lower() for item in profile.get("amr") or []]
+    amr = [
+        str(item or "").strip().lower()
+        for item in (profile.get("amr") or overview.get("amr") or [])
+    ]
     if any("otp_email" in item for item in amr):
         return "email_otp"
     return ""
@@ -59,6 +62,177 @@ def _mask_phone_number(value) -> str:
     if len(text) <= 8:
         return "***"
     return f"{text[:4]}****{text[-4:]}"
+
+
+def _utcnow_iso() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _normalize_plan(value) -> str:
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return ""
+    if any(token in raw for token in ("team", "enterprise", "business")):
+        return "team"
+    if any(token in raw for token in ("plus", "pro", "premium", "paid")):
+        return "plus"
+    if raw in {"free", "basic", "starter", "hobby"}:
+        return "free"
+    return raw
+
+
+def _normalize_usage_plan(value) -> str:
+    """Mirror subscription._plan for an explicit wham plan_type."""
+    normalized = _normalize_plan(value)
+    return normalized if normalized in {"plus", "team", "free"} else "free"
+
+
+def _plan_state(plan: str) -> str:
+    normalized = _normalize_plan(plan)
+    if normalized in {"plus", "team"}:
+        return "subscribed"
+    if normalized == "free":
+        return "free"
+    if "trial" in normalized:
+        return "trial"
+    if normalized in {"expired", "invalid", "banned"}:
+        return "expired"
+    return "unknown"
+
+
+def _string_list(value) -> list[str]:
+    if not isinstance(value, (list, tuple, set)):
+        return []
+    return [str(item).strip() for item in value if str(item or "").strip()]
+
+
+def _optional_bool(value):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value or "").strip().lower()
+    if text in {"1", "true", "yes", "on", "enabled"}:
+        return True
+    if text in {"0", "false", "no", "off", "disabled"}:
+        return False
+    return None
+
+
+def _security_from_profile(profile: dict, base: dict | None = None) -> dict:
+    base = base if isinstance(base, dict) else {}
+    profile = profile if isinstance(profile, dict) else {}
+
+    phone_keys = {"phone_bound", "phone_number_masked", "phone_number", "phoneNumber"}
+    phone_observed = any(key in base for key in phone_keys) or any(key in profile for key in phone_keys)
+    phone_value = (
+        base.get("phone_number_masked")
+        or base.get("phone_number")
+        or base.get("phoneNumber")
+        or profile.get("phone_number_masked")
+        or profile.get("phone_number")
+        or profile.get("phoneNumber")
+        or ""
+    )
+    phone_number_masked = _mask_phone_number(phone_value)
+    explicit_phone_bound = None
+    for payload in (base, profile):
+        if "phone_bound" in payload:
+            explicit_phone_bound = _optional_bool(payload.get("phone_bound"))
+            break
+    phone_bound = bool(phone_number_masked) if explicit_phone_bound is None else explicit_phone_bound
+
+    amr_observed = "amr" in base or "amr" in profile
+    amr = _string_list(base.get("amr")) or _string_list(profile.get("amr"))
+    explicit_mfa = None
+    mfa_observed = False
+    for payload in (base, profile):
+        for key in ("mfa_enabled", "has_mfa", "mfa"):
+            if key not in payload:
+                continue
+            mfa_observed = True
+            explicit_mfa = _optional_bool(payload.get(key))
+            if explicit_mfa is not None:
+                break
+        if explicit_mfa is not None:
+            break
+    mfa_enabled = explicit_mfa if explicit_mfa is not None else any("mfa" in item.lower() for item in amr)
+    security: dict = {}
+    if phone_observed:
+        security.update(
+            {
+                "phone_bound": bool(phone_bound),
+                "phone_number_masked": phone_number_masked,
+            }
+        )
+    if mfa_observed or amr_observed:
+        security.update({"mfa_enabled": bool(mfa_enabled), "amr": amr})
+    return security
+
+
+def _build_account_state_summary(
+    *,
+    valid: bool | None,
+    status,
+    source,
+    profile: dict | None,
+    usage: dict | None,
+    base: dict | None = None,
+) -> dict:
+    """Normalize check_valid and query_state into one persistence shape."""
+    base = base if isinstance(base, dict) else {}
+    profile = profile if isinstance(profile, dict) else {}
+    usage = usage if isinstance(usage, dict) else {}
+
+    # wham's explicit plan_type is authoritative, even when it is ``free``.
+    usage_plan = usage.get("plan_type")
+    plan = (
+        _normalize_usage_plan(usage_plan)
+        if str(usage_plan or "").strip()
+        else _normalize_plan(status)
+    )
+    plan_state = _plan_state(plan)
+    chips = []
+    if plan == "plus":
+        chips.append("Plus")
+    elif plan == "team":
+        chips.append("Team")
+    elif plan == "free":
+        chips.append("Free")
+
+    security = _security_from_profile(profile, base)
+    if security.get("phone_bound"):
+        chips.append("已绑手机")
+    check_source = (
+        "backend-api/wham/usage"
+        if str(usage_plan or "").strip()
+        else str(
+            source
+            or base.get("check_source")
+            or base.get("subscription_source")
+            or ""
+        ).strip()
+    )
+    summary = {
+        "checked_at": str(base.get("checked_at") or _utcnow_iso()),
+        "check_source": check_source,
+        "subscription_source": check_source,
+        "plan": plan,
+        "plan_name": plan,
+        "plan_state": plan_state,
+        "chips": chips,
+        **security,
+        "chatgpt_usage": usage,
+    }
+    if valid is not None:
+        summary["valid"] = bool(valid)
+    else:
+        error = base.get("last_error") or base.get("subscription_error") or base.get("profile_error")
+        if error not in (None, "", {}):
+            summary["last_error"] = str(error)
+    if "remote_email" in base or "email" in profile:
+        summary["remote_email"] = str(base.get("remote_email") or profile.get("email") or "").strip()
+    return summary
 
 
 def _int_setting(value, default: int, *, minimum: int = 1) -> int:
@@ -268,6 +442,13 @@ class ChatGPTPlatform(BasePlatform):
             a.id_token = extra.get("id_token", "")
             a.cookies = extra.get("cookies", "")
             a.extra = extra
+            a.account_id = (
+                extra.get("account_id")
+                or extra.get("chatgpt_account_id")
+                or getattr(account, "user_id", "")
+                or ""
+            )
+            a.chatgpt_account_id = a.account_id
 
             region = str(getattr(account, "region", "") or extra.get("region", "") or "").strip()
             configured_proxy = self.config.proxy if self.config else None
@@ -287,43 +468,16 @@ class ChatGPTPlatform(BasePlatform):
                     if should_report and proxy:
                         proxy_pool.report_success(proxy)
                     status = details.get("status")
-                    # 把订阅状态同步映射成前端能用的 plan_state / chips
-                    # 来源（避免老 chips 还带 "Plus" 但实际已 free）。
-                    if status == "plus":
-                        plan_state = "subscribed"
-                        chips = ["Plus"]
-                    elif status == "team":
-                        plan_state = "subscribed"
-                        chips = ["Team"]
-                    elif status == "free":
-                        plan_state = "free"
-                        chips = ["Free"]
-                    elif status in ("expired", "invalid", "banned"):
-                        plan_state = "expired"
-                        chips = []
-                    else:
-                        plan_state = "unknown"
-                        chips = []
-                    overview = {
-                        "plan": status,
-                        "plan_name": status,
-                        "plan_state": plan_state,
-                        "chips": chips,
-                        "check_source": details.get("source"),
-                    }
-                    me = details.get("me")
-                    if isinstance(me, dict):
-                        phone_number = _mask_phone_number(me.get("phone_number"))
-                        overview["phone_bound"] = bool(phone_number)
-                        if phone_number:
-                            overview["phone_number_masked"] = phone_number
-                            overview["chips"].append("已绑手机")
-                        if me.get("email"):
-                            overview["remote_email"] = str(me.get("email") or "")
-                    if isinstance(details.get("usage"), dict):
-                        overview["chatgpt_usage"] = details["usage"]
+                    valid = status not in ("expired", "invalid", "banned", None)
+                    overview = _build_account_state_summary(
+                        valid=valid,
+                        status=status,
+                        source=details.get("source"),
+                        profile=details.get("me"),
+                        usage=details.get("usage"),
+                    )
                     self._last_check_overview = overview
-                    return status not in ("expired", "invalid", "banned", None)
+                    return valid
                 except Exception:
                     if should_report and proxy:
                         proxy_pool.report_fail(proxy)
@@ -705,6 +859,21 @@ class ChatGPTPlatform(BasePlatform):
             id_token=a.id_token,
             proxy=proxy,
         )
+        summary = _build_account_state_summary(
+            valid=data.get("valid") if isinstance(data.get("valid"), bool) else None,
+            status=data.get("subscription_status") or data.get("plan"),
+            source=data.get("subscription_source") or data.get("check_source"),
+            profile=data.get("profile"),
+            usage=data.get("chatgpt_usage"),
+            base=data,
+        )
+        data.update(summary)
+        # Keep the established action response fields while making them agree
+        # with the canonical summary used by account checks and persistence.
+        if summary.get("plan"):
+            data["subscription_status"] = summary["plan"]
+        if summary.get("check_source"):
+            data["subscription_source"] = summary["check_source"]
         data["local_app_account"] = read_current_codex_account()
         data["desktop_app_state"] = get_codex_desktop_state()
         return {"ok": True, "data": data}

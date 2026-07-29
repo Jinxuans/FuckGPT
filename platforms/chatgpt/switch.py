@@ -352,33 +352,52 @@ def fetch_chatgpt_account_state(
     resolved_access = access_token
 
     if resolved_access:
-        ok, profile = _fetch_profile(resolved_access, proxy=proxy)
-        state["valid"] = ok
-        if ok:
-            state["profile"] = profile
-            try:
-                from platforms.chatgpt.subscription import fetch_subscription_status_details
+        try:
+            # Use the same detector as ``ChatGPTPlatform.check_valid``.  It
+            # can fall back to wham/usage when /me is unavailable, preventing
+            # query_state and batch checks from persisting opposite validity
+            # results for the same remote response.
+            from platforms.chatgpt.subscription import fetch_subscription_status_details
 
-                class _A:
-                    pass
+            class _A:
+                pass
 
-                account = _A()
-                account.access_token = resolved_access
-                account.chatgpt_account_id = chatgpt_account_id
-                account.id_token = id_token
-                account.cookies = cookies
-                account.extra = {"chatgpt_account_id": chatgpt_account_id}
-                details = fetch_subscription_status_details(account, proxy=proxy)
-                state["subscription_status"] = details.get("status")
-                state["subscription_source"] = details.get("source")
-                if isinstance(details.get("usage"), dict):
-                    state["chatgpt_usage"] = details["usage"]
-                    state["plan"] = details["status"]
-                    state["plan_name"] = details["status"]
-            except Exception as exc:
-                state["subscription_error"] = str(exc)
-        else:
-            state["profile_error"] = profile
+            account = _A()
+            account.access_token = resolved_access
+            account.chatgpt_account_id = chatgpt_account_id
+            account.id_token = id_token
+            account.cookies = cookies
+            account.extra = {"chatgpt_account_id": chatgpt_account_id}
+            details = fetch_subscription_status_details(account, proxy=proxy)
+            status = details.get("status")
+            state["valid"] = status not in ("expired", "invalid", "banned", None)
+            state["subscription_status"] = status
+            state["subscription_source"] = details.get("source")
+            profile = details.get("me")
+            if isinstance(profile, dict):
+                state["profile"] = profile
+            if isinstance(details.get("usage"), dict):
+                state["chatgpt_usage"] = details["usage"]
+            if status:
+                state["plan"] = status
+                state["plan_name"] = status
+        except Exception as exc:
+            state["subscription_error"] = str(exc)
+            # Preserve the legacy profile-only fallback for providers or
+            # transient response shapes that the subscription detector cannot
+            # parse.  Both main entry points still agree whenever wham works.
+            ok, profile = _fetch_profile(resolved_access, proxy=proxy)
+            if ok:
+                state["valid"] = True
+                state["profile"] = profile
+            else:
+                status_code = profile.get("status_code") if isinstance(profile, dict) else None
+                # Only explicit authentication rejection is an invalid account.
+                # Rate limits, server errors and transport failures are an
+                # indeterminate check and must preserve the previous validity.
+                state["valid"] = False if status_code in {401, 403} else None
+                state["profile_error"] = profile
+                state["last_error"] = str(profile)
     else:
         state["valid"] = False
         state["profile_error"] = "缺少 access_token，且无法通过 session_token 刷新"

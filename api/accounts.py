@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import io
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Response
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -213,6 +213,19 @@ def authorize_codex_oauth_batch(body: CodexOAuthBatchRequest):
 @router.post("/import")
 def import_accounts(body: ImportRequest):
     return service.import_accounts(body.platform, body.lines)
+
+
+@router.get("/{account_id}/credentials")
+def get_account_credentials(
+    account_id: int,
+    response: Response,
+    scope: Literal["platform", "codex"] | None = None,
+):
+    result = service.get_credentials(account_id, scope)
+    if result is None:
+        raise HTTPException(404, "账号不存在")
+    response.headers["Cache-Control"] = "no-store"
+    return result
 
 
 @router.get("/{account_id}")

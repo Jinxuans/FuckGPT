@@ -51,11 +51,27 @@ const SETTINGS_NAV_ITEMS: { labelKey: TranslationKey; hash: string }[] = [
 
 const NAV_ITEMS: NavItem[] = [
   { path: "/", labelKey: "nav.dashboard", icon: LayoutDashboard, exact: true },
-  { path: "/accounts/chatgpt", label: "chatgpt free", icon: Users },
+  { path: "/accounts/chatgpt", labelKey: "nav.chatgptAccounts", icon: Users },
   { path: "/mailboxes", labelKey: "nav.mailboxResources", icon: Mail },
   { path: "/tasks", labelKey: "nav.tasks", icon: ListChecks },
   { path: "/settings", labelKey: "nav.settings", icon: SettingsIcon },
 ];
+
+const SHELL_CONTENT_WIDTH = {
+  standard: "max-w-6xl",
+  workspace: "max-w-[1680px]",
+} as const;
+
+const WORKSPACE_ROUTE_PREFIXES = ["/", "/accounts", "/mailboxes", "/tasks"];
+
+function getShellContentWidth(pathname: string) {
+  const isWorkspace = WORKSPACE_ROUTE_PREFIXES.some(
+    (prefix) => pathname === prefix || pathname.startsWith(`${prefix}/`),
+  );
+  return isWorkspace
+    ? SHELL_CONTENT_WIDTH.workspace
+    : SHELL_CONTENT_WIDTH.standard;
+}
 
 function Sidebar({
   theme,
@@ -244,6 +260,8 @@ function Shell({
     localStorage.setItem("sidebar-collapsed", String(collapsed));
   }, [collapsed]);
 
+  const contentWidthClass = getShellContentWidth(location.pathname);
+
   return (
     <div className="flex h-screen overflow-hidden bg-[var(--bg-base)]">
       <WelcomeDialog />
@@ -253,8 +271,8 @@ function Shell({
         collapsed={collapsed}
         setCollapsed={setCollapsed}
       />
-      <main className="flex-1 overflow-y-auto">
-        <div className={cn("mx-auto px-6 py-6 lg:px-8", ["/mailboxes", "/tasks"].includes(location.pathname) ? "max-w-7xl" : "max-w-6xl")}>
+      <main className="min-w-0 flex-1 overflow-y-auto">
+        <div className={cn("mx-auto px-6 py-6 lg:px-8", contentWidthClass)}>
           <UpdateBanner />
           <Routes>
             <Route path="/" element={<Dashboard />} />

@@ -11,7 +11,7 @@ from sqlmodel import Session, select
 
 from core.account_graph import load_account_graphs, patch_account_graph
 from core.base_platform import AccountStatus, RegisterConfig
-from core.db import AccountModel, AccountOverviewModel, engine
+from core.db import AccountModel, AccountSubscriptionModel, engine
 from core.platform_accounts import build_platform_account
 from core.registry import get
 
@@ -113,14 +113,13 @@ def flag_expiring_trials(
     results = {"warned": 0, "expired": 0, "skipped": 0}
 
     with Session(engine) as session:
-        overviews = session.exec(
-            select(AccountOverviewModel)
-            .where(AccountOverviewModel.lifecycle_status == "trial")
+        subscriptions = session.exec(
+            select(AccountSubscriptionModel)
+            .where(AccountSubscriptionModel.plan_state == "trial")
         ).all()
 
-    for overview in overviews:
-        summary = overview.get_summary()
-        trial_end = int(summary.get("trial_end_time") or 0)
+    for subscription in subscriptions:
+        trial_end = int(subscription.trial_end_time or 0)
         if not trial_end:
             results["skipped"] += 1
             continue
@@ -128,33 +127,20 @@ def flag_expiring_trials(
         if trial_end < now_ts:
             # Already expired
             with Session(engine) as session:
-                model = session.get(AccountModel, overview.account_id)
+                model = session.get(AccountModel, subscription.account_id)
                 if model:
                     model.updated_at = _utcnow()
                     patch_account_graph(
                         session, model,
                         lifecycle_status=AccountStatus.EXPIRED.value,
-                        summary_updates={"expiry_warning": "expired"},
+                        summary_updates={"plan_state": "expired"},
                     )
                     session.add(model)
                     session.commit()
             results["expired"] += 1
         elif trial_end < warning_ts:
-            # Expiring soon
-            hours_left = max(0, (trial_end - now_ts) // 3600)
-            with Session(engine) as session:
-                model = session.get(AccountModel, overview.account_id)
-                if model:
-                    model.updated_at = _utcnow()
-                    patch_account_graph(
-                        session, model,
-                        summary_updates={
-                            "expiry_warning": f"expiring_in_{hours_left}h",
-                            "expiry_warning_hours": hours_left,
-                        },
-                    )
-                    session.add(model)
-                    session.commit()
+            # The view derives the live warning directly from trial_end_time,
+            # so no duplicate/stale warning payload needs to be persisted.
             results["warned"] += 1
         else:
             results["skipped"] += 1

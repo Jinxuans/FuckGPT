@@ -18,7 +18,7 @@ def test_sidebar_top_level_nav_keeps_public_entries():
     assert 'path: "/"' in block
     assert 'labelKey: "nav.dashboard"' in block
     assert 'path: "/accounts/chatgpt"' in block
-    assert 'label: "chatgpt free"' in block
+    assert 'labelKey: "nav.chatgptAccounts"' in block
     assert 'path: "/mailboxes"' in block
     assert 'labelKey: "nav.mailboxResources"' in block
     assert 'path: "/tasks"' in block

@@ -8,7 +8,7 @@ from infrastructure.platform_runtime import (
     PERSISTED_ACTION_DATA_KEYS,
     _safe_action_result_data,
 )
-from core.account_graph import PLATFORM_CREDENTIAL_TYPES
+from core.account_graph import CODEX_CREDENTIAL_TYPES
 from platforms.chatgpt.codex_oauth import (
     ACCOUNT_CHOOSER_SUBMIT_GRACE_SECONDS,
     EMAIL_SUBMIT_GRACE_SECONDS,
@@ -497,12 +497,12 @@ def test_codex_oauth_incorrect_password_can_recover_with_email_otp(monkeypatch):
     assert _is_incorrect_password_error("Incorrect email address or password") is True
 
 
-def test_registration_auth_mode_restores_from_legacy_overview_and_profile_amr():
+def test_registration_auth_mode_restores_from_structured_overview_and_profile_amr():
     assert _resolve_registration_auth_mode(
-        {"account_overview": {"legacy_extra": {"registration_auth_mode": "email_otp"}}}
+        {"account_overview": {"registration_auth_mode": "email_otp"}}
     ) == "email_otp"
     assert _resolve_registration_auth_mode(
-        {"account_overview": {"legacy_extra": {"profile": {"amr": ["otp", "urn:openai:amr:otp_email"]}}}}
+        {"account_overview": {"amr": ["otp", "urn:openai:amr:otp_email"]}}
     ) == "email_otp"
     assert _resolve_registration_auth_mode({"registration_auth_mode": "password"}) == "password"
 
@@ -1412,9 +1412,9 @@ def test_codex_oauth_result_is_persistable_but_returned_safely():
     assert "codex_access_token" in PERSISTED_ACTION_DATA_KEYS
     assert "codex_refresh_token" in PERSISTED_ACTION_DATA_KEYS
     assert "codex_id_token" in PERSISTED_ACTION_DATA_KEYS
-    assert PLATFORM_CREDENTIAL_TYPES["codex_access_token"] == "token"
-    assert PLATFORM_CREDENTIAL_TYPES["codex_refresh_token"] == "token"
-    assert PLATFORM_CREDENTIAL_TYPES["codex_id_token"] == "token"
+    assert CODEX_CREDENTIAL_TYPES["codex_access_token"] == "token"
+    assert CODEX_CREDENTIAL_TYPES["codex_refresh_token"] == "token"
+    assert CODEX_CREDENTIAL_TYPES["codex_id_token"] == "token"
 
     safe = _safe_action_result_data(
         "codex_oauth_authorize",

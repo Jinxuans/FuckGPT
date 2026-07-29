@@ -22,6 +22,7 @@ class AccountRecord:
     display_status: str = "registered"
     overview: dict = field(default_factory=dict)
     display_summary: dict = field(default_factory=dict)
+    account_view: dict = field(default_factory=dict)
     credentials: list[dict] = field(default_factory=list)
     provider_accounts: list[dict] = field(default_factory=list)
     provider_resources: list[dict] = field(default_factory=list)

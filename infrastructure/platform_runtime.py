@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import re
 from typing import Any, Callable
 
 from sqlmodel import Session
 
 from core.base_platform import RegisterConfig
-from core.account_graph import patch_account_graph
+from core.account_graph import (
+    load_account_graphs,
+    patch_account_graph,
+    recover_lifecycle_status_for_valid_account,
+)
 from core.db import AccountModel, engine
 from core.platform_accounts import build_platform_account
 from core.proxy_resolution import (
@@ -59,6 +64,7 @@ PERSISTED_ACTION_DATA_KEYS = {
 }
 
 STATEFUL_ACTION_IDS = {"get_account_state", "switch_account", "query_state", "switch_desktop"}
+ACCOUNT_STATE_ACTION_IDS = {"get_account_state", "query_state"}
 CODEX_OAUTH_SECRET_RESULT_KEYS = {
     "codex_access_token",
     "codex_refresh_token",
@@ -75,16 +81,158 @@ def _mask_secret(value: Any) -> str:
     return f"{text[:6]}...{text[-4:]}"
 
 
+def _mask_phone_number(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if re.fullmatch(r"\+?\d{1,4}\*{3,}\d{2,4}", text):
+        return text
+    digits = "".join(character for character in text if character.isdigit())
+    if len(digits) <= 8:
+        return "***"
+    if text.startswith("+"):
+        return f"+{digits[:3]}****{digits[-4:]}"
+    return f"{digits[:4]}****{digits[-4:]}"
+
+
+def _normalize_chatgpt_usage_plan(value: Any) -> str:
+    raw = str(value or "").strip().lower()
+    if any(token in raw for token in ("team", "enterprise", "business")):
+        return "team"
+    if any(token in raw for token in ("plus", "pro", "premium", "paid")):
+        return "plus"
+    return "free"
+
+
+def _string_list(value: Any) -> list[str]:
+    if not isinstance(value, (list, tuple, set)):
+        return []
+    return [str(item).strip() for item in value if str(item or "").strip()]
+
+
+def _optional_bool(value: Any) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value or "").strip().lower()
+    if text in {"1", "true", "yes", "on", "enabled"}:
+        return True
+    if text in {"0", "false", "no", "off", "disabled"}:
+        return False
+    return None
+
+
+def _normalized_result_key(key: Any) -> str:
+    text = str(key or "").strip().replace("-", "_")
+    text = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", text)
+    return re.sub(r"_+", "_", text.lower())
+
+
+def _is_phone_result_key(key: Any) -> bool:
+    normalized = _normalized_result_key(key)
+    compact = normalized.replace("_", "")
+    if compact in {
+        "phonebound",
+        "hasphone",
+        "phoneverified",
+        "mobileverified",
+        "msisdnverified",
+        "telverified",
+    }:
+        return False
+    if "phone" in compact:
+        return True
+    if compact in {"mobile", "mobilenumber", "mobileno", "msisdn", "tel", "telephone", "telephonenumber"}:
+        return True
+    return bool(set(normalized.split("_")) & {"mobile", "msisdn", "tel", "telephone"})
+
+
+def _is_sensitive_result_key(key: Any) -> bool:
+    normalized = _normalized_result_key(key)
+    compact = normalized.replace("_", "")
+    if (
+        normalized.startswith("has_")
+        or normalized.endswith(("_present", "_preview", "_masked"))
+        or normalized.endswith(
+            (
+                "_token_count",
+                "_token_counts",
+                "_token_used",
+                "_token_usage",
+                "_token_limit",
+                "_token_remaining",
+                "_token_total",
+                "_token_type",
+                "_token_status",
+                "_token_expires_at",
+            )
+        )
+    ):
+        return False
+    if normalized in {
+        "token",
+        "authorization",
+        "api_key",
+        "client_secret",
+        "password",
+        "secret",
+        "cookie",
+        "cookies",
+        "credential",
+        "credentials",
+        "sso",
+        "sso_rw",
+        "wos_session",
+    }:
+        return True
+    if compact in {
+        "accesstoken",
+        "refreshtoken",
+        "idtoken",
+        "sessiontoken",
+        "authtoken",
+        "apikey",
+        "clientsecret",
+    }:
+        return True
+    return (
+        normalized.endswith("_token")
+        or "_token_" in normalized
+        or "cookie" in normalized
+        or "password" in normalized
+        or normalized.endswith("_secret")
+    )
+
+
+def _sanitize_action_result(value: Any, *, key: str = "") -> Any:
+    phone_context = _is_phone_result_key(key)
+    if isinstance(value, dict):
+        safe: dict[str, Any] = {}
+        for child_key, item in value.items():
+            if _is_sensitive_result_key(child_key):
+                continue
+            child_context = str(child_key)
+            if phone_context and not _is_phone_result_key(child_key):
+                child_context = key
+            safe[str(child_key)] = _sanitize_action_result(item, key=child_context)
+        return safe
+    if isinstance(value, list):
+        return [_sanitize_action_result(item, key=key) for item in value]
+    if phone_context and not isinstance(value, bool):
+        return _mask_phone_number(value)
+    return value
+
+
 def _safe_action_result_data(action_id: str, data: Any) -> Any:
-    if action_id != "codex_oauth_authorize" or not isinstance(data, dict):
-        return data
-    safe = dict(data)
-    for key in CODEX_OAUTH_SECRET_RESULT_KEYS:
-        if key in safe:
+    prepared = dict(data) if isinstance(data, dict) else data
+    if action_id == "codex_oauth_authorize" and isinstance(prepared, dict):
+        for key in CODEX_OAUTH_SECRET_RESULT_KEYS:
+            if key not in prepared:
+                continue
             preview_key = f"{key}_preview"
-            safe[preview_key] = safe.get(preview_key) or _mask_secret(safe.get(key))
-            safe.pop(key, None)
-    return safe
+            prepared[preview_key] = prepared.get(preview_key) or _mask_secret(prepared.get(key))
+    return _sanitize_action_result(prepared)
 
 
 def _utcnow_iso() -> str:
@@ -97,23 +245,98 @@ def _build_account_overview(platform: str, data: dict[str, Any]) -> dict[str, An
 
     overview: dict[str, Any] = {
         "platform": platform,
-        "checked_at": _utcnow_iso(),
+        "checked_at": data.get("checked_at") or _utcnow_iso(),
         "chips": [],
     }
-    if "valid" in data:
-        overview["valid"] = bool(data.get("valid"))
-        overview["chips"].append("有效" if data.get("valid") else "失效")
+    observed_validity = _optional_bool(data.get("valid")) if "valid" in data else None
+    if observed_validity is not None:
+        overview["valid"] = observed_validity
+        overview["chips"].append("有效" if observed_validity else "失效")
+    last_error = data.get("last_error") or data.get("check_error")
+    if last_error not in (None, ""):
+        overview["last_error"] = str(last_error)
 
-    remote_email = ""
-    if isinstance(data.get("remote_user"), dict):
+    profile = data.get("profile") if isinstance(data.get("profile"), dict) else {}
+    remote_email = str(data.get("remote_email") or profile.get("email") or "")
+    if not remote_email and isinstance(data.get("remote_user"), dict):
         remote_email = str(data["remote_user"].get("email", "") or "")
-    elif isinstance(data.get("portal_user"), dict):
+    elif not remote_email and isinstance(data.get("portal_user"), dict):
         remote_email = str(data["portal_user"].get("email", "") or "")
     if remote_email:
         overview["remote_email"] = remote_email
 
+    chatgpt_usage = data.get("chatgpt_usage")
+    if not isinstance(chatgpt_usage, dict):
+        chatgpt_usage = data.get("wham_usage")
+    if not isinstance(chatgpt_usage, dict):
+        chatgpt_usage = {}
+    usage_plan_raw = chatgpt_usage.get("plan_type") if platform == "chatgpt" else ""
+    usage_plan = (
+        _normalize_chatgpt_usage_plan(usage_plan_raw)
+        if str(usage_plan_raw or "").strip()
+        else ""
+    )
+    check_source = (
+        "backend-api/wham/usage"
+        if str(usage_plan_raw or "").strip()
+        else str(data.get("check_source") or data.get("subscription_source") or "").strip()
+    )
+    if check_source:
+        overview["check_source"] = check_source
+        overview["subscription_source"] = check_source
+    if platform == "chatgpt":
+        # Keep the raw usage response for the usage-snapshot adapter.  It does
+        # not contain login credentials and is the canonical plan source.
+        overview["chatgpt_usage"] = chatgpt_usage
+
+        phone_keys = {"phone_bound", "phone_number_masked", "phone_number", "phoneNumber"}
+        phone_observed = any(key in data for key in phone_keys) or any(key in profile for key in phone_keys)
+        phone_value = (
+            data.get("phone_number_masked")
+            or data.get("phone_number")
+            or data.get("phoneNumber")
+            or profile.get("phone_number_masked")
+            or profile.get("phone_number")
+            or profile.get("phoneNumber")
+            or ""
+        )
+        phone_number_masked = _mask_phone_number(phone_value)
+        explicit_phone_bound = None
+        for payload in (data, profile):
+            if "phone_bound" in payload:
+                explicit_phone_bound = _optional_bool(payload.get("phone_bound"))
+                break
+        if phone_observed:
+            overview["phone_bound"] = bool(phone_number_masked) if explicit_phone_bound is None else explicit_phone_bound
+            overview["phone_number_masked"] = phone_number_masked
+
+        amr_observed = "amr" in data or "amr" in profile
+        amr = _string_list(data.get("amr")) or _string_list(profile.get("amr"))
+        explicit_mfa = None
+        mfa_observed = False
+        for payload in (data, profile):
+            for key in ("mfa_enabled", "has_mfa", "mfa"):
+                if key not in payload:
+                    continue
+                mfa_observed = True
+                explicit_mfa = _optional_bool(payload.get(key))
+                if explicit_mfa is not None:
+                    break
+            if explicit_mfa is not None:
+                break
+        if mfa_observed or amr_observed:
+            overview["amr"] = amr
+            overview["mfa_enabled"] = (
+                explicit_mfa
+                if explicit_mfa is not None
+                else any("mfa" in item.lower() for item in amr)
+            )
+
     plan = (
-        data.get("membership_type")
+        (usage_plan if str(usage_plan or "").strip() else None)
+        or data.get("subscription_status")
+        or data.get("plan")
+        or data.get("membership_type")
         or (data.get("billing_info") or {}).get("membershipType")
         or (data.get("usage_summary") or {}).get("plan_title")
         or (data.get("subscription") or {}).get("plan")
@@ -122,14 +345,24 @@ def _build_account_overview(platform: str, data: dict[str, Any]) -> dict[str, An
     if plan:
         overview["plan"] = plan
         overview["plan_name"] = str(plan)
-        overview["chips"].append(str(plan))
         plan_lower = str(plan).strip().lower()
+        if platform == "chatgpt" and any(token in plan_lower for token in ("team", "enterprise", "business")):
+            overview["chips"].append("Team")
+        elif platform == "chatgpt" and any(token in plan_lower for token in ("pro", "plus", "premium", "paid")):
+            overview["chips"].append("Plus")
+        elif platform == "chatgpt" and plan_lower in {"free", "basic", "starter", "hobby"}:
+            overview["chips"].append("Free")
+        else:
+            overview["chips"].append(str(plan))
         if any(token in plan_lower for token in ("pro", "plus", "premium", "business", "team", "enterprise", "student")):
             overview["plan_state"] = "subscribed"
         elif "trial" in plan_lower:
             overview["plan_state"] = "trial"
         elif plan_lower in {"free", "basic", "starter", "hobby"}:
             overview["plan_state"] = "free"
+
+    if platform == "chatgpt" and overview.get("phone_bound"):
+        overview["chips"].append("已绑手机")
 
     if "trial_eligible" in data:
         overview["trial_eligible"] = data.get("trial_eligible")
@@ -241,6 +474,52 @@ def _build_account_overview(platform: str, data: dict[str, Any]) -> dict[str, An
     return overview if len(overview) > 2 else None
 
 
+def _persist_action_result(command: ActionExecutionCommand, result: dict[str, Any]) -> None:
+    data = result.get("data") if isinstance(result.get("data"), dict) else {}
+    action_ok = bool(result.get("ok"))
+    credential_updates = {
+        key: value
+        for key, value in data.items()
+        if action_ok and key in PERSISTED_ACTION_DATA_KEYS and value not in (None, "")
+    }
+    summary_updates: dict[str, Any] = {}
+    if command.action_id in ACCOUNT_STATE_ACTION_IDS:
+        if action_ok:
+            overview = _build_account_overview(command.platform, data)
+            if overview:
+                summary_updates.update(overview)
+        else:
+            error = str(result.get("error") or data.get("error") or "账号状态查询失败")
+            if error != "任务已取消":
+                summary_updates = {"checked_at": _utcnow_iso(), "last_error": error}
+
+    if not credential_updates and not summary_updates:
+        return
+
+    with Session(engine) as session:
+        model = session.get(AccountModel, command.account_id)
+        if not model or model.platform != command.platform:
+            return
+        lifecycle_status = None
+        if summary_updates.get("valid") is True:
+            current_graph = load_account_graphs(session, [int(model.id or 0)]).get(int(model.id or 0), {})
+            merged_graph = dict(current_graph)
+            merged_overview = dict(merged_graph.get("overview") or {})
+            merged_overview.update(summary_updates)
+            merged_graph["overview"] = merged_overview
+            lifecycle_status = recover_lifecycle_status_for_valid_account(merged_graph)
+        model.updated_at = datetime.now(timezone.utc)
+        patch_account_graph(
+            session,
+            model,
+            lifecycle_status=lifecycle_status,
+            summary_updates=summary_updates or None,
+            credential_updates=credential_updates or None,
+        )
+        session.add(model)
+        session.commit()
+
+
 class PlatformRuntime:
     def list_platforms(self) -> list[PlatformDescriptor]:
         load_all()
@@ -301,91 +580,71 @@ class PlatformRuntime:
         load_all()
         if callable(cancel_check) and cancel_check():
             return ActionExecutionResult(ok=False, error="任务已取消")
+
+        platform_cls = get(command.platform)
+        params = dict(command.params or {})
+        proxy_mode = normalize_proxy_mode(
+            str(params.get("platform_proxy_mode") or "").strip(),
+            default=PROXY_MODE_DIRECT,
+        )
+        proxy_value = str(params.get("platform_proxy_value") or "").strip()
+        try:
+            from core.proxy_pool import proxy_pool
+
+            action_proxy = resolve_proxy_by_mode(
+                proxy_mode,
+                manual_proxy=proxy_value,
+                proxy_getter=proxy_pool.get_next,
+            )
+        except Exception:
+            action_proxy = None
+        instance = platform_cls(
+            config=RegisterConfig(
+                proxy=action_proxy,
+                extra={"disable_proxy_pool": proxy_mode == PROXY_MODE_DIRECT},
+            )
+        )
+        if log_fn:
+            instance.set_logger(log_fn)
+            if params.get("platform_proxy_mode") or action_proxy:
+                log_fn(
+                    f"ChatGPT/Codex 代理: {mask_proxy_url(action_proxy) if action_proxy else '直连'}"
+                    f"（{proxy_mode}）"
+                )
+        if callable(cancel_check):
+            if hasattr(instance, "set_cancel_checker"):
+                instance.set_cancel_checker(cancel_check)
+            else:
+                instance._cancel_check_fn = cancel_check
+
+        # Build a detached platform account in a short read session.  Browser,
+        # OAuth and remote API work must not hold a SQLite transaction open.
         with Session(engine) as session:
             model = session.get(AccountModel, command.account_id)
             if not model or model.platform != command.platform:
                 return ActionExecutionResult(ok=False, error="账号不存在")
-
-            platform_cls = get(command.platform)
-            params = dict(command.params or {})
-            proxy_mode = normalize_proxy_mode(
-                str(params.get("platform_proxy_mode") or "").strip(),
-                default=PROXY_MODE_DIRECT,
-            )
-            proxy_value = str(params.get("platform_proxy_value") or "").strip()
-            try:
-                from core.proxy_pool import proxy_pool
-
-                action_proxy = resolve_proxy_by_mode(
-                    proxy_mode,
-                    manual_proxy=proxy_value,
-                    proxy_getter=proxy_pool.get_next,
-                )
-            except Exception:
-                action_proxy = None
-            instance = platform_cls(
-                config=RegisterConfig(
-                    proxy=action_proxy,
-                    extra={"disable_proxy_pool": proxy_mode == PROXY_MODE_DIRECT},
-                )
-            )
-            if log_fn:
-                instance.set_logger(log_fn)
-                if params.get("platform_proxy_mode") or action_proxy:
-                    log_fn(
-                        f"ChatGPT/Codex 代理: {mask_proxy_url(action_proxy) if action_proxy else '直连'}"
-                        f"（{proxy_mode}）"
-                    )
-            if callable(cancel_check):
-                if hasattr(instance, "set_cancel_checker"):
-                    instance.set_cancel_checker(cancel_check)
-                else:
-                    instance._cancel_check_fn = cancel_check
             account = build_platform_account(session, model)
             try:
                 setattr(account, "id", int(model.id or 0))
             except Exception:
                 pass
-            try:
-                if callable(cancel_check) and cancel_check():
-                    return ActionExecutionResult(ok=False, error="任务已取消")
-                result: dict[str, Any] = instance.execute_action(command.action_id, account, command.params)
-            except NotImplementedError as exc:
-                return ActionExecutionResult(ok=False, data={"error_type": "not_supported"}, error=str(exc))
-            except Exception as exc:
-                return ActionExecutionResult(ok=False, error=str(exc))
 
-            if isinstance(result.get("data"), dict):
-                data = result["data"]
-                needs_save = False
-                action_ok = bool(result.get("ok"))
-                credential_updates = {}
-                if action_ok:
-                    credential_updates = {
-                        key: value
-                        for key, value in data.items()
-                        if key in PERSISTED_ACTION_DATA_KEYS and value not in (None, "")
-                    }
-                summary_updates: dict[str, Any] = {}
-                if action_ok and command.action_id in STATEFUL_ACTION_IDS:
-                    overview = _build_account_overview(command.platform, data)
-                    if overview:
-                        summary_updates.update(overview)
-                        needs_save = True
-                if credential_updates:
-                    needs_save = True
-                if needs_save:
-                    model.updated_at = datetime.now(timezone.utc)
-                    patch_account_graph(
-                        session,
-                        model,
-                        summary_updates=summary_updates or None,
-                        credential_updates=credential_updates or None,
-                    )
-                    session.add(model)
-                    session.commit()
-            return ActionExecutionResult(
-                ok=bool(result.get("ok")),
-                data=_safe_action_result_data(command.action_id, result.get("data")),
-                error=str(result.get("error", "")),
-            )
+        try:
+            if callable(cancel_check) and cancel_check():
+                return ActionExecutionResult(ok=False, error="任务已取消")
+            result = instance.execute_action(command.action_id, account, command.params)
+        except NotImplementedError as exc:
+            return ActionExecutionResult(ok=False, data={"error_type": "not_supported"}, error=str(exc))
+        except Exception as exc:
+            failure = {"ok": False, "error": str(exc)}
+            _persist_action_result(command, failure)
+            return ActionExecutionResult(ok=False, error=str(exc))
+
+        if not isinstance(result, dict):
+            result = {"ok": False, "error": "平台动作返回格式无效"}
+        _persist_action_result(command, result)
+        return ActionExecutionResult(
+            ok=bool(result.get("ok")),
+            data=_safe_action_result_data(command.action_id, result.get("data")),
+            error=str(result.get("error", "")),
+        )

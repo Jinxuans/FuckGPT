@@ -7,13 +7,22 @@ import json
 import zipfile
 from datetime import datetime, timedelta, timezone
 
-from sqlmodel import Session
+from sqlalchemy import inspect
+from sqlmodel import Session, select
 
 from application.account_exports import AccountExportsService
 from core.account_graph import patch_account_graph
 from core.base_platform import Account
-from core.db import AccountModel, TaskModel, engine, save_account
-from domain.accounts import AccountExportSelection, AccountQuery
+from core.db import (
+    AccountAuthCredentialModel,
+    AccountCodexAuthModel,
+    AccountModel,
+    AccountStatusModel,
+    TaskModel,
+    engine,
+    save_account,
+)
+from domain.accounts import AccountExportSelection, AccountQuery, AccountRecord
 from infrastructure.accounts_repository import AccountsRepository
 
 
@@ -37,6 +46,181 @@ def _create_account(**overrides):
     return records[0].id
 
 
+_DEBUG_SECRET_VALUES = {
+    "credential-value-secret",
+    "credential-preview-secret",
+    "metadata-refresh-secret",
+    "metadata-codex-access-secret",
+    "wrapped-client-secret",
+    "provider-api-secret",
+    "provider-api-preview",
+    "provider-access-secret",
+    "provider-wrapped-secret",
+    "resource-client-secret",
+    "resource-service-api-secret",
+    "resource-authorization-secret",
+    "overview-access-secret",
+    "overview-password-secret",
+    "overview-cookie-secret",
+    "overview-wrapped-secret",
+    "display-session-cookie-secret",
+}
+
+
+def _unsafe_debug_record() -> AccountRecord:
+    account_view = {
+        "identity": {"id": 4242, "email": "debug-redaction@test.com"},
+        "status": {"display": "registered"},
+        "custom_safe_marker": {"value": "account-view-stays-unchanged"},
+    }
+    return AccountRecord(
+        id=4242,
+        platform="chatgpt",
+        email="debug-redaction@test.com",
+        password="TopLevelPass!Keep",
+        account_view=account_view,
+        credentials=[
+            {
+                "id": 1,
+                "scope": "platform",
+                "credential_type": "token",
+                "key": "access_token",
+                "value": "credential-value-secret",
+                "preview": "credential-preview-secret",
+                "metadata": {
+                    "refreshToken": "metadata-refresh-secret",
+                    "codexAccessToken": "metadata-codex-access-secret",
+                    "contactPhone": "+56996830313",
+                    "usage": {"input_token_count": 123},
+                    "wrapped": {
+                        "key": "client_secret",
+                        "value": "wrapped-client-secret",
+                    },
+                },
+            }
+        ],
+        provider_accounts=[
+            {
+                "id": 2,
+                "provider_name": "mail-provider",
+                "credentials": {"api_key": "provider-api-secret"},
+                "credential_previews": {"api_key": "provider-api-preview"},
+                "metadata": {
+                    "oauth": {"accessToken": "provider-access-secret"},
+                    "phone_numbers": ["+56996830313"],
+                    "wrapped": {
+                        "name": "api_key",
+                        "value": "provider-wrapped-secret",
+                    },
+                },
+            }
+        ],
+        provider_resources=[
+            {
+                "id": 3,
+                "provider_name": "mail-provider",
+                "metadata": {
+                    "clientSecret": "resource-client-secret",
+                    "serviceApiKey": "resource-service-api-secret",
+                    "headers": {"Authorization": "resource-authorization-secret"},
+                    "mobile": "+14155552671",
+                },
+            }
+        ],
+        overview={
+            "auth": {
+                "access_token": "overview-access-secret",
+                "password": "overview-password-secret",
+                "cookieJar": "overview-cookie-secret",
+            },
+            "profile": {"phoneNumber": "+56996830313"},
+            "usage": {"output_token_count": 456},
+            "wrapped": {
+                "credential_key": "session_token",
+                "value": "overview-wrapped-secret",
+            },
+        },
+        display_summary={
+            "warnings": [
+                {
+                    "context": {
+                        "sessionCookie": "display-session-cookie-secret",
+                        "telephone": "+56996830313",
+                    }
+                }
+            ]
+        },
+    )
+
+
+class _StaticUnsafeDebugRepository:
+    def __init__(self, record: AccountRecord):
+        self.record = record
+
+    def list(self, _query):
+        return 1, [self.record]
+
+    def get(self, account_id: int):
+        return self.record if account_id == self.record.id else None
+
+
+def _assert_debug_payload_is_redacted(payload: dict) -> None:
+    encoded = json.dumps(payload, ensure_ascii=False)
+    for secret in _DEBUG_SECRET_VALUES:
+        assert secret not in encoded
+
+    assert payload["password"] == "TopLevelPass!Keep"
+    assert payload["account_view"] == _unsafe_debug_record().account_view
+
+    credential = payload["credentials"][0]
+    assert credential["key"] == "access_token"
+    assert "value" not in credential
+    assert "preview" not in credential
+    assert credential["metadata"]["contactPhone"] == "+569****0313"
+    assert credential["metadata"]["usage"]["input_token_count"] == 123
+    assert "refreshToken" not in credential["metadata"]
+    assert "codexAccessToken" not in credential["metadata"]
+    assert "value" not in credential["metadata"]["wrapped"]
+
+    provider = payload["provider_accounts"][0]
+    assert "credentials" not in provider
+    assert "credential_previews" not in provider
+    assert provider["metadata"]["phone_numbers"] == ["+569****0313"]
+    assert "accessToken" not in provider["metadata"]["oauth"]
+    assert "value" not in provider["metadata"]["wrapped"]
+
+    resource_metadata = payload["provider_resources"][0]["metadata"]
+    assert "clientSecret" not in resource_metadata
+    assert "serviceApiKey" not in resource_metadata
+    assert "Authorization" not in resource_metadata["headers"]
+    assert resource_metadata["mobile"] == "+141****2671"
+
+    assert payload["overview"]["profile"]["phoneNumber"] == "+569****0313"
+    assert payload["overview"]["usage"]["output_token_count"] == 456
+    assert payload["overview"]["auth"] == {}
+    assert "value" not in payload["overview"]["wrapped"]
+    display_context = payload["display_summary"]["warnings"][0]["context"]
+    assert "sessionCookie" not in display_context
+    assert display_context["telephone"] == "+569****0313"
+
+
+def test_account_schema_uses_structured_tables():
+    tables = set(inspect(engine).get_table_names())
+    assert {
+        "accounts",
+        "account_auth_credentials",
+        "account_status",
+        "account_subscription",
+        "account_security_profile",
+        "account_usage_snapshot",
+        "account_codex_auth",
+    }.issubset(tables)
+    assert "account_overviews" not in tables
+    assert "account_credentials" not in tables
+    with engine.connect() as connection:
+        assert connection.exec_driver_sql("PRAGMA foreign_keys").scalar_one() == 1
+
+
 def test_save_account_returns_model_with_loaded_attributes_after_session_close():
     created = save_account(
         Account(
@@ -51,6 +235,17 @@ def test_save_account_returns_model_with_loaded_attributes_after_session_close()
     created_id = int(created.id)
     assert created_id > 0
     assert created.email == "detached-model@test.com"
+    with Session(engine) as session:
+        status = session.get(AccountStatusModel, created_id)
+        credentials = session.exec(
+            select(AccountAuthCredentialModel)
+            .where(AccountAuthCredentialModel.account_id == created_id)
+        ).all()
+    assert status.lifecycle_status == "registered"
+    assert status.validity_status == "unknown"
+    assert {(item.scope, item.key) for item in credentials} == {
+        ("platform", "access_token"),
+    }
 
     updated = save_account(
         Account(
@@ -65,6 +260,37 @@ def test_save_account_returns_model_with_loaded_attributes_after_session_close()
     assert int(updated.id) == created_id
     assert updated.email == "detached-model@test.com"
     assert updated.password == "SecondPass123!"
+    with Session(engine) as session:
+        access_token = session.exec(
+            select(AccountAuthCredentialModel)
+            .where(AccountAuthCredentialModel.account_id == created_id)
+            .where(AccountAuthCredentialModel.key == "access_token")
+        ).one()
+    assert access_token.value == "updated-access-token"
+
+
+def test_incremental_non_access_token_patch_does_not_replace_primary_credential():
+    account_id = _create_account(
+        email="primary-token@test.com",
+        extra={"access_token": "access-secret"},
+    )
+    with Session(engine) as session:
+        model = session.get(AccountModel, account_id)
+        patch_account_graph(
+            session,
+            model,
+            credential_updates={"id_token": "identity-secret", "refresh_token": "refresh-secret"},
+        )
+        session.commit()
+        credentials = session.exec(
+            select(AccountAuthCredentialModel)
+            .where(AccountAuthCredentialModel.account_id == account_id)
+        ).all()
+
+    by_key = {item.key: item for item in credentials}
+    assert by_key["access_token"].is_primary is True
+    assert by_key["id_token"].is_primary is False
+    assert by_key["refresh_token"].is_primary is False
 
 
 def test_list_accounts_empty(client):
@@ -81,6 +307,44 @@ def test_list_accounts_after_create(client):
     data = resp.json()
     assert data["total"] == 1
     assert data["items"][0]["email"] == "test@example.com"
+    view = data["items"][0]["account_view"]
+    assert view["identity"]["email"] == "test@example.com"
+    assert view["status"] == {
+        "lifecycle": "registered",
+        "validity": "unknown",
+        "display": "registered",
+        "checked_at": None,
+    }
+    assert set(view) == {
+        "identity",
+        "status",
+        "subscription",
+        "security",
+        "usage",
+        "codex",
+        "verification",
+        "display",
+    }
+    assert view["display"]["metrics"] == {"primary": [], "secondary": []}
+    assert view["display"]["sections"] == []
+
+
+def test_list_accounts_recursively_redacts_debug_payloads(client, monkeypatch):
+    from api import accounts as accounts_api
+
+    record = _unsafe_debug_record()
+    monkeypatch.setattr(
+        accounts_api.service,
+        "repository",
+        _StaticUnsafeDebugRepository(record),
+    )
+
+    response = client.get("/api/accounts")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["total"] == 1
+    _assert_debug_payload_is_redacted(payload["items"][0])
 
 
 def test_get_account_by_id(client):
@@ -88,6 +352,160 @@ def test_get_account_by_id(client):
     resp = client.get(f"/api/accounts/{account_id}")
     assert resp.status_code == 200
     assert resp.json()["email"] == "test@example.com"
+    assert resp.json()["account_view"]["identity"]["id"] == account_id
+
+
+def test_get_account_recursively_redacts_debug_payloads(client, monkeypatch):
+    from api import accounts as accounts_api
+
+    record = _unsafe_debug_record()
+    monkeypatch.setattr(
+        accounts_api.service,
+        "repository",
+        _StaticUnsafeDebugRepository(record),
+    )
+
+    response = client.get(f"/api/accounts/{record.id}")
+
+    assert response.status_code == 200
+    _assert_debug_payload_is_redacted(response.json())
+
+
+def test_account_view_never_exposes_auth_secrets_and_reports_codex_state(client):
+    secrets = {
+        "access_token": "platform-access-secret",
+        "refresh_token": "platform-refresh-secret",
+        "cookies": "session-cookie-secret",
+        "codex_access_token": "codex-access-secret",
+        "codex_refresh_token": "codex-refresh-secret",
+        "codex_id_token": "codex-id-secret",
+    }
+    account_id = _create_account(
+        email="secure-view@test.com",
+        user_id="acct-platform",
+        extra={
+            **secrets,
+            "account_id": "acct-platform",
+            "codex_email": "codex-login@test.com",
+            "codex_account_id": "acct-codex",
+            "codex_plan_type": "plus",
+            "codex_auth_path": "data/codex_auths/codex.json",
+            "codex_expires_at": "2026-01-02T03:04:05Z",
+            "codex_last_refresh": "2026-01-01T00:00:00Z",
+        },
+    )
+
+    response = client.get(f"/api/accounts/{account_id}")
+
+    assert response.status_code == 200
+    payload = response.json()
+    view = payload["account_view"]
+    encoded_view = json.dumps(view, ensure_ascii=False)
+    for secret in secrets.values():
+        assert secret not in encoded_view
+        assert secret not in response.text
+    assert view["identity"]["account_id"] == "acct-platform"
+    assert view["security"]["platform_auth"] == {
+        "has_primary_credential": True,
+        "has_access_token": True,
+        "has_refresh_token": True,
+        "has_session_token": False,
+        "has_cookie": True,
+    }
+    assert view["codex"] == {
+        "authorized": True,
+        "email": "codex-login@test.com",
+        "account_id": "acct-codex",
+        "plan_type": "plus",
+        "expires_at": "2026-01-02T03:04:05Z",
+        "last_refresh": "2026-01-01T00:00:00Z",
+        "auth_path": "data/codex_auths/codex.json",
+        "has_access_token": True,
+        "has_refresh_token": True,
+    }
+    assert all("value" not in item and "preview" not in item for item in payload["credentials"])
+
+    with Session(engine) as session:
+        codex = session.get(AccountCodexAuthModel, account_id)
+        credentials = session.exec(
+            select(AccountAuthCredentialModel)
+            .where(AccountAuthCredentialModel.account_id == account_id)
+        ).all()
+    assert codex.codex_account_id == "acct-codex"
+    assert codex.has_access_token is True
+    assert codex.has_refresh_token is True
+    assert {(item.scope, item.key) for item in credentials if item.scope == "codex"} == {
+        ("codex", "codex_access_token"),
+        ("codex", "codex_refresh_token"),
+        ("codex", "codex_id_token"),
+    }
+
+
+def test_credentials_are_revealed_only_by_explicit_endpoint_and_support_scope_filter(client):
+    secrets = {
+        "access_token": "platform-access-visible-on-demand",
+        "refresh_token": "platform-refresh-visible-on-demand",
+        "cookies": "platform-cookie-visible-on-demand",
+        "codex_access_token": "codex-access-visible-on-demand",
+        "codex_refresh_token": "codex-refresh-visible-on-demand",
+    }
+    account_id = _create_account(
+        email="credential-reveal@test.com",
+        extra=secrets,
+    )
+
+    list_response = client.get("/api/accounts")
+    detail_response = client.get(f"/api/accounts/{account_id}")
+    assert list_response.status_code == 200
+    assert detail_response.status_code == 200
+    for secret in secrets.values():
+        assert secret not in list_response.text
+        assert secret not in detail_response.text
+
+    response = client.get(f"/api/accounts/{account_id}/credentials")
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-store"
+    items = response.json()["items"]
+    assert {item["key"]: item["value"] for item in items} == secrets
+    assert all(set(item) == {
+        "scope",
+        "provider_name",
+        "credential_type",
+        "key",
+        "value",
+        "is_primary",
+        "source",
+    } for item in items)
+
+    platform_response = client.get(
+        f"/api/accounts/{account_id}/credentials",
+        params={"scope": "platform"},
+    )
+    assert platform_response.status_code == 200
+    platform_items = platform_response.json()["items"]
+    assert {item["key"] for item in platform_items} == {
+        "access_token",
+        "refresh_token",
+        "cookies",
+    }
+    assert {item["scope"] for item in platform_items} == {"platform"}
+
+    codex_response = client.get(
+        f"/api/accounts/{account_id}/credentials",
+        params={"scope": "codex"},
+    )
+    assert codex_response.status_code == 200
+    codex_items = codex_response.json()["items"]
+    assert {item["key"] for item in codex_items} == {
+        "codex_access_token",
+        "codex_refresh_token",
+    }
+    assert {item["scope"] for item in codex_items} == {"codex"}
+
+
+def test_get_account_credentials_not_found(client):
+    response = client.get("/api/accounts/99999/credentials")
+    assert response.status_code == 404
 
 
 def test_get_account_not_found(client):
@@ -238,6 +656,16 @@ def test_codex_oauth_batch_freezes_selected_account_ids_and_params(client):
     assert payload["action_id"] == "codex_oauth_authorize"
     assert payload["concurrency"] == 3
     assert payload["params"]["platform_proxy_mode"] == "manual"
+
+
+def test_empty_export_selection_never_falls_back_to_all_accounts():
+    _create_account(email="must-not-export@test.com")
+
+    records = AccountsRepository().select_for_export(
+        AccountExportSelection(platform="chatgpt", ids=[], select_all=False)
+    )
+
+    assert records == []
 
 
 def test_export_any2api_multi_platform(client):

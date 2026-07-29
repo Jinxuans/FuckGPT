@@ -281,3 +281,142 @@ def build_account_display_summary(
         "warnings": warnings,
         "sections": sections,
     }
+
+
+def build_account_view_display(
+    *,
+    status: dict[str, Any] | None,
+    subscription: dict[str, Any] | None,
+    security: dict[str, Any] | None,
+    usage: dict[str, Any] | None,
+    codex: dict[str, Any] | None,
+    verification: dict[str, Any] | None,
+    last_error: str = "",
+) -> dict[str, Any]:
+    """Build presentation-only fields for the structured ``account_view``.
+
+    This function only accepts the already-safe projection sections.  In
+    particular, credentials, cookies and raw OAuth tokens cannot accidentally
+    flow into badges, metrics or warnings.
+    """
+
+    status = _safe_dict(status)
+    subscription = _safe_dict(subscription)
+    security = _safe_dict(security)
+    usage = _safe_dict(usage)
+    codex = _safe_dict(codex)
+    verification = _safe_dict(verification)
+
+    badges: list[dict[str, Any]] = []
+    seen_badges: set[str] = set()
+
+    def add_badge(label: Any, tone: str = "muted") -> None:
+        text = _text(label)
+        if not text or text in seen_badges:
+            return
+        seen_badges.add(text)
+        badges.append({"label": text, "tone": tone})
+
+    plan = _text(subscription.get("plan"))
+    plan_state = _text(subscription.get("state"))
+    if plan:
+        add_badge(plan.title(), "good" if plan_state in {"subscribed", "trial"} else "muted")
+    if security.get("phone_bound"):
+        add_badge("已绑手机", "good")
+    if codex.get("authorized"):
+        add_badge("Codex 已授权", "good")
+    if isinstance(verification.get("mailbox"), dict):
+        add_badge("邮箱验证", "muted")
+
+    primary_metrics: list[dict[str, Any]] = []
+    secondary_metrics: list[dict[str, Any]] = []
+    if plan:
+        _append_metric(secondary_metrics, _metric("plan", "套餐", plan, tone="muted"))
+    if security.get("phone_bound"):
+        _append_metric(
+            secondary_metrics,
+            _metric(
+                "phone_bound",
+                "绑定手机",
+                security.get("phone_number_masked") or "已绑定",
+                tone="good",
+            ),
+        )
+
+    raw_usage = _safe_dict(usage.get("raw"))
+    rate_limit = _safe_dict(raw_usage.get("rate_limit"))
+    if rate_limit:
+        _append_metric(primary_metrics, _quota_metric("weekly_limit", "周限额", rate_limit))
+    code_review_rate_limit = _safe_dict(raw_usage.get("code_review_rate_limit"))
+    if code_review_rate_limit:
+        _append_metric(
+            primary_metrics,
+            _quota_metric(
+                "code_review_weekly_limit",
+                "代码审查周限额",
+                code_review_rate_limit,
+            ),
+        )
+    used_percent = usage.get("used_percent")
+    if used_percent is not None and not any(item.get("key") == "weekly_limit" for item in primary_metrics):
+        try:
+            remaining = max(0.0, min(100.0, 100.0 - float(used_percent)))
+        except (TypeError, ValueError):
+            remaining = None
+        if remaining is not None:
+            reset_label = _format_reset_at(usage.get("reset_at"))
+            _append_metric(
+                primary_metrics,
+                _metric(
+                    "usage_limit",
+                    "额度",
+                    f"剩余 {remaining:g}%",
+                    sub=f"{reset_label} 重置" if reset_label else "",
+                    percent=remaining,
+                    tone="danger" if usage.get("limit_reached") or remaining <= 0 else ("warning" if remaining <= 20 else "good"),
+                ),
+            )
+    credits = _safe_dict(usage.get("credits"))
+    if credits.get("unlimited"):
+        _append_metric(secondary_metrics, _metric("credits", "Credits", "无限", tone="good"))
+    elif credits.get("balance") not in (None, ""):
+        _append_metric(secondary_metrics, _metric("credits", "Credits", credits.get("balance"), tone="muted"))
+
+    warnings: list[dict[str, Any]] = []
+    lifecycle = _text(status.get("lifecycle"))
+    validity = _text(status.get("validity"))
+    if validity == "invalid" or lifecycle == "invalid":
+        warnings.append({"key": "invalid", "tone": "danger", "message": "账号当前检测为失效"})
+    elif validity == "unknown":
+        warnings.append({"key": "unknown_validity", "tone": "warning", "message": "尚未完成有效性检测"})
+    if usage.get("limit_reached"):
+        warnings.append({"key": "limit_reached", "tone": "danger", "message": "账号额度已用尽"})
+    try:
+        trial_end_time = int(subscription.get("trial_end_time") or 0)
+    except (TypeError, ValueError):
+        trial_end_time = 0
+    if plan_state == "trial" and trial_end_time > 0:
+        seconds_left = trial_end_time - int(datetime.now(timezone.utc).timestamp())
+        if seconds_left <= 0:
+            warnings.append({"key": "trial_expired", "tone": "danger", "message": "试用已到期"})
+        elif seconds_left <= 48 * 3600:
+            hours_left = max(1, (seconds_left + 3599) // 3600)
+            warnings.append(
+                {
+                    "key": "trial_expiring",
+                    "tone": "warning",
+                    "message": f"试用将在 {hours_left} 小时内到期",
+                }
+            )
+    if _text(last_error):
+        warnings.append({"key": "check_error", "tone": "danger", "message": _text(last_error)})
+
+    return {
+        "badges": badges,
+        "metrics": {
+            "primary": primary_metrics,
+            "secondary": secondary_metrics,
+        },
+        "warnings": warnings,
+        "sections": [],
+    }

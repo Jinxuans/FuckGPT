@@ -1,11 +1,13 @@
 """数据库模型 - SQLite via SQLModel"""
 import json
 import os
+import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from sqlalchemy import Index, UniqueConstraint, inspect, text
+from sqlalchemy import Index, UniqueConstraint, event, inspect, text
+from sqlalchemy.engine import Engine
 from sqlmodel import Field, SQLModel, Session, create_engine, select
 
 
@@ -19,11 +21,27 @@ def _default_database_url() -> str:
 
 
 DATABASE_URL = os.getenv("ACCOUNT_MANAGER_DATABASE_URL", _default_database_url())
+
+
+@event.listens_for(Engine, "connect")
+def _enable_sqlite_foreign_keys(dbapi_connection, _connection_record) -> None:
+    if not isinstance(dbapi_connection, sqlite3.Connection):
+        return
+    cursor = dbapi_connection.cursor()
+    try:
+        cursor.execute("PRAGMA foreign_keys=ON")
+    finally:
+        cursor.close()
+
+
 engine = create_engine(DATABASE_URL)
 
 
 class AccountModel(SQLModel, table=True):
     __tablename__ = "accounts"
+    __table_args__ = (
+        UniqueConstraint("platform", "email", name="uq_accounts_platform_email"),
+    )
 
     id: Optional[int] = Field(default=None, primary_key=True)
     platform: str = Field(index=True)
@@ -34,33 +52,21 @@ class AccountModel(SQLModel, table=True):
     updated_at: datetime = Field(default_factory=_utcnow)
 
 
-class AccountOverviewModel(SQLModel, table=True):
-    __tablename__ = "account_overviews"
-
-    account_id: int = Field(primary_key=True, foreign_key="accounts.id")
-    lifecycle_status: str = Field(default="registered", index=True)
-    validity_status: str = Field(default="unknown", index=True)
-    plan_state: str = Field(default="unknown", index=True)
-    plan_name: str = ""
-    display_status: str = Field(default="registered", index=True)
-    remote_email: str = ""
-    checked_at: Optional[datetime] = None
-    summary_json: str = "{}"
-    created_at: datetime = Field(default_factory=_utcnow)
-    updated_at: datetime = Field(default_factory=_utcnow)
-
-    def get_summary(self) -> dict:
-        return json.loads(self.summary_json or "{}")
-
-    def set_summary(self, data: dict):
-        self.summary_json = json.dumps(data or {}, ensure_ascii=False)
-
-
-class AccountCredentialModel(SQLModel, table=True):
-    __tablename__ = "account_credentials"
+class AccountAuthCredentialModel(SQLModel, table=True):
+    __tablename__ = "account_auth_credentials"
+    __table_args__ = (
+        UniqueConstraint(
+            "account_id",
+            "scope",
+            "provider_name",
+            "key",
+            name="uq_account_auth_credentials_key",
+        ),
+        Index("ix_account_auth_credentials_account_scope", "account_id", "scope"),
+    )
 
     id: Optional[int] = Field(default=None, primary_key=True)
-    account_id: int = Field(index=True, foreign_key="accounts.id")
+    account_id: int = Field(index=True, foreign_key="accounts.id", ondelete="CASCADE")
     scope: str = Field(default="platform", index=True)
     provider_name: str = Field(default="", index=True)
     credential_type: str = Field(default="secret", index=True)
@@ -79,11 +85,129 @@ class AccountCredentialModel(SQLModel, table=True):
         self.metadata_json = json.dumps(data or {}, ensure_ascii=False)
 
 
+class AccountStatusModel(SQLModel, table=True):
+    __tablename__ = "account_status"
+
+    account_id: int = Field(primary_key=True, foreign_key="accounts.id", ondelete="CASCADE")
+    lifecycle_status: str = Field(default="registered", index=True)
+    validity_status: str = Field(default="unknown", index=True)
+    display_status: str = Field(default="registered", index=True)
+    remote_email: str = ""
+    region: str = ""
+    checked_at: Optional[datetime] = None
+    last_error: str = ""
+    created_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow)
+
+
+class AccountSubscriptionModel(SQLModel, table=True):
+    __tablename__ = "account_subscription"
+
+    account_id: int = Field(primary_key=True, foreign_key="accounts.id", ondelete="CASCADE")
+    plan_type: str = Field(default="", index=True)
+    plan_state: str = Field(default="unknown", index=True)
+    source: str = ""
+    trial_end_time: int = 0
+    cashier_url: str = ""
+    raw_json: str = "{}"
+    checked_at: Optional[datetime] = None
+    created_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow)
+
+    def get_raw(self) -> dict:
+        return json.loads(self.raw_json or "{}")
+
+    def set_raw(self, data: dict):
+        self.raw_json = json.dumps(data or {}, ensure_ascii=False, default=str)
+
+
+class AccountSecurityProfileModel(SQLModel, table=True):
+    __tablename__ = "account_security_profile"
+
+    account_id: int = Field(primary_key=True, foreign_key="accounts.id", ondelete="CASCADE")
+    phone_bound: bool = Field(default=False, index=True)
+    phone_number_masked: str = ""
+    mfa_enabled: bool = Field(default=False, index=True)
+    amr_json: str = "[]"
+    raw_json: str = "{}"
+    checked_at: Optional[datetime] = None
+    created_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow)
+
+    def get_amr(self) -> list:
+        data = json.loads(self.amr_json or "[]")
+        return data if isinstance(data, list) else []
+
+    def set_amr(self, data: list):
+        self.amr_json = json.dumps(data or [], ensure_ascii=False, default=str)
+
+    def get_raw(self) -> dict:
+        data = json.loads(self.raw_json or "{}")
+        return data if isinstance(data, dict) else {}
+
+    def set_raw(self, data: dict):
+        self.raw_json = json.dumps(data or {}, ensure_ascii=False, default=str)
+
+
+class AccountUsageSnapshotModel(SQLModel, table=True):
+    __tablename__ = "account_usage_snapshot"
+    __table_args__ = (
+        Index(
+            "ix_account_usage_snapshot_account_provider_checked",
+            "account_id",
+            "provider",
+            "checked_at",
+        ),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    account_id: int = Field(index=True, foreign_key="accounts.id", ondelete="CASCADE")
+    provider: str = Field(default="", index=True)
+    plan_type: str = Field(default="", index=True)
+    used_percent: Optional[float] = None
+    limit_reached: bool = Field(default=False, index=True)
+    reset_at: int = 0
+    credits_json: str = "{}"
+    raw_json: str = "{}"
+    checked_at: datetime = Field(default_factory=_utcnow, index=True)
+    created_at: datetime = Field(default_factory=_utcnow)
+
+    def get_credits(self) -> dict:
+        data = json.loads(self.credits_json or "{}")
+        return data if isinstance(data, dict) else {}
+
+    def set_credits(self, data: dict):
+        self.credits_json = json.dumps(data or {}, ensure_ascii=False, default=str)
+
+    def get_raw(self) -> dict:
+        data = json.loads(self.raw_json or "{}")
+        return data if isinstance(data, dict) else {}
+
+    def set_raw(self, data: dict):
+        self.raw_json = json.dumps(data or {}, ensure_ascii=False, default=str)
+
+
+class AccountCodexAuthModel(SQLModel, table=True):
+    __tablename__ = "account_codex_auth"
+
+    account_id: int = Field(primary_key=True, foreign_key="accounts.id", ondelete="CASCADE")
+    codex_email: str = Field(default="", index=True)
+    codex_account_id: str = Field(default="", index=True)
+    codex_plan_type: str = Field(default="", index=True)
+    auth_path: str = ""
+    expires_at: Optional[datetime] = None
+    last_refresh: Optional[datetime] = None
+    has_access_token: bool = Field(default=False, index=True)
+    has_refresh_token: bool = Field(default=False, index=True)
+    created_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow)
+
+
 class ProviderAccountModel(SQLModel, table=True):
     __tablename__ = "provider_accounts"
 
     id: Optional[int] = Field(default=None, primary_key=True)
-    account_id: int = Field(index=True, foreign_key="accounts.id")
+    account_id: int = Field(index=True, foreign_key="accounts.id", ondelete="CASCADE")
     provider_type: str = Field(default="mailbox", index=True)
     provider_name: str = Field(default="", index=True)
     login_identifier: str = Field(default="", index=True)
@@ -110,7 +234,7 @@ class ProviderResourceModel(SQLModel, table=True):
     __tablename__ = "provider_resources"
 
     id: Optional[int] = Field(default=None, primary_key=True)
-    account_id: int = Field(index=True, foreign_key="accounts.id")
+    account_id: int = Field(index=True, foreign_key="accounts.id", ondelete="CASCADE")
     provider_type: str = Field(default="mailbox", index=True)
     provider_name: str = Field(default="", index=True)
     resource_type: str = Field(default="resource", index=True)
@@ -440,105 +564,11 @@ def save_account(account, *, session: Session | None = None, commit: bool = True
         return model
 
 
-LEGACY_ACCOUNT_COLUMNS = (
-    "region",
-    "token",
-    "status",
-    "trial_end_time",
-    "cashier_url",
-    "extra_json",
-)
-
-
-def _load_json(value: str) -> dict:
-    try:
-        data = json.loads(value or "{}")
-    except Exception:
-        return {}
-    return data if isinstance(data, dict) else {}
-
-
-def _accounts_columns() -> set[str]:
-    inspector = inspect(engine)
-    tables = set(inspector.get_table_names())
-    if "accounts" not in tables:
-        return set()
-    return {column["name"] for column in inspector.get_columns("accounts")}
-
-
-def _migrate_legacy_accounts_schema() -> None:
-    columns = _accounts_columns()
-    if not columns or not any(column in columns for column in LEGACY_ACCOUNT_COLUMNS):
-        return
-
-    from core.account_graph import sync_legacy_account_graph
-
-    with engine.begin() as connection:
-        rows = connection.exec_driver_sql(
-            """
-            SELECT
-                id,
-                platform,
-                COALESCE(region, '') AS region,
-                COALESCE(token, '') AS token,
-                COALESCE(status, 'registered') AS status,
-                COALESCE(trial_end_time, 0) AS trial_end_time,
-                COALESCE(cashier_url, '') AS cashier_url,
-                COALESCE(extra_json, '{}') AS extra_json
-            FROM accounts
-            """
-        ).mappings().all()
-
-    with Session(engine) as session:
-        for row in rows:
-            sync_legacy_account_graph(
-                session,
-                account_id=int(row["id"] or 0),
-                platform=str(row["platform"] or ""),
-                lifecycle_status=str(row["status"] or "registered"),
-                region=str(row["region"] or ""),
-                legacy_token=str(row["token"] or ""),
-                trial_end_time=int(row["trial_end_time"] or 0),
-                cashier_url=str(row["cashier_url"] or ""),
-                extra=_load_json(str(row["extra_json"] or "{}")),
-            )
-        session.commit()
-
-    with engine.begin() as connection:
-        connection.exec_driver_sql("PRAGMA foreign_keys=OFF")
-        connection.exec_driver_sql(
-            """
-            CREATE TABLE accounts__new (
-                id INTEGER NOT NULL PRIMARY KEY,
-                platform VARCHAR NOT NULL,
-                email VARCHAR NOT NULL,
-                password VARCHAR NOT NULL,
-                user_id VARCHAR NOT NULL,
-                created_at DATETIME NOT NULL,
-                updated_at DATETIME NOT NULL
-            )
-            """
-        )
-        connection.exec_driver_sql(
-            """
-            INSERT INTO accounts__new (id, platform, email, password, user_id, created_at, updated_at)
-            SELECT id, platform, email, password, user_id, created_at, updated_at
-            FROM accounts
-            """
-        )
-        connection.exec_driver_sql("DROP TABLE accounts")
-        connection.exec_driver_sql("ALTER TABLE accounts__new RENAME TO accounts")
-        connection.exec_driver_sql("CREATE INDEX ix_accounts_platform ON accounts (platform)")
-        connection.exec_driver_sql("CREATE INDEX ix_accounts_email ON accounts (email)")
-        connection.exec_driver_sql("PRAGMA foreign_keys=ON")
-
-
 def init_db():
     SQLModel.metadata.create_all(engine)
     from core.account_graph import sync_all_account_graphs
     from infrastructure.provider_definitions_repository import ProviderDefinitionsRepository
 
-    _migrate_legacy_accounts_schema()
     _ensure_column("provider_definitions", "category", "TEXT DEFAULT ''")
     SQLModel.metadata.create_all(engine)
 

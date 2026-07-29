@@ -19,8 +19,11 @@ def _account_id(account) -> str:
     extra = getattr(account, "extra", {}) or {}
     for value in (
         getattr(account, "chatgpt_account_id", ""),
+        getattr(account, "account_id", ""),
         extra.get("chatgpt_account_id", ""),
         extra.get("chatgptAccountId", ""),
+        extra.get("account_id", ""),
+        extra.get("accountId", ""),
     ):
         if str(value or "").strip():
             return str(value).strip()
@@ -57,13 +60,28 @@ def _status_from_me(data: dict) -> str:
     return "free"
 
 
+def _status_from_usage(usage: dict | None) -> str | None:
+    """Return a plan only when wham explicitly supplied ``plan_type``.
+
+    An explicit ``free`` response is authoritative too.  Treating it as a
+    missing/weak value lets stale ``backend-api/me`` organisation data turn a
+    downgraded account back into Plus/Team.
+    """
+    if not isinstance(usage, dict):
+        return None
+    plan_type = usage.get("plan_type")
+    if not str(plan_type or "").strip():
+        return None
+    return _plan(plan_type)
+
+
 def _status_from_details(me: dict | None, usage: dict | None) -> str:
-    usage_status = _plan((usage or {}).get("plan_type"))
-    if usage_status != "free":
+    usage_status = _status_from_usage(usage)
+    if usage_status is not None:
         return usage_status
     if isinstance(me, dict):
         return _status_from_me(me)
-    return usage_status
+    return "free"
 
 
 def _usage(account, proxy: Optional[str]) -> dict:
@@ -104,12 +122,22 @@ def fetch_subscription_status_details(account, proxy: Optional[str] = None) -> d
                 usage = _usage(account, proxy)
             except Exception as exc:
                 logger.info("usage enrichment failed: %s", exc)
-            return {"status": _status_from_details(data, usage), "source": "backend-api/me", "me": data, "usage": usage}
+            # ``wham/usage.plan_type`` is the canonical plan signal whenever
+            # it is present (including an explicit ``free``).  ``/me`` still
+            # contributes profile/security information and remains the source
+            # only when wham did not provide a plan.
+            source = "backend-api/wham/usage" if _status_from_usage(usage) is not None else "backend-api/me"
+            return {
+                "status": _status_from_details(data, usage),
+                "source": source,
+                "me": data,
+                "usage": usage,
+            }
     except Exception as exc:
         logger.info("subscription status fallback to usage: %s", exc)
     usage = _usage(account, proxy)
     return {
-        "status": _plan(usage.get("plan_type")),
+        "status": _status_from_details(None, usage),
         "source": "backend-api/wham/usage",
         "me": None,
         "usage": usage,

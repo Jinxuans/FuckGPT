@@ -48,6 +48,7 @@ const ZH_MESSAGES = {
   "common.standby": "待命",
 
   "nav.dashboard": "总览",
+  "nav.chatgptAccounts": "ChatGPT 账号",
   "nav.mailboxResources": "邮箱资源",
   "nav.tasks": "任务记录",
   "nav.settings": "设置",
@@ -464,6 +465,7 @@ const EN_MESSAGES: Record<TranslationKey, string> = {
   "common.standby": "Standby",
 
   "nav.dashboard": "Dashboard",
+  "nav.chatgptAccounts": "ChatGPT Accounts",
   "nav.mailboxResources": "Mailbox Resources",
   "nav.tasks": "Task History",
   "nav.settings": "Settings",

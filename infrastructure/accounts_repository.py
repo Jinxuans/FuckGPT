@@ -7,6 +7,7 @@ from sqlmodel import Session, select
 from core.account_display import build_account_display_summary
 from core.db import AccountModel, engine
 from core.account_graph import (
+    build_account_view,
     compute_account_stats,
     load_account_graphs,
     matches_status_filter,
@@ -83,6 +84,7 @@ def _to_record(model: AccountModel, graph: dict | None = None) -> AccountRecord:
             overview=overview,
             provider_resources=provider_resources,
         ),
+        account_view=build_account_view(model, graph),
         credentials=list(graph.get("credentials") or []),
         provider_accounts=list(graph.get("provider_accounts") or []),
         provider_resources=provider_resources,
@@ -96,7 +98,11 @@ class AccountsRepository:
     def _load_records(session: Session, models: list[AccountModel]) -> list[AccountRecord]:
         account_ids = [int(model.id or 0) for model in models if model.id]
         graphs = load_account_graphs(session, account_ids)
-        missing = [model for model in models if int(model.id or 0) not in graphs]
+        missing = [
+            model
+            for model in models
+            if not (graphs.get(int(model.id or 0)) or {}).get("status")
+        ]
         if missing:
             for model in missing:
                 sync_account_graph(session, model)
@@ -137,6 +143,8 @@ class AccountsRepository:
             return records[0] if records else None
 
     def select_for_export(self, selection: AccountExportSelection) -> list[AccountRecord]:
+        if not selection.select_all and not selection.ids:
+            return []
         with Session(engine) as session:
             statement = select(AccountModel)
             if selection.platform:
@@ -167,9 +175,6 @@ class AccountsRepository:
             if command.user_id is not None:
                 model.user_id = command.user_id
             model.updated_at = datetime.now(timezone.utc)
-            session.add(model)
-            session.commit()
-            session.refresh(model)
             patch_account_graph(
                 session,
                 model,
@@ -190,7 +195,9 @@ class AccountsRepository:
                 replace_provider_accounts=command.replace_provider_accounts,
                 replace_provider_resources=command.replace_provider_resources,
             )
+            session.add(model)
             session.commit()
+            session.refresh(model)
             return self._load_records(session, [model])[0]
 
     def delete(self, account_id: int) -> bool:
@@ -209,55 +216,62 @@ class AccountsRepository:
     def import_lines(self, platform: str, lines: list[AccountImportLine]) -> int:
         created = 0
         with Session(engine) as session:
+            models_by_email: dict[str, AccountModel] = {}
             for line in lines:
-                model = AccountModel(
-                    platform=platform,
-                    email=line.email,
-                    password=line.password,
-                )
-                session.add(model)
-                created += 1
-            session.commit()
-            models = session.exec(
-                select(AccountModel)
-                .where(AccountModel.platform == platform)
-                .order_by(AccountModel.id.desc())
-                .limit(created)
-            ).all()
-            by_email = {line.email: line for line in lines}
-            for model in models:
-                line = by_email.get(model.email)
-                if not line:
-                    sync_account_graph(session, model)
-                    continue
+                model = models_by_email.get(line.email)
+                if model is None:
+                    model = session.exec(
+                        select(AccountModel)
+                        .where(AccountModel.platform == platform)
+                        .where(AccountModel.email == line.email)
+                    ).first()
+                is_new = model is None
+                if model is None:
+                    model = AccountModel(
+                        platform=platform,
+                        email=line.email,
+                        password=line.password,
+                    )
+                    session.add(model)
+                    session.flush()
+                    created += 1
+                else:
+                    model.password = line.password
+                    model.updated_at = datetime.now(timezone.utc)
+                    session.add(model)
+                models_by_email[line.email] = model
+
                 extra = dict(line.extra or {})
                 summary_updates = dict(extra.get("overview") or extra.get("summary") or {})
-                for key in ("trial_end_time", "cashier_url", "region", "remote_email", "checked_at"):
+                for key in (
+                    "valid",
+                    "validity_status",
+                    "checked_at",
+                    "check_source",
+                    "subscription_source",
+                    "remote_email",
+                    "region",
+                    "plan",
+                    "plan_name",
+                    "plan_type",
+                    "plan_state",
+                    "trial_end_time",
+                    "cashier_url",
+                    "phone_bound",
+                    "phone_number_masked",
+                    "mfa_enabled",
+                    "amr",
+                    "chatgpt_usage",
+                    "wham_usage",
+                    "usage",
+                    "usage_summary",
+                    "subscription",
+                    "security",
+                    "profile",
+                    "registration_auth_mode",
+                ):
                     if key in extra and key not in summary_updates:
                         summary_updates[key] = extra[key]
-                legacy_extra = {
-                    key: value
-                    for key, value in extra.items()
-                    if key not in {
-                        "overview",
-                        "summary",
-                        "primary_token",
-                        "token",
-                        "lifecycle_status",
-                        "status",
-                        "cashier_url",
-                        "trial_end_time",
-                        "region",
-                        "remote_email",
-                        "checked_at",
-                        "credentials",
-                        "provider_accounts",
-                        "provider_resources",
-                    }
-                    and value not in (None, "", [], {})
-                }
-                if legacy_extra:
-                    summary_updates["legacy_extra"] = legacy_extra
                 credential_updates = dict(extra.get("credentials") or {})
                 for key in (
                     "access_token",
@@ -274,16 +288,30 @@ class AccountsRepository:
                     "wos_session",
                     "sso",
                     "sso_rw",
+                    "codex_access_token",
+                    "codex_refresh_token",
+                    "codex_id_token",
+                    "codex_account_id",
+                    "codex_email",
+                    "codex_plan_type",
+                    "codex_expires_at",
+                    "codex_last_refresh",
+                    "codex_auth_path",
                 ):
                     if key in extra and key not in credential_updates:
                         credential_updates[key] = extra[key]
                 primary_token = extra.get("primary_token")
                 if primary_token in (None, ""):
                     primary_token = extra.get("token")
+                lifecycle_status = extra.get("lifecycle_status")
+                if lifecycle_status in (None, ""):
+                    lifecycle_status = extra.get("status")
+                if lifecycle_status in (None, "") and is_new:
+                    lifecycle_status = "registered"
                 patch_account_graph(
                     session,
                     model,
-                    lifecycle_status=str(extra.get("lifecycle_status") or extra.get("status") or "registered"),
+                    lifecycle_status=str(lifecycle_status or "") or None,
                     primary_token=str(primary_token or "") or None,
                     cashier_url=str(extra.get("cashier_url") or "") or None,
                     summary_updates=summary_updates or None,
