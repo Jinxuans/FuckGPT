@@ -119,7 +119,6 @@ def test_chatgpt_register_task_succeeds_after_successful_registration(monkeypatc
             "password": "Secret123!",
             "extra": {
                 "identity_provider": "mailbox",
-                "auto_upload_sub2api_agent_identity": True,
             },
         },
         logger,
@@ -136,12 +135,6 @@ def test_chatgpt_register_task_succeeds_after_successful_registration(monkeypatc
                 "email": "registered@example.com",
             }
         ],
-        "auto_upload_sub2api_agent_identity": True,
-        "sub2api_agent_identity_upload": {
-            "submitted": 0,
-            "failed": 0,
-            "errors": [],
-        },
     }
     assert any(event[0] == "success" for event in logger.events)
     assert not any(
@@ -349,84 +342,6 @@ def test_register_task_cancel_stops_scheduling_new_workers(monkeypatch):
     assert logger.finished == (tasks_module.TASK_STATUS_CANCELLED, "任务已取消")
 
 
-def test_register_task_uploads_each_saved_account_immediately(monkeypatch):
-    events = []
-
-    class FakePlatform:
-        def register(self, email=None, password=None):
-            return Account(
-                platform="chatgpt",
-                email=email or "registered@example.com",
-                password=password or "Secret123!",
-                user_id="acct_123",
-                extra={"access_token": "access-token"},
-            )
-
-    saved_ids = iter((123, 124))
-
-    def save(account, **kwargs):
-        account_id = next(saved_ids)
-        events.append(("saved", account_id))
-        return type("SavedAccount", (), {"id": account_id})()
-
-    def upload(account_id, *, sub2api_url, api_key):
-        events.append(("uploaded", account_id, sub2api_url, api_key))
-        return {"submitted": 1}
-
-    monkeypatch.setattr(tasks_module, "get", lambda platform_name: object)
-    monkeypatch.setattr(
-        tasks_module,
-        "_resolve_registration_proxy_for_platform",
-        lambda *args, **kwargs: None,
-    )
-    monkeypatch.setattr(
-        tasks_module,
-        "_build_platform_instance",
-        lambda *args, **kwargs: FakePlatform(),
-    )
-    monkeypatch.setattr(tasks_module, "save_account", save)
-    monkeypatch.setattr(
-        tasks_module,
-        "_upload_registered_chatgpt_account_to_sub2api",
-        upload,
-    )
-    monkeypatch.setattr("core.base_mailbox.create_mailbox", lambda *args, **kwargs: object())
-
-    logger = _FakeLogger(task_id="task-immediate-upload")
-    tasks_module.set_register_sub2api_upload_config(
-        logger.task_id,
-        sub2api_url="https://sub2api.example",
-        api_key="volatile-admin-key",
-    )
-    try:
-        tasks_module._execute_register_task(
-            {
-                "platform": "chatgpt",
-                "count": 2,
-                "concurrency": 1,
-                "extra": {
-                    "identity_provider": "mailbox",
-                    "auto_upload_sub2api_agent_identity": True,
-                },
-            },
-            logger,
-        )
-    finally:
-        tasks_module.clear_register_sub2api_upload_config(logger.task_id)
-
-    assert [item[:2] for item in events] == [
-        ("saved", 123),
-        ("uploaded", 123),
-        ("saved", 124),
-        ("uploaded", 124),
-    ]
-    assert logger.result_data["sub2api_agent_identity_upload"] == {
-        "submitted": 2,
-        "failed": 0,
-        "errors": [],
-    }
-
-
 def test_register_task_separates_platform_and_mailbox_proxies(monkeypatch):
     captured = {}
 
@@ -496,11 +411,8 @@ def test_register_api_preserves_protocol_outlook_pool(client, monkeypatch):
             "count": 1,
             "concurrency": 1,
             "executor_type": "protocol",
-            "sub2api_url": "https://sub2api.example",
-            "sub2api_api_key": "volatile-admin-key",
             "extra": {
                 "local_ms_pool_text": pool_text,
-                "auto_upload_sub2api_agent_identity": True,
             },
         },
     )
@@ -510,40 +422,6 @@ def test_register_api_preserves_protocol_outlook_pool(client, monkeypatch):
     assert captured["extra"]["mail_provider"] == "local_ms_pool"
     assert captured["extra"]["local_ms_pool_text"] == pool_text
     assert captured["extra"]["local_ms_pool_alias_count"] == 6
-    assert captured["extra"]["auto_upload_sub2api_agent_identity"] is True
-
-
-def test_register_api_keeps_sub2api_key_out_of_task_payload(client, monkeypatch):
-    captured = {}
-
-    def fake_create(payload, *, sub2api_upload=None):
-        captured["payload"] = payload
-        captured["upload"] = sub2api_upload
-        return {"task_id": "task_protocol"}
-
-    monkeypatch.setattr("api.task_commands.command_service.create_register_task", fake_create)
-
-    response = client.post(
-        "/api/tasks/register",
-        json={
-            "count": 1,
-            "executor_type": "protocol",
-            "sub2api_url": "https://sub2api.example",
-            "sub2api_api_key": "volatile-admin-key",
-            "extra": {
-                "local_ms_pool_text": "user@outlook.com----mail-pass----client-id----refresh-token",
-                "auto_upload_sub2api_agent_identity": True,
-            },
-        },
-    )
-
-    assert response.status_code == 200
-    assert "sub2api_api_key" not in captured["payload"]
-    assert "sub2api_url" not in captured["payload"]
-    assert captured["upload"] == {
-        "sub2api_url": "https://sub2api.example",
-        "api_key": "volatile-admin-key",
-    }
 
 
 def test_register_api_allows_six_outlook_child_addresses_per_parent(client, monkeypatch):
