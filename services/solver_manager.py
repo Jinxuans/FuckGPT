@@ -109,7 +109,10 @@ def start():
         _proc = subprocess.Popen(
             cmd,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
+            # A long-lived solver must not inherit a pipe that the parent
+            # closes after the readiness probe. On Windows the next Quart log
+            # write can otherwise hit a broken pipe and terminate the solver.
+            stderr=subprocess.DEVNULL,
             env={**os.environ, "PYTHONUTF8": "1"},
         )
         # 等待服务就绪（最多30s）
@@ -133,11 +136,6 @@ def start():
                 print(f"[Solver] 已启动 PID={_proc.pid}")
                 _consecutive_failures = 0
                 _last_failure_reason = ""
-                # 关闭 stderr pipe 避免缓冲区满导致子进程阻塞
-                try:
-                    _proc.stderr.close()
-                except Exception:
-                    pass
                 return
         # 启动超时
         _consecutive_failures += 1

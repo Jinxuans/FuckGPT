@@ -13,17 +13,128 @@ from platforms.chatgpt.protocol_register import (
 )
 from platforms.chatgpt.browser_register import (
     OTP_SUBMIT_SELECTORS,
+    _about_you_checkbox_is_master,
+    _about_you_checkbox_is_required,
     _browser_registration_flow,
+    _check_required_about_you_consents,
     _click_first,
     _click_otp_submit_button,
+    _collect_visible_text_inputs,
     _extract_auth_error_text,
+    _infer_about_you_mode,
     _is_login_password_url,
+    _pick_best_about_you_input,
     _press_enter_on_input,
     _probe_password_registration_page,
     _start_browser_signup_via_authorize,
     _submit_password_via_page,
     _submit_otp_via_page,
 )
+
+
+def test_about_you_mode_uses_stable_age_attributes_for_unknown_locale():
+    entries = [
+        {
+            "visibleIndex": 0,
+            "type": "text",
+            "name": "name",
+            "id": "_r_3_-name",
+            "labels": ["성명"],
+        },
+        {
+            "visibleIndex": 1,
+            "type": "text",
+            "name": "age",
+            "id": "_r_3_-age",
+            "inputMode": "numeric",
+            "labels": ["연령"],
+        },
+    ]
+
+    age_entry = _pick_best_about_you_input(entries, "age", exclude_visible_indices={0})
+
+    assert age_entry is entries[1]
+    assert _infer_about_you_mode(entries, {"hasAge": False, "hasBirthday": False}) == "age"
+
+
+def test_about_you_mode_prefers_visible_birthday_semantics():
+    entries = [
+        {"visibleIndex": 0, "type": "text", "name": "name", "id": "profile-name"},
+        {"visibleIndex": 1, "type": "date", "name": "birthdate", "id": "profile-birthdate"},
+    ]
+
+    assert _infer_about_you_mode(entries, {}) == "birthday"
+    assert _infer_about_you_mode(entries[:1], {}, has_segmented_birthday=True) == "birthday"
+    assert _infer_about_you_mode(entries[:1], {}, has_birthday_select=True) == "birthday_select"
+
+
+def test_collect_visible_text_inputs_excludes_consent_checkboxes():
+    class Page:
+        def evaluate(self, _script, _selector):
+            return [
+                {"visibleIndex": 0, "type": "text", "name": "name"},
+                {"visibleIndex": 1, "type": "number", "name": "age"},
+                {"visibleIndex": 2, "type": "checkbox", "name": "allcheckboxes"},
+                {"visibleIndex": 3, "type": "checkbox", "name": "privacy"},
+            ]
+
+    assert [item["name"] for item in _collect_visible_text_inputs(Page())] == ["name", "age"]
+
+
+def test_about_you_consent_classifier_skips_master_and_optional_items():
+    master = {"name": "allcheckboxes", "id": "_r_3_-allcheckboxes", "labels": ["Agree to all"]}
+    required_native = {"name": "privacy", "required": True, "labels": ["Privacy"]}
+    required_korean = {"name": "privacy", "labels": ["개인정보 수집 및 사용(필수)"]}
+    optional = {"name": "marketing", "labels": ["Marketing updates (optional)"]}
+
+    assert _about_you_checkbox_is_master(master) is True
+    assert _about_you_checkbox_is_required(required_native) is True
+    assert _about_you_checkbox_is_required(required_korean) is True
+    assert _about_you_checkbox_is_required(optional) is False
+
+
+def test_about_you_checks_only_required_individual_consents():
+    entries = [
+        {"visibleIndex": 0, "name": "allcheckboxes", "required": True},
+        {"visibleIndex": 1, "name": "privacy", "required": True},
+        {"visibleIndex": 2, "name": "marketing", "labels": ["Optional updates"]},
+        {"visibleIndex": 3, "name": "terms", "ariaRequired": True, "checked": True},
+    ]
+
+    class Checkbox:
+        def __init__(self, checked=False):
+            self.checked = checked
+            self.check_calls = 0
+
+        def is_checked(self, **_kwargs):
+            return self.checked
+
+        def check(self, **_kwargs):
+            self.check_calls += 1
+            self.checked = True
+
+        def click(self, **_kwargs):
+            raise AssertionError("native check should succeed")
+
+    controls = [Checkbox(), Checkbox(), Checkbox(), Checkbox(checked=True)]
+
+    class Locator:
+        def nth(self, index):
+            return controls[index]
+
+    class Page:
+        def evaluate(self, _script):
+            return entries
+
+        def locator(self, selector):
+            assert selector == "input[type='checkbox']:visible:not([disabled])"
+            return Locator()
+
+    logs = []
+    assert _check_required_about_you_consents(Page(), logs.append) == 2
+    assert [control.check_calls for control in controls] == [0, 1, 0, 0]
+    assert "required=2" in logs[-1]
+    assert "master_skipped=1" in logs[-1]
 
 
 class _FakeCookies:

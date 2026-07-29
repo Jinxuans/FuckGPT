@@ -1256,6 +1256,40 @@ def test_codex_sms_phone_callback_retries_when_no_numbers(monkeypatch):
     assert any("接码暂无号码" in item for item in logs)
 
 
+def test_codex_sms_phone_callback_retries_transient_connection_reset(monkeypatch):
+    class Provider:
+        def __init__(self):
+            self.calls = 0
+
+        def get_number(self, service="", country=""):
+            self.calls += 1
+            if self.calls < 3:
+                raise RuntimeError(
+                    "SMSBower 请求失败: ('Connection aborted.', "
+                    "ConnectionResetError(10054, 'remote reset'))"
+                )
+            return SmsActivation(
+                activation_id="activation-3",
+                phone_number="+15555550123",
+                provider="smsbower",
+                service=service,
+                country=country,
+            )
+
+    sleeps = []
+    monkeypatch.setattr("platforms.chatgpt.plugin.time.sleep", lambda seconds: sleeps.append(seconds))
+    provider = Provider()
+    callback = _CodexSmsPhoneCallback(
+        provider,
+        buy_max_attempts=5,
+        buy_retry_interval=1,
+    )
+
+    assert callback() == "+15555550123"
+    assert provider.calls == 3
+    assert sleeps == [1, 1]
+
+
 def test_codex_sms_phone_callback_sparsifies_large_no_number_retry_logs(monkeypatch):
     class Provider:
         request_timeout = 1

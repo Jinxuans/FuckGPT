@@ -314,6 +314,26 @@ class _CodexSmsPhoneCallback:
             or "no stock" in lowered
             or "暂无库存" in message
             or "无库存" in message
+            or any(
+                token in lowered
+                for token in (
+                    "connectionreseterror",
+                    "connection reset",
+                    "connection aborted",
+                    "remotedisconnected",
+                    "remote end closed connection",
+                    "temporarily unavailable",
+                    "connect timeout",
+                    "read timed out",
+                    "timed out",
+                    "sslerror",
+                    "ssleoferror",
+                    "unexpected_eof",
+                    "eof occurred",
+                    "network is unreachable",
+                    "proxyerror",
+                )
+            )
         )
 
     def _buy_number_with_retry(self):

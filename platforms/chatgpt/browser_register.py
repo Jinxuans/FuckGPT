@@ -919,13 +919,21 @@ def _sync_hidden_birthday_input(page, birthdate: str, log) -> bool:
     return synced
 
 
+ABOUT_YOU_VALUE_INPUT_DOM_SELECTOR = (
+    "input:not([type='hidden']):not([type='checkbox']):not([type='radio'])"
+    ":not([type='submit']):not([type='button']):not([type='reset'])"
+    ":not([type='file']):not([type='image']):not([disabled]):not([readonly])"
+)
+ABOUT_YOU_VALUE_INPUT_SELECTOR = f"{ABOUT_YOU_VALUE_INPUT_DOM_SELECTOR}:visible"
+
+
 def _collect_visible_text_inputs(page) -> list[dict]:
     try:
         inputs = page.evaluate(
             """
-            () => {
+            (inputSelector) => {
               const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
-              const nodes = Array.from(document.querySelectorAll("input:not([type='hidden']):not([disabled]):not([readonly])"));
+              const nodes = Array.from(document.querySelectorAll(inputSelector));
               const visible = nodes.filter((el) => {
                 const style = window.getComputedStyle(el);
                 const rect = el.getBoundingClientRect();
@@ -954,6 +962,13 @@ def _collect_visible_text_inputs(page) -> list[dict]:
                   type: normalize(el.getAttribute('type') || el.type || ''),
                   name: normalize(el.getAttribute('name') || ''),
                   id: normalize(el.id || ''),
+                  autocomplete: normalize(el.getAttribute('autocomplete') || ''),
+                  inputMode: normalize(el.getAttribute('inputmode') || ''),
+                  dataType: normalize(el.getAttribute('data-type') || ''),
+                  testId: normalize(el.getAttribute('data-testid') || ''),
+                  min: normalize(el.getAttribute('min') || ''),
+                  max: normalize(el.getAttribute('max') || ''),
+                  maxLength: Number(el.maxLength || 0),
                   placeholder: normalize(el.getAttribute('placeholder') || ''),
                   ariaLabel,
                   labels: explicitLabels.filter(Boolean),
@@ -963,11 +978,17 @@ def _collect_visible_text_inputs(page) -> list[dict]:
                 };
               });
             }
-            """
+            """,
+            ABOUT_YOU_VALUE_INPUT_DOM_SELECTOR,
         ) or []
     except Exception:
         inputs = []
-    return [item for item in inputs if isinstance(item, dict)]
+    text_like_types = {"", "text", "number", "date", "tel", "email"}
+    return [
+        item
+        for item in inputs
+        if isinstance(item, dict) and str(item.get("type") or "").strip().lower() in text_like_types
+    ]
 
 
 def _about_you_input_hints(entry: dict) -> str:
@@ -989,6 +1010,188 @@ def _about_you_input_hints(entry: dict) -> str:
     return " ".join(part for part in parts if part).strip().lower()
 
 
+def _about_you_stable_input_hints(entry: dict) -> str:
+    """Return language-independent form metadata for an about-you input."""
+    return " ".join(
+        str(entry.get(key) or "").strip().lower()
+        for key in ("name", "id", "autocomplete", "type", "inputMode", "dataType", "testId")
+        if str(entry.get(key) or "").strip()
+    )
+
+
+def _about_you_input_has_semantic_field(entry: dict, field: str) -> bool:
+    """Identify a field from stable DOM attributes, without relying on UI language."""
+    hints = _about_you_stable_input_hints(entry)
+    if not hints:
+        return False
+
+    tokens_by_field = {
+        "name": ("name", "fullname", "full-name", "full_name"),
+        "age": ("age",),
+        "birthday": ("birthday", "birthdate", "birth-date", "birth_date", "dob"),
+    }
+    tokens = tokens_by_field.get(field, ())
+    if any(re.search(rf"(?:^|[^a-z0-9]){re.escape(token)}(?:$|[^a-z0-9])", hints) for token in tokens):
+        return True
+    return field == "birthday" and str(entry.get("type") or "").strip().lower() == "date"
+
+
+def _infer_about_you_mode(
+    entries: list[dict],
+    mode_probe: dict,
+    *,
+    has_birthday_select: bool = False,
+    has_segmented_birthday: bool = False,
+) -> str:
+    """Classify the profile form using control semantics first and translated text last."""
+    if has_birthday_select:
+        return "birthday_select"
+
+    has_age_control = any(_about_you_input_has_semantic_field(entry, "age") for entry in entries)
+    has_birthday_control = any(_about_you_input_has_semantic_field(entry, "birthday") for entry in entries)
+    if has_segmented_birthday or has_birthday_control:
+        return "birthday"
+    if has_age_control:
+        return "age"
+
+    has_age_label = bool(mode_probe.get("hasAge"))
+    has_birthday_label = bool(mode_probe.get("hasBirthday"))
+    if has_age_label and not has_birthday_label:
+        return "age"
+    return "birthday"
+
+
+def _collect_visible_checkboxes(page) -> list[dict]:
+    try:
+        checkboxes = page.evaluate(
+            """
+            () => {
+              const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
+              const nodes = Array.from(document.querySelectorAll("input[type='checkbox']:not([disabled])"));
+              const visible = nodes.filter((el) => {
+                const style = window.getComputedStyle(el);
+                const rect = el.getBoundingClientRect();
+                return style && style.display !== 'none' && style.visibility !== 'hidden'
+                  && rect.width > 0 && rect.height > 0;
+              });
+              return visible.map((el, visibleIndex) => {
+                const explicitLabels = Array.from(document.querySelectorAll('label'))
+                  .filter((label) => String(label.getAttribute('for') || '') === String(el.id || ''))
+                  .map((label) => normalize(label.textContent));
+                const labelledByText = normalize(
+                  String(el.getAttribute('aria-labelledby') || '')
+                    .split(/\\s+/)
+                    .filter(Boolean)
+                    .map((id) => normalize(document.getElementById(id)?.textContent || ''))
+                    .join(' ')
+                );
+                return {
+                  visibleIndex,
+                  name: normalize(el.getAttribute('name') || ''),
+                  id: normalize(el.id || ''),
+                  testId: normalize(el.getAttribute('data-testid') || ''),
+                  required: Boolean(el.required),
+                  ariaRequired: String(el.getAttribute('aria-required') || '').toLowerCase() === 'true',
+                  ariaInvalid: String(el.getAttribute('aria-invalid') || '').toLowerCase() === 'true',
+                  nativeInvalid: typeof el.checkValidity === 'function' ? !el.checkValidity() : false,
+                  checked: Boolean(el.checked),
+                  labels: explicitLabels.filter(Boolean),
+                  wrappedLabel: normalize(el.closest('label')?.textContent || ''),
+                  labelledByText,
+                  parentText: normalize(el.parentElement?.textContent || ''),
+                };
+              });
+            }
+            """
+        ) or []
+    except Exception:
+        checkboxes = []
+    return [item for item in checkboxes if isinstance(item, dict)]
+
+
+def _about_you_checkbox_hints(entry: dict) -> str:
+    labels = entry.get("labels") if isinstance(entry.get("labels"), list) else []
+    parts = [
+        *(str(value or "") for value in labels),
+        str(entry.get("wrappedLabel") or ""),
+        str(entry.get("labelledByText") or ""),
+        str(entry.get("parentText") or ""),
+    ]
+    return " ".join(value for value in parts if value).strip().lower()
+
+
+def _about_you_checkbox_is_master(entry: dict) -> bool:
+    stable = " ".join(
+        str(entry.get(key) or "").strip().lower() for key in ("name", "id", "testId")
+    )
+    return bool(re.search(r"(?:^|[^a-z0-9])(all(?:checkbox(?:es)?|consents?|agreements?)?|selectall)(?:$|[^a-z0-9])", stable))
+
+
+def _about_you_checkbox_is_required(entry: dict) -> bool:
+    if any(bool(entry.get(key)) for key in ("required", "ariaRequired", "ariaInvalid", "nativeInvalid")):
+        return True
+    # Some localized React forms expose the requirement only in their label.
+    # DOM validity remains the primary signal; these markers are a conservative fallback.
+    hints = _about_you_checkbox_hints(entry)
+    return any(
+        marker in hints
+        for marker in (
+            "(required)",
+            " required",
+            "(필수)",
+            "필수",
+            "必須",
+            "必填",
+            "obligatoire",
+            "erforderlich",
+            "obligatorio",
+            "obbligatorio",
+            "obrigatório",
+        )
+    )
+
+
+def _check_required_about_you_consents(page, log) -> int:
+    """Check only required individual consents, never the optional/all master control."""
+    entries = _collect_visible_checkboxes(page)
+    required_entries = [
+        entry
+        for entry in entries
+        if not _about_you_checkbox_is_master(entry) and _about_you_checkbox_is_required(entry)
+    ]
+    checked_count = 0
+    locator = page.locator("input[type='checkbox']:visible:not([disabled])")
+    for entry in required_entries:
+        try:
+            visible_index = int(entry.get("visibleIndex"))
+            target = locator.nth(visible_index)
+            if not target.is_checked(timeout=500):
+                try:
+                    target.check(timeout=1500)
+                except Exception:
+                    # React can replace the node after check while preserving
+                    # state. Re-resolve before click so a stale locator cannot
+                    # toggle an already-checked consent back off.
+                    target = page.locator("input[type='checkbox']:visible:not([disabled])").nth(
+                        visible_index
+                    )
+                    if not target.is_checked(timeout=500):
+                        target.click(timeout=1500)
+            if target.is_checked(timeout=500):
+                checked_count += 1
+        except Exception:
+            continue
+    if entries:
+        log(
+            "about_you 同意项: "
+            f"visible={len(entries)}, required={len(required_entries)}, checked={checked_count}, "
+            f"master_skipped={sum(1 for entry in entries if _about_you_checkbox_is_master(entry))}"
+        )
+        if checked_count < len(required_entries):
+            log("about_you 部分必选同意项未能勾选，将由页面校验反馈触发一次重试")
+    return checked_count
+
+
 def _pick_best_about_you_input(entries: list[dict], field: str, exclude_visible_indices: set[int] | None = None) -> dict | None:
     exclude = {int(value) for value in (exclude_visible_indices or set())}
     best_entry = None
@@ -1006,6 +1209,8 @@ def _pick_best_about_you_input(entries: list[dict], field: str, exclude_visible_
 
         score = 0
         if field == "name":
+            if _about_you_input_has_semantic_field(entry, "name"):
+                score += 20
             if any(token in hints for token in ("full name", "fullname", "全名", "姓名", "nombre completo", "nom complet", "vollständiger name", "nome completo")):
                 score += 10
             if any(token in hints for token in (" name ", "name", "autocomplete=name", "nombre", "nom", "nome")):
@@ -1013,7 +1218,9 @@ def _pick_best_about_you_input(entries: list[dict], field: str, exclude_visible_
             if any(token in hints for token in ("age", "年龄", "edad", "âge", "alter", "idade", "birthday", "birth", "date of birth", "出生", "生日")):
                 score -= 8
         elif field == "age":
-            if any(token in hints for token in ("age", "年龄", "how old", "edad", "âge", "alter", "idade", "나이")):
+            if _about_you_input_has_semantic_field(entry, "age"):
+                score += 20
+            if any(token in hints for token in ("age", "年龄", "how old", "edad", "âge", "alter", "idade", "나이", "연령")):
                 score += 10
             if any(token in hints for token in ("full name", "fullname", "全名", "姓名", "nombre completo", "nom complet")):
                 score -= 10
@@ -2298,7 +2505,7 @@ def _submit_about_you_via_page(page, log) -> dict:
             visible_index = int(entry.get("visibleIndex"))
         except Exception:
             return None
-        return page.locator("input:visible:not([type='hidden']):not([disabled]):not([readonly])").nth(visible_index)
+        return page.locator(ABOUT_YOU_VALUE_INPUT_SELECTOR).nth(visible_index)
 
     def _fill_visible_input_entry(entry: dict | None, value: str) -> bool:
         if not entry:
@@ -2321,9 +2528,7 @@ def _submit_about_you_via_page(page, log) -> dict:
     def _fill_second_visible_input(values: list[str], excluded_visible_indices: set[int] | None = None) -> bool:
         """兜底：about_you 卡片一般是 Full name + Birthday/Age 两个输入框。"""
         try:
-            locator = page.locator(
-                "input:visible:not([type='hidden']):not([disabled]):not([readonly])"
-            )
+            locator = page.locator(ABOUT_YOU_VALUE_INPUT_SELECTOR)
             count = locator.count()
             if count < 2:
                 return False
@@ -2529,9 +2734,13 @@ def _submit_about_you_via_page(page, log) -> dict:
 
     age_years = None
     try:
-        birth_year = int(str(birthdate).split("-")[0])
-        current_year = int(time.strftime("%Y"))
-        age_years = max(25, min(40, current_year - birth_year))
+        birth_year, birth_month, birth_day = (int(part) for part in str(birthdate).split("-"))
+        today = time.localtime()
+        age_years = today.tm_year - birth_year - (
+            (today.tm_mon, today.tm_mday) < (birth_month, birth_day)
+        )
+        if not 18 <= age_years <= 120:
+            raise ValueError("generated age is outside the accepted adult range")
     except Exception:
         age_years = random.randint(25, 35)
 
@@ -2574,9 +2783,9 @@ def _submit_about_you_via_page(page, log) -> dict:
                 .map((n) => String(n.textContent || '').trim().toLowerCase())
                 .filter(Boolean);
               const allText = labels.concat(placeholders).concat(headings);
-              const hasAge = allText.some((t) => t === 'age' || t === 'edad' || t === 'âge' || t === 'alter' || t === 'idade' || t === '年齢' || t.includes('how old') || t.includes('年龄') || t.includes('年齢') || t.includes('나이'));
+              const hasAge = allText.some((t) => t === 'age' || t === 'edad' || t === 'âge' || t === 'alter' || t === 'idade' || t === '年齢' || t.includes('how old') || t.includes('年龄') || t.includes('年齢') || t.includes('나이') || t.includes('연령'));
               const hasBirthday = allText.some((t) =>
-                t.includes('birthday') || t.includes('date of birth') || t.includes('birth') || t.includes('生日') || t.includes('出生') || t.includes('生年月日') || t.includes('誕生日') || t.includes('fecha de nacimiento') || t.includes('nascimento') || t.includes('geburtstag') || t.includes('naissance')
+                t.includes('birthday') || t.includes('date of birth') || t.includes('birth') || t.includes('生日') || t.includes('出生') || t.includes('生年月日') || t.includes('誕生日') || t.includes('fecha de nacimiento') || t.includes('nascimento') || t.includes('geburtstag') || t.includes('naissance') || t.includes('생년월일') || t.includes('생일')
               );
               return { labels, placeholders, headings, hasAge, hasBirthday };
             }
@@ -2585,22 +2794,33 @@ def _submit_about_you_via_page(page, log) -> dict:
     except Exception:
         mode_probe = {}
 
-    has_age_label = bool(mode_probe.get("hasAge"))
-    has_birthday_label = bool(mode_probe.get("hasBirthday"))
-    has_age_field = any(_has_visible(candidate) for candidate in age_candidates[:3])
-    has_birthday_field = any(_has_visible(candidate) for candidate in birthday_candidates[:3])
     has_birthday_select = False
     try:
         has_birthday_select = page.locator("select:visible").count() >= 2
     except Exception:
         has_birthday_select = False
-    if has_birthday_select:
-        about_mode = "birthday_select"
-    elif (has_age_label and not has_birthday_label) or (has_age_field and not has_birthday_field):
-        about_mode = "age"
-    else:
-        about_mode = "birthday"
-    log(f"about_you 页面模式: {about_mode} labels={mode_probe.get('labels', [])[:4]}")
+    try:
+        has_segmented_birthday = all(
+            page.locator(f'[data-type="{part}"]:visible').count() > 0 for part in ("month", "day", "year")
+        )
+    except Exception:
+        has_segmented_birthday = False
+    about_mode = _infer_about_you_mode(
+        visible_inputs,
+        mode_probe,
+        has_birthday_select=has_birthday_select,
+        has_segmented_birthday=has_segmented_birthday,
+    )
+    semantic_age_fields = sum(
+        1 for entry in visible_inputs if _about_you_input_has_semantic_field(entry, "age")
+    )
+    semantic_birthday_fields = sum(
+        1 for entry in visible_inputs if _about_you_input_has_semantic_field(entry, "birthday")
+    )
+    log(
+        f"about_you 页面模式: {about_mode} semantic_age={semantic_age_fields} "
+        f"semantic_birthday={semantic_birthday_fields} labels={mode_probe.get('labels', [])[:4]}"
+    )
     direct_name_selector = _resolve_visible_input_selector(
         [
             'input[name="name"]',
@@ -2621,8 +2841,19 @@ def _submit_about_you_via_page(page, log) -> dict:
         ]
     )
     if about_mode == "age" and len(ordered_visible_entries) >= 2:
-        name_entry = ordered_visible_entries[0]
-        age_entry = ordered_visible_entries[1]
+        if not name_entry:
+            name_entry = ordered_visible_entries[0]
+        if not age_entry:
+            excluded_name_index = int(name_entry.get("visibleIndex", -1)) if name_entry else -1
+            age_entry = next(
+                (
+                    entry
+                    for entry in ordered_visible_entries
+                    if int(entry.get("visibleIndex", -1)) != excluded_name_index
+                ),
+                None,
+            )
+    if about_mode == "age" and name_entry and age_entry:
         log(
             f"about_you age 输入框映射: name=#{int(name_entry.get('visibleIndex', 0))}, "
             f"age=#{int(age_entry.get('visibleIndex', 0))}"
@@ -2632,6 +2863,27 @@ def _submit_about_you_via_page(page, log) -> dict:
             "about_you age 直接定位: "
             f"name={direct_name_selector or '-'}, age={direct_age_selector or '-'}"
         )
+
+    def _verify_age_value(expected_age: int) -> bool:
+        candidates = []
+        if direct_age_selector:
+            candidates.append(page.locator(direct_age_selector).first)
+        entry_locator = _locator_from_visible_input_entry(age_entry) if age_entry else None
+        if entry_locator is not None:
+            candidates.append(entry_locator)
+        for target in candidates:
+            try:
+                actual = str(target.input_value(timeout=700) or "").strip()
+                valid = bool(
+                    target.evaluate(
+                        "(el) => typeof el.checkValidity !== 'function' || el.checkValidity()"
+                    )
+                )
+                if actual == str(expected_age) and valid:
+                    return True
+            except Exception:
+                continue
+        return False
 
     def _fill_segmented_date(mm: str, dd: str, yyyy: str) -> bool:
         """处理 MM / DD / YYYY 分段日期输入框（React DateField 样式）。
@@ -2713,7 +2965,7 @@ def _submit_about_you_via_page(page, log) -> dict:
                     return True
 
             # 方式4: 第二个可见 input（name 是第一个）
-            inputs = page.locator("input:visible:not([type='hidden']):not([disabled])")
+            inputs = page.locator(ABOUT_YOU_VALUE_INPUT_SELECTOR)
             if inputs.count() >= 2:
                 target = inputs.nth(1)
                 target.click(force=True)
@@ -2786,6 +3038,9 @@ def _submit_about_you_via_page(page, log) -> dict:
                 fill_result["age"] = True
         if len(date_parts) == 3 and _sync_hidden_birthday_input(page, f"{yyyy}-{mm}-{dd}", log):
             fill_result["birthdate"] = True
+        if fill_result.get("age") and age_years is not None:
+            fill_result["age"] = _verify_age_value(age_years)
+            log(f"about_you age 有效性: value_match={fill_result['age']}")
     elif about_mode == "birthday" or about_mode == "birthday_text":
         # 先尝试分段日期输入（MM / DD / YYYY 格式的 DateField）
         if len(date_parts) == 3 and _fill_segmented_date(mm, dd, yyyy):
@@ -2817,12 +3072,14 @@ def _submit_about_you_via_page(page, log) -> dict:
     log(f"about_you 填写结果: {fill_result}")
     if not fill_result.get("name"):
         raise RuntimeError("about_you 未成功填写 Full name")
-    if not (
+    if about_mode == "age" and not fill_result.get("age"):
+        raise RuntimeError("about_you age 控件未通过值与有效性校验")
+    if about_mode != "age" and not (
         fill_result.get("birthdate")
-        or fill_result.get("age")
         or (fill_result.get("month") and fill_result.get("day") and fill_result.get("year"))
     ):
         raise RuntimeError("about_you 未成功填写 Birthday/Age")
+    _check_required_about_you_consents(page, log)
     _browser_pause(page)
 
     submit_selector = _click_first(
@@ -2889,13 +3146,9 @@ def _submit_about_you_via_page(page, log) -> dict:
                 error_text = ""
         if error_text and "oai_log" not in error_text and "SSR_HTML" not in error_text:
             normalized_error = str(error_text).strip().lower()
-            if (
-                about_mode == "age"
-                and not retried_generic_validation
-                and ("doesn't look right" in normalized_error or "try again" in normalized_error)
-            ):
+            if about_mode == "age" and not retried_generic_validation and "about-you" in str(current_url):
                 retried_generic_validation = True
-                log("about_you age 模式提交被拒，重新同步 Full name/Age/hidden birthday 后重试一次...")
+                log("about_you age 模式提交被拒，按字段语义重新同步资料与必选同意项后重试一次...")
                 if direct_name_selector and _fill_input_like_user(page, direct_name_selector, name):
                     fill_result["name"] = True
                 elif _fill_visible_input_entry(name_entry, name):
@@ -2917,6 +3170,15 @@ def _submit_about_you_via_page(page, log) -> dict:
                                 break
                 if len(date_parts) == 3 and _sync_hidden_birthday_input(page, f"{yyyy}-{mm}-{dd}", log):
                     fill_result["birthdate"] = True
+                _check_required_about_you_consents(page, log)
+                if age_years is not None and not _verify_age_value(age_years):
+                    return {
+                        "ok": False,
+                        "status": 400,
+                        "url": current_url,
+                        "data": None,
+                        "text": "about_you age 字段重填后仍未通过控件有效性校验",
+                    }
                 _browser_pause(page)
                 retry_submit_selector = _click_first(
                     page,
