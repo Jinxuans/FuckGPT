@@ -12,6 +12,7 @@ from platforms.chatgpt.protocol_register import (
     _SentinelBrowserRuntime,
 )
 from platforms.chatgpt.browser_register import (
+    ChatGPTBrowserRegister,
     OTP_SUBMIT_SELECTORS,
     _about_you_checkbox_is_master,
     _about_you_checkbox_is_required,
@@ -287,7 +288,7 @@ def test_browser_registration_falls_back_to_visible_page_after_nextauth_failure(
     assert any("改用可见 OpenAI 注册页面" in item for item in logs)
 
 
-def test_probe_password_registration_page_uses_active_signup_session(monkeypatch):
+def test_probe_password_registration_page_clicks_official_create_password_link(monkeypatch):
     calls = []
     logs = []
 
@@ -296,11 +297,12 @@ def test_probe_password_registration_page_uses_active_signup_session(monkeypatch
 
     page = Page()
 
-    def fake_goto(page, url, **kwargs):
-        calls.append(url)
-        page.url = url
+    def fake_click(page, selectors, **kwargs):
+        calls.append(list(selectors))
+        page.url = "https://auth.openai.com/create-account/password"
+        return 'a[href="/create-account/password"]'
 
-    monkeypatch.setattr("platforms.chatgpt.browser_register._goto_with_retry", fake_goto)
+    monkeypatch.setattr("platforms.chatgpt.browser_register._click_first", fake_click)
     monkeypatch.setattr(
         "platforms.chatgpt.browser_register._derive_registration_state_from_page",
         lambda page: {"page_type": "create_account_password", "current_url": page.url},
@@ -313,8 +315,177 @@ def test_probe_password_registration_page_uses_active_signup_session(monkeypatch
     )
 
     assert result["page_type"] == "create_account_password"
-    assert calls == ["https://auth.openai.com/create-account/password"]
-    assert any("主动密码注册探测成功" in item for item in logs)
+    assert len(calls) == 1
+    assert 'a[href="/create-account/password"]' in calls[0]
+    assert any("官方入口进入密码创建页" in item for item in logs)
+
+
+def test_probe_password_registration_page_keeps_otp_when_official_link_is_absent(monkeypatch):
+    logs = []
+
+    class Page:
+        url = "https://auth.openai.com/email-verification"
+
+    state = {"page_type": "email_otp_verification", "current_url": Page.url}
+    monkeypatch.setattr("platforms.chatgpt.browser_register._click_first", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        "platforms.chatgpt.browser_register._goto_with_retry",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("must not synthesize a password URL")),
+    )
+
+    result = _probe_password_registration_page(Page(), state, logs.append)
+
+    assert result is state
+    assert any("未提供官方密码入口" in item for item in logs)
+
+
+def test_probe_password_registration_page_follows_official_existing_account_link(monkeypatch):
+    logs = []
+
+    class Page:
+        url = "https://auth.openai.com/email-verification"
+
+    page = Page()
+
+    def fake_click(page, selectors, **kwargs):
+        page.url = "https://auth.openai.com/log-in/password"
+        return 'a[href="/log-in/password"]'
+
+    monkeypatch.setattr("platforms.chatgpt.browser_register._click_first", fake_click)
+    monkeypatch.setattr(
+        "platforms.chatgpt.browser_register._derive_registration_state_from_page",
+        lambda page: {"page_type": "login_password", "current_url": page.url},
+    )
+
+    result = _probe_password_registration_page(
+        page,
+        {"page_type": "email_otp_verification", "current_url": page.url},
+        logs.append,
+    )
+
+    assert result["page_type"] == "login_password"
+    assert any("已有账号密码页" in item for item in logs)
+
+
+def test_existing_account_never_submits_generated_registration_password(monkeypatch):
+    logs = []
+    calls = []
+    markers = []
+
+    class Page:
+        url = "https://auth.openai.com/log-in/password"
+
+    page = Page()
+
+    monkeypatch.setattr("platforms.chatgpt.browser_register._seed_browser_device_id", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        "platforms.chatgpt.browser_register._start_browser_signup_via_authorize",
+        lambda *args, **kwargs: {"page_type": "login_password", "current_url": page.url},
+    )
+    monkeypatch.setattr("platforms.chatgpt.browser_register._get_cookies", lambda page: {})
+    monkeypatch.setattr("platforms.chatgpt.browser_register._click_passwordless_login_if_available", lambda *args, **kwargs: calls.append("otp") or True)
+    monkeypatch.setattr(
+        "platforms.chatgpt.browser_register._wait_for_passwordless_login_state",
+        lambda page: {"page_type": "email_otp_verification", "current_url": "https://auth.openai.com/email-verification"},
+    )
+    monkeypatch.setattr(
+        "platforms.chatgpt.browser_register._submit_oauth_password_direct",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("generated password must not be submitted")),
+    )
+    monkeypatch.setattr(
+        "platforms.chatgpt.browser_register._submit_otp_via_page",
+        lambda page, code, log, **kwargs: page.__dict__.update(url="https://chatgpt.com/") or {"ok": True, "status": 200, "url": page.url},
+    )
+    monkeypatch.setattr("platforms.chatgpt.browser_register._handle_post_signup_onboarding", lambda page, log: None)
+
+    result = _browser_registration_flow(
+        page,
+        "existing@example.com",
+        "generated-not-a-real-password",
+        lambda: "123456",
+        logs.append,
+        password_provided=False,
+        existing_account_callback=lambda: markers.append("existing"),
+    )
+
+    assert result["existing_account"] is True
+    assert result["account_status"] == "existing_account"
+    assert result["registration_auth_mode"] == "email_otp"
+    assert calls == ["otp"]
+    assert markers == ["existing"]
+    assert any("禁止使用随机注册密码" in item for item in logs)
+
+
+def test_existing_account_uses_explicit_password_when_provided(monkeypatch):
+    logs = []
+    submitted = []
+
+    class Page:
+        url = "https://auth.openai.com/log-in/password"
+
+    page = Page()
+
+    monkeypatch.setattr("platforms.chatgpt.browser_register._seed_browser_device_id", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        "platforms.chatgpt.browser_register._start_browser_signup_via_authorize",
+        lambda *args, **kwargs: {"page_type": "login_password", "current_url": page.url},
+    )
+    monkeypatch.setattr("platforms.chatgpt.browser_register._get_cookies", lambda page: {})
+    monkeypatch.setattr(
+        "platforms.chatgpt.browser_register._submit_oauth_password_direct",
+        lambda page, password, log: submitted.append(password) or {"ok": True, "status": 200, "url": "https://chatgpt.com/"},
+    )
+    monkeypatch.setattr("platforms.chatgpt.browser_register._extract_flow_state", lambda data, url: {"page_type": "chatgpt_home", "current_url": url})
+    monkeypatch.setattr("platforms.chatgpt.browser_register._handle_post_signup_onboarding", lambda page, log: None)
+
+    result = _browser_registration_flow(
+        page,
+        "existing@example.com",
+        "real-password-supplied-by-user",
+        None,
+        logs.append,
+        password_provided=True,
+    )
+
+    assert submitted == ["real-password-supplied-by-user"]
+    assert result["existing_account"] is True
+    assert result["registration_auth_mode"] == "password"
+
+
+def test_existing_account_otp_success_does_not_persist_rejected_password(monkeypatch):
+    class Browser:
+        def new_page(self):
+            return object()
+
+    class BrowserContext:
+        def __enter__(self):
+            return Browser()
+
+        def __exit__(self, *args):
+            return None
+
+    worker = ChatGPTBrowserRegister(headless=True, otp_callback=lambda: "123456")
+    monkeypatch.setattr(worker, "_open_browser", lambda launch_opts: BrowserContext())
+    monkeypatch.setattr(
+        "platforms.chatgpt.browser_register._browser_registration_flow",
+        lambda *args, **kwargs: {
+            "page_type": "chatgpt_home",
+            "existing_account": True,
+            "account_status": "existing_account",
+            "registration_auth_mode": "email_otp",
+        },
+    )
+    monkeypatch.setattr("platforms.chatgpt.browser_register._get_cookies", lambda page: {})
+    monkeypatch.setattr("platforms.chatgpt.browser_register._fetch_chatgpt_session_from_page", lambda *args: {})
+
+    result = worker.run(
+        "existing@example.com",
+        "rejected-user-password",
+        password_provided=True,
+    )
+
+    assert result["password"] == ""
+    assert result["registration_auth_mode"] == "email_otp"
 
 
 def test_signup_authorize_retries_csrf_without_repeating_email_submission(monkeypatch):

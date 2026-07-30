@@ -24,6 +24,9 @@ class RegistrationContext:
     email: str | None
     password: str | None
     log_fn: Callable[[str], None]
+    # Only a caller-supplied password may authenticate an existing account.
+    # Generated passwords are scoped to new-account creation.
+    password_provided: bool = False
 
     @property
     def executor_type(self) -> str:

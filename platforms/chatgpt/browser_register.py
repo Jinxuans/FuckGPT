@@ -28,6 +28,17 @@ from .constants import (
 CAMOUFOX_VISIBLE_WINDOW_SIZE = (1280, 720)
 
 
+class ExistingAccountAuthenticationError(RuntimeError):
+    """An existing remote account could not be authenticated safely.
+
+    The mailbox must not return to the registration pool, otherwise a later
+    worker would repeat the same new-account attempt with another generated
+    password.
+    """
+
+    preserve_mailbox = True
+
+
 def _apply_camoufox_visible_window_limit(
     launch_opts: dict,
     backend_config: BrowserBackendConfig,
@@ -238,6 +249,15 @@ PASSWORDLESS_LOGIN_SELECTORS = [
     'button:has-text("ワンタイムコード")',
     'button:has-text("一回限りのコード")',
     'button:has-text("認証コード")',
+]
+
+PASSWORD_CONTINUE_LINK_SELECTORS = [
+    'a[href="/create-account/password"]',
+    'a[href^="/create-account/password?"]',
+    'a[href$="/create-account/password"]',
+    'a[href="/log-in/password"]',
+    'a[href^="/log-in/password?"]',
+    'a[href$="/log-in/password"]',
 ]
 
 # add-phone 页面国际拨号码 -> 国家名映射（用于 UI 下拉选择）
@@ -754,6 +774,17 @@ def _click_passwordless_login_if_available(page, log, *, context: str) -> bool:
         log(f"{context} 已选择一次性验证码登录")
         time.sleep(1)
     return clicked
+
+
+def _wait_for_passwordless_login_state(page, *, timeout: float = 12) -> dict:
+    deadline = time.time() + max(float(timeout or 0), 0)
+    last_state = _derive_registration_state_from_page(page)
+    while time.time() < deadline:
+        if str(last_state.get("page_type") or "") != "login_password":
+            return last_state
+        time.sleep(0.25)
+        last_state = _derive_registration_state_from_page(page)
+    return last_state
 
 
 def _get_page_oauth_url(page) -> str:
@@ -3208,21 +3239,36 @@ def _probe_password_registration_page(page, state: dict, log) -> dict:
     if not _is_email_otp(state):
         return state
     original_url = str(getattr(page, "url", "") or state.get("current_url") or "")
-    password_url = f"{OPENAI_AUTH}/create-account/password"
-    log(f"主动探测密码注册页面: {password_url}")
+    log("检查验证码页面提供的官方“使用密码继续”入口")
+    clicked_selector = ""
     try:
-        _goto_with_retry(page, password_url, wait_until="domcontentloaded", timeout=30000, log=log)
+        clicked_selector = _click_first(page, PASSWORD_CONTINUE_LINK_SELECTORS, timeout=2) or ""
+        if not clicked_selector:
+            log("验证码页面未提供官方密码入口，保持邮箱验证码流程")
+            return state
+        log(f"已点击验证码页面官方密码入口: {clicked_selector}")
+        deadline = time.time() + 12
         probed_state = _derive_registration_state_from_page(page)
+        while time.time() < deadline and str(probed_state.get("page_type") or "") not in {
+            "create_account_password",
+            "password",
+            "login_password",
+        }:
+            time.sleep(0.25)
+            probed_state = _derive_registration_state_from_page(page)
         if _is_password_registration(probed_state):
-            log("主动密码注册探测成功，继续密码创建流程")
+            log("官方入口进入密码创建页，继续密码注册流程")
+            return probed_state
+        if str(probed_state.get("page_type") or "") == "login_password":
+            log("官方入口进入已有账号密码页，切换已有账号登录流程")
             return probed_state
         log(
-            "主动密码注册探测未进入密码页: "
+            "官方密码入口未进入可识别的密码页: "
             f"page={probed_state.get('page_type') or '-'} url={str(getattr(page, 'url', '') or '')[:110]}"
         )
     except Exception as exc:
-        log(f"主动密码注册探测失败，恢复原验证码页面: {str(exc).splitlines()[0][:180]}")
-    if original_url:
+        log(f"点击官方密码入口失败，恢复原验证码页面: {str(exc).splitlines()[0][:180]}")
+    if clicked_selector and original_url:
         _goto_with_retry(page, original_url, wait_until="domcontentloaded", timeout=30000, log=log)
     return _derive_registration_state_from_page(page)
 
@@ -3235,6 +3281,8 @@ def _browser_registration_flow(
     log,
     *,
     prefer_password_registration: bool = False,
+    password_provided: bool = True,
+    existing_account_callback: Optional[Callable[[], None]] = None,
 ) -> dict:
     device_id = str(uuid.uuid4())
     _seed_browser_device_id(page, device_id)
@@ -3257,6 +3305,8 @@ def _browser_registration_flow(
     if prefer_password_registration:
         state = _probe_password_registration_page(page, state, log)
     register_submitted = False
+    existing_account_detected = False
+    login_auth_mode = ""
     seen_states: dict[str, int] = {}
 
     for step in range(12):
@@ -3279,7 +3329,10 @@ def _browser_registration_flow(
         if _is_registration_complete(state):
             _handle_post_signup_onboarding(page, log)
             final_state = _extract_flow_state(None, page.url)
-            final_state["registration_auth_mode"] = "password" if register_submitted else "email_otp"
+            final_state["registration_auth_mode"] = login_auth_mode or ("password" if register_submitted else "email_otp")
+            if existing_account_detected:
+                final_state["existing_account"] = True
+                final_state["account_status"] = "existing_account"
             return final_state
 
         if _is_password_registration(state):
@@ -3303,17 +3356,50 @@ def _browser_registration_flow(
             continue
 
         if str(state.get("page_type") or "") == "login_password":
-            if _recover_signup_password_page(page, log):
-                state = _derive_registration_state_from_page(page)
-                continue
-            log("注册流程落到已有账号登录密码页，按登录流程继续认证...")
-            login_resp = _submit_oauth_password_direct(page, password, log)
-            log(f"登录密码页提交状态: {login_resp.get('status', 0)}")
-            if not login_resp.get("ok"):
-                raise RuntimeError(f"登录密码页提交失败: {(login_resp.get('text') or '')[:300]}")
-            state = _extract_flow_state(login_resp.get("data"), login_resp.get("url", page.url))
-            if not state.get("page_type"):
-                state = _derive_registration_state_from_page(page)
+            if not existing_account_detected and callable(existing_account_callback):
+                existing_account_callback()
+            existing_account_detected = True
+            log("检测到已有账号(login_password)，停止注册流程，切换登录认证")
+
+            if password_provided and str(password or "").strip():
+                log("使用调用方显式提供的已有账号密码登录")
+                login_resp = _submit_oauth_password_direct(page, password, log)
+                log(f"已有账号密码登录提交状态: {login_resp.get('status', 0)}")
+                if login_resp.get("ok"):
+                    login_auth_mode = "password"
+                    state = _extract_flow_state(login_resp.get("data"), login_resp.get("url", page.url))
+                    if not state.get("page_type"):
+                        state = _derive_registration_state_from_page(page)
+                    continue
+                password_error = str(login_resp.get("text") or login_resp.get("url") or "")[:300]
+                if callable(otp_callback) and _click_passwordless_login_if_available(
+                    page, log, context="已有账号密码校验失败"
+                ):
+                    log("已有账号真实密码不可用，改用邮箱一次性验证码登录")
+                    login_auth_mode = "email_otp"
+                    state = _wait_for_passwordless_login_state(page)
+                    if str(state.get("page_type") or "") == "login_password":
+                        raise ExistingAccountAuthenticationError(
+                            "已有账号密码失败，选择一次性验证码后仍停留在密码页"
+                        )
+                    continue
+                raise ExistingAccountAuthenticationError(f"已有账号真实密码登录失败: {password_error}")
+
+            if not callable(otp_callback):
+                raise ExistingAccountAuthenticationError(
+                    "检测到已有账号，但未提供真实密码或可用的邮箱一次性验证码"
+                )
+            log("未提供已有账号真实密码，禁止使用随机注册密码，改用邮箱一次性验证码登录")
+            if not _click_passwordless_login_if_available(page, log, context="已有账号登录"):
+                raise ExistingAccountAuthenticationError(
+                    "已有账号密码页未找到一次性验证码登录入口"
+                )
+            login_auth_mode = "email_otp"
+            state = _wait_for_passwordless_login_state(page)
+            if str(state.get("page_type") or "") == "login_password":
+                raise ExistingAccountAuthenticationError(
+                    "选择一次性验证码后仍停留在已有账号密码页"
+                )
             continue
 
         if _is_email_otp(state):
@@ -3386,6 +3472,7 @@ class ChatGPTBrowserRegister:
         codex_oauth_timeout: int = 300,
         keep_browser_open: bool = False,
         prefer_password_registration: bool = False,
+        existing_account_callback: Optional[Callable[[], None]] = None,
         log_fn: Callable[[str], None] = print,
         backend_config: Optional[BrowserBackendConfig] = None,
     ):
@@ -3397,6 +3484,7 @@ class ChatGPTBrowserRegister:
         self.codex_oauth_timeout = int(codex_oauth_timeout or 300)
         self.keep_browser_open = bool(keep_browser_open)
         self.prefer_password_registration = bool(prefer_password_registration)
+        self.existing_account_callback = existing_account_callback
         self.log = log_fn
         # backend_config 为 None 时默认 Camoufox，跟老调用方一致。
         # BitBrowser 路径需要上层 plugin.py 显式传 backend_config。
@@ -3423,7 +3511,7 @@ class ChatGPTBrowserRegister:
             log=self.log,
         )
 
-    def run(self, email: str, password: str) -> dict:
+    def run(self, email: str, password: str, *, password_provided: bool = True) -> dict:
         if self.backend_config.is_bitbrowser:
             # BitBrowser 路径：profile 已配代理/指纹，launch_opts 不传这些。
             launch_opts = {"headless": self.backend_config.is_headless}
@@ -3447,15 +3535,26 @@ class ChatGPTBrowserRegister:
                 self.otp_callback,
                 self.log,
                 prefer_password_registration=self.prefer_password_registration,
+                password_provided=password_provided,
+                existing_account_callback=self.existing_account_callback,
             )
             self.log(f"注册流程完成: page={final_state.get('page_type') or '-'}")
 
             # 获取 session token 和 cookies
             cookies_dict = _get_cookies(page)
             session_info = _fetch_chatgpt_session_from_page(page, cookies_dict, self.log)
+            result_password = password
+            if (
+                final_state.get("existing_account")
+                and final_state.get("registration_auth_mode") != "password"
+            ):
+                # The supplied password was either absent or rejected before
+                # the successful OTP fallback.  Do not persist it as a valid
+                # credential for this existing account.
+                result_password = ""
             result = {
                 "email": email,
-                "password": password,
+                "password": result_password,
                 "account_id": session_info.get("account_id", ""),
                 "access_token": session_info.get("access_token", ""),
                 "refresh_token": session_info.get("refresh_token", ""),
@@ -3477,7 +3576,7 @@ class ChatGPTBrowserRegister:
                     codex_result = perform_codex_oauth_login_on_page(
                         page,
                         email=email,
-                        password=password,
+                        password=result_password,
                         registration_auth_mode=result["registration_auth_mode"],
                         proxy=self.proxy,
                         log_fn=self.log,

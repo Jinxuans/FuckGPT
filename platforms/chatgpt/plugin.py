@@ -538,6 +538,8 @@ class ChatGPTPlatform(BasePlatform):
             "profile": result.get("profile", {}),
             "expires_at": result.get("expires_at", ""),
             "registration_auth_mode": result.get("registration_auth_mode", ""),
+            "existing_account": bool(result.get("existing_account") or (result.get("registration_state") or {}).get("existing_account")),
+            "account_status": str(result.get("account_status") or (result.get("registration_state") or {}).get("account_status") or ""),
         }
         for key in (
             "codex_auth_path",
@@ -566,9 +568,20 @@ class ChatGPTPlatform(BasePlatform):
     def build_browser_registration_adapter(self):
         def _build_browser_worker(ctx, artifacts):
             from platforms.chatgpt.browser_register import ChatGPTBrowserRegister
+            from core.mailbox_lifecycle import MailboxAllocationLifecycle
+
             post_codex_oauth = _truthy(ctx.extra.get("auto_codex_oauth_after_register"))
             codex_phone_callback = self._build_codex_phone_callback(ctx.proxy) if post_codex_oauth else None
             keep_browser_open = _truthy(ctx.extra.get("codex_oauth_keep_browser_open"))
+            identity_metadata = dict(getattr(ctx.identity, "metadata", {}) or {})
+            allocation_id = str(identity_metadata.get("mailbox_allocation_id") or "")
+
+            def _mark_existing_account():
+                if allocation_id:
+                    MailboxAllocationLifecycle().flag_existing_account(
+                        allocation_id,
+                        reason="OpenAI 认证流程进入 login_password",
+                    )
 
             return ChatGPTBrowserRegister(
                 headless=(ctx.executor_type == "headless"),
@@ -579,6 +592,7 @@ class ChatGPTPlatform(BasePlatform):
                 codex_oauth_timeout=int(ctx.extra.get("codex_oauth_timeout") or 300),
                 keep_browser_open=keep_browser_open,
                 prefer_password_registration=_truthy(ctx.extra.get("prefer_password_registration")),
+                existing_account_callback=_mark_existing_account,
                 log_fn=ctx.log,
                 backend_config=(ctx.extra or {}).get("_reuse_backend_config"),
             )
@@ -589,6 +603,7 @@ class ChatGPTPlatform(BasePlatform):
             browser_register_runner=lambda worker, ctx, artifacts: worker.run(
                 email=ctx.identity.email or "",
                 password=ctx.password or "",
+                password_provided=ctx.password_provided,
             ),
             otp_spec=OtpSpec(wait_message="等待验证码...", timeout=600),
         )

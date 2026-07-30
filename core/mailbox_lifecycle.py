@@ -316,7 +316,77 @@ class MailboxAllocationLifecycle:
             allocation.updated_at = now
             session.add(allocation)
             if resource and resource.status == RESOURCE_ALLOCATED:
-                resource.status = RESOURCE_AVAILABLE
+                resource.status = (
+                    RESOURCE_ARCHIVED
+                    if resource.get_metadata().get("existing_account")
+                    else RESOURCE_AVAILABLE
+                )
+                resource.updated_at = now
+                session.add(resource)
+            session.commit()
+            return True
+
+    def flag_existing_account(self, allocation_id: str, *, reason: str = "检测到已有账号") -> bool:
+        """Persist the provider-side existing-account classification immediately.
+
+        The allocation remains active so a successful password/OTP login can
+        still bind the mailbox to the saved account.  Any later release or
+        interruption will archive the resource instead of returning it to the
+        new-registration pool.
+        """
+        now = _utcnow()
+        with Session(db.engine) as session:
+            allocation = session.get(MailboxAllocationModel, _text(allocation_id))
+            if allocation is None or allocation.status != ALLOCATION_ACTIVE:
+                return False
+            resource = session.get(MailboxResourceModel, allocation.resource_id)
+            if resource is None:
+                return False
+            metadata = resource.get_metadata()
+            metadata.update(
+                {
+                    "existing_account": True,
+                    "account_status": "existing_account",
+                    "existing_account_reason": _text(reason),
+                }
+            )
+            resource.set_metadata(metadata)
+            resource.updated_at = now
+            session.add(resource)
+            session.commit()
+            return True
+
+    def mark_existing_account(self, allocation_id: str, *, reason: str = "检测到已有账号") -> bool:
+        """Finish an allocation without returning its mailbox to registration.
+
+        A provider-side ``login_password`` state proves that the address is no
+        longer a fresh registration identity.  Archive it even when login
+        authentication later fails, so another worker cannot retry account
+        creation with a newly generated password.
+        """
+        now = _utcnow()
+        with Session(db.engine) as session:
+            allocation = session.get(MailboxAllocationModel, _text(allocation_id))
+            if allocation is None:
+                return False
+            resource = session.get(MailboxResourceModel, allocation.resource_id)
+            if allocation.status == ALLOCATION_ACTIVE:
+                allocation.status = ALLOCATION_FAILED
+                allocation.reason = _text(reason)
+                allocation.finished_at = now
+                allocation.updated_at = now
+                session.add(allocation)
+            if resource is not None and resource.status != RESOURCE_BOUND:
+                metadata = resource.get_metadata()
+                metadata.update(
+                    {
+                        "existing_account": True,
+                        "account_status": "existing_account",
+                        "existing_account_reason": _text(reason),
+                    }
+                )
+                resource.set_metadata(metadata)
+                resource.status = RESOURCE_ARCHIVED
                 resource.updated_at = now
                 session.add(resource)
             session.commit()
@@ -337,7 +407,11 @@ class MailboxAllocationLifecycle:
                 allocation.updated_at = now
                 resource = session.get(MailboxResourceModel, allocation.resource_id)
                 if resource and resource.status == RESOURCE_ALLOCATED:
-                    resource.status = RESOURCE_AVAILABLE
+                    resource.status = (
+                        RESOURCE_ARCHIVED
+                        if resource.get_metadata().get("existing_account")
+                        else RESOURCE_AVAILABLE
+                    )
                     resource.updated_at = now
                     session.add(resource)
                 session.add(allocation)

@@ -23,6 +23,7 @@ from core.mailbox_lifecycle import (
     MailboxAllocationLifecycle,
     MailboxUnavailableError,
     RESOURCE_ARCHIVED,
+    RESOURCE_ALLOCATED,
     RESOURCE_AVAILABLE,
     RESOURCE_BOUND,
 )
@@ -85,6 +86,47 @@ def test_failed_allocation_keeps_history_and_returns_resource_immediately():
         attempt_id="task-2:worker_1",
     )
     assert second.resource_id == allocation.resource_id
+
+
+def test_existing_account_allocation_is_archived_instead_of_returned_to_pool():
+    lifecycle = MailboxAllocationLifecycle()
+    allocation = lifecycle.allocate(
+        mailbox_account=_mailbox("existing@example.com"),
+        provider="api_mailbox",
+        platform="chatgpt",
+        attempt_id="existing:worker_1",
+    )
+
+    assert lifecycle.mark_existing_account(allocation.id, reason="login_password") is True
+
+    resource = _resource()
+    assert resource.status == RESOURCE_ARCHIVED
+    assert lifecycle.is_available(provider_name="api_mailbox", resource_identifier="mailbox-key") is False
+    assert resource.get_metadata()["existing_account"] is True
+    assert resource.get_metadata()["account_status"] == "existing_account"
+    with Session(db.engine) as session:
+        history = session.get(MailboxAllocationModel, allocation.id)
+        assert history.status == ALLOCATION_FAILED
+        assert history.reason == "login_password"
+
+
+def test_existing_account_flag_is_immediate_and_survives_release():
+    lifecycle = MailboxAllocationLifecycle()
+    allocation = lifecycle.allocate(
+        mailbox_account=_mailbox("existing@example.com"),
+        provider="api_mailbox",
+        platform="chatgpt",
+        attempt_id="existing-flag:worker_1",
+    )
+
+    assert lifecycle.flag_existing_account(allocation.id, reason="login_password") is True
+    flagged = _resource()
+    assert flagged.status == RESOURCE_ALLOCATED
+    assert flagged.get_metadata()["existing_account"] is True
+
+    assert lifecycle.release(allocation.id, outcome=ALLOCATION_FAILED, reason="otp failed") is True
+    assert _resource().status == RESOURCE_ARCHIVED
+    assert lifecycle.is_available(provider_name="api_mailbox", resource_identifier="mailbox-key") is False
 
 
 def test_active_allocation_prevents_double_claim():

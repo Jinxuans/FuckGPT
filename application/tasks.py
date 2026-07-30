@@ -1002,6 +1002,7 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
         allocation_id = ""
         allocation_succeeded = False
         failure_reason = ""
+        existing_account_failure = False
         try:
             platform = _build_platform_instance(
                 platform_name,
@@ -1093,7 +1094,10 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
                         level="warning",
                     )
             logger.record_success()
-            logger.log(f"注册成功: {account.email}")
+            if bool((account.extra or {}).get("existing_account")):
+                logger.log(f"已有账号登录成功: {account.email}")
+            else:
+                logger.log(f"注册成功: {account.email}")
             item = {
                 "account_id": saved_account_id,
                 "email": account.email,
@@ -1103,6 +1107,7 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
             return item
         except Exception as exc:
             failure_reason = str(exc)
+            existing_account_failure = bool(getattr(exc, "preserve_mailbox", False))
             if logger.is_cancel_requested() or str(exc) == "任务已取消":
                 return "__cancel_requested__"
             if platform_proxy and platform_proxy_mode == PROXY_MODE_PROXY_SERVICE:
@@ -1126,11 +1131,18 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
                 )
 
                 cancelled = logger.is_cancel_requested() or failure_reason == "任务已取消"
-                MailboxAllocationLifecycle().release(
-                    allocation_id,
-                    outcome=ALLOCATION_CANCELLED if cancelled else ALLOCATION_FAILED,
-                    reason=failure_reason or ("任务已取消" if cancelled else "注册未成功"),
-                )
+                lifecycle = MailboxAllocationLifecycle()
+                if existing_account_failure and not cancelled:
+                    lifecycle.mark_existing_account(
+                        allocation_id,
+                        reason=failure_reason or "检测到已有账号但登录认证未完成",
+                    )
+                else:
+                    lifecycle.release(
+                        allocation_id,
+                        outcome=ALLOCATION_CANCELLED if cancelled else ALLOCATION_FAILED,
+                        reason=failure_reason or ("任务已取消" if cancelled else "注册未成功"),
+                    )
             logger.clear_subtask()
 
     success = 0
