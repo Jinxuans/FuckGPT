@@ -190,13 +190,6 @@ _BUILTIN_DEFINITIONS: list[dict] = [
                 "hint": "购买循环没有固定延迟；库存不足、瞬时失败会立即重试，直到成功、达到次数或超时。",
             },
             {
-                "key": "hotmail007_buy_timeout_seconds",
-                "label": "购买超时秒",
-                "placeholder": "30",
-                "default_value": "30",
-                "category": "connection",
-            },
-            {
                 "key": "hotmail007_request_timeout",
                 "label": "单次请求超时秒",
                 "placeholder": "8",

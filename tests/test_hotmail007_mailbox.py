@@ -91,7 +91,6 @@ def test_hotmail007_buy_loops_until_success_without_sleep(monkeypatch):
         client_key="client-key",
         product_id="11,12",
         buy_max_attempts=5,
-        buy_timeout_seconds=5,
         session=session,
         log_fn=logs.append,
     )
@@ -116,10 +115,40 @@ def test_hotmail007_buy_loops_until_success_without_sleep(monkeypatch):
         "user@outlook.com:mail-pass:refresh-token:client-id"
     )
     assert logs[0].startswith("Hotmail007 开始循环购买邮箱")
+    assert "request_timeout=8s" in logs[0]
+    assert "soft_timeout" not in logs[0]
     assert any("第 1 次购买未成功" in item for item in logs)
     assert any("第 1 次购买未成功，productId=12" in item for item in logs)
     assert any("购买成功：第 3 次尝试，productId=12，获得邮箱 user@outlook.com" in item for item in logs)
     assert not any("client-key" in item or "refresh-token" in item or "mail-pass" in item for item in logs)
+
+
+def test_hotmail007_max_attempt_error_reports_actual_attempts():
+    logs = []
+    session = FakeSession(
+        [
+            {"code": 23002, "success": False, "message": "Insufficient stock", "data": {}},
+            {"code": 23002, "success": False, "message": "Insufficient stock", "data": {}},
+        ]
+    )
+    mailbox = Hotmail007Mailbox(
+        client_key="client-key",
+        product_id="11",
+        buy_max_attempts=2,
+        session=session,
+        log_fn=logs.append,
+    )
+
+    try:
+        mailbox.get_email()
+    except RuntimeError as exc:
+        assert "attempts=2" in str(exc)
+        assert "soft_timeout" not in str(exc)
+    else:
+        raise AssertionError("exhausted Hotmail007 buy loop should raise")
+
+    assert len(session.calls) == 2
+    assert any("已达到最大尝试次数 2 次" in item for item in logs)
 
 
 def test_hotmail007_prefetch_buys_with_bounded_parallelism():
@@ -144,7 +173,6 @@ def test_hotmail007_prefetch_buys_with_bounded_parallelism():
         client_key="client-key",
         product_id="11",
         buy_quantity=1,
-        buy_timeout_seconds=5,
         session=session,
         log_fn=logs.append,
     )
@@ -176,7 +204,6 @@ def test_hotmail007_buy_loop_stops_when_cancelled():
         client_key="client-key",
         product_id="11",
         buy_max_attempts=200,
-        buy_timeout_seconds=30,
         session=CancelAfterFirstFailureSession(),
     )
     mailbox.set_cancel_checker(lambda: calls["count"] >= 1)

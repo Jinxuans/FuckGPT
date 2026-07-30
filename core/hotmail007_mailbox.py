@@ -157,7 +157,6 @@ class Hotmail007Mailbox(BaseMailbox):
         base_url: str = DEFAULT_BASE_URL,
         buy_quantity: int | str = 1,
         buy_max_attempts: int | str = 200,
-        buy_timeout_seconds: float | str = 30,
         request_timeout: float | str = 8,
         folders: str | tuple[str, ...] = DEFAULT_FOLDERS,
         include_junk: bool | str = True,
@@ -171,7 +170,6 @@ class Hotmail007Mailbox(BaseMailbox):
         self.base_url = str(base_url or DEFAULT_BASE_URL).strip().rstrip("/") + "/"
         self.buy_quantity = _int_value(buy_quantity, 1, minimum=1, maximum=50)
         self.buy_max_attempts = _int_value(buy_max_attempts, 200, minimum=1)
-        self.buy_timeout_seconds = _float_value(buy_timeout_seconds, 30, minimum=0.1)
         self.request_timeout = _float_value(request_timeout, 8, minimum=0.5)
         resolved_folders = _split_folders(folders)
         if not _truthy(include_junk):
@@ -201,7 +199,6 @@ class Hotmail007Mailbox(BaseMailbox):
             base_url=config.get("hotmail007_base_url", DEFAULT_BASE_URL),
             buy_quantity=config.get("hotmail007_buy_quantity", 1),
             buy_max_attempts=config.get("hotmail007_buy_max_attempts", 200),
-            buy_timeout_seconds=config.get("hotmail007_buy_timeout_seconds", 30),
             request_timeout=config.get("hotmail007_request_timeout", 8),
             folders=config.get("hotmail007_folders", ",".join(DEFAULT_FOLDERS)),
             include_junk=config.get("hotmail007_include_junk", "true"),
@@ -324,18 +321,17 @@ class Hotmail007Mailbox(BaseMailbox):
 
     def _buy_batch_until_success(self, quantity: int | None = None) -> list[Hotmail007AccountEntry]:
         requested_quantity = _int_value(quantity, self.buy_quantity, minimum=1, maximum=50)
-        deadline = time.monotonic() + self.buy_timeout_seconds
         last_error = ""
+        attempts_made = 0
         self.raise_if_cancelled()
         self._log(
             "Hotmail007 开始循环购买邮箱"
             f"（productId={','.join(self.product_ids)}, quantity={requested_quantity}, "
-            f"max_attempts={self.buy_max_attempts}, timeout={self.buy_timeout_seconds:g}s）"
+            f"max_attempts={self.buy_max_attempts}, request_timeout={self.request_timeout:g}s）"
         )
         for attempt in range(1, self.buy_max_attempts + 1):
             self.raise_if_cancelled()
-            if time.monotonic() > deadline:
-                break
+            attempts_made = attempt
             try:
                 product_id, entries = self._buy_once(quantity=requested_quantity)
                 if not entries:
@@ -358,12 +354,12 @@ class Hotmail007Mailbox(BaseMailbox):
                     self._log(f"Hotmail007 第 {attempt} 次购买未成功{product_part}：{last_error}")
                 continue
         self._log(
-            f"Hotmail007 循环购买失败：尝试 {self.buy_max_attempts} 次或达到 "
-            f"{self.buy_timeout_seconds:g}s 超时，最后错误：{last_error or 'none'}"
+            f"Hotmail007 循环购买失败：已达到最大尝试次数 {attempts_made} 次，"
+            f"最后错误：{last_error or 'none'}"
         )
         raise RuntimeError(
-            f"Hotmail007 循环购买失败: attempts={self.buy_max_attempts}, "
-            f"timeout={self.buy_timeout_seconds:g}s, last_error={last_error or 'none'}"
+            f"Hotmail007 循环购买失败: attempts={attempts_made}, "
+            f"last_error={last_error or 'none'}"
         )
 
     def _buy_until_success(self) -> Hotmail007AccountEntry:
