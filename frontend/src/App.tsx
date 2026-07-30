@@ -14,6 +14,7 @@ import Accounts from "@/pages/Accounts";
 import MailboxResources from "@/pages/MailboxResources";
 import TaskHistory from "@/pages/TaskHistory";
 import SettingsPage from "@/pages/SettingsPage";
+import KakaoPipeline from "@/pages/KakaoPipeline";
 import UpdateBanner from "@/components/UpdateBanner";
 import WelcomeDialog from "@/components/WelcomeDialog";
 import {
@@ -28,6 +29,7 @@ import {
   ListChecks,
   PanelLeftClose,
   PanelLeft,
+  ScanLine,
 } from "lucide-react";
 
 /* ------------------------------------------------------------------ */
@@ -52,6 +54,7 @@ const SETTINGS_NAV_ITEMS: { labelKey: TranslationKey; hash: string }[] = [
 const NAV_ITEMS: NavItem[] = [
   { path: "/", labelKey: "nav.dashboard", icon: LayoutDashboard, exact: true },
   { path: "/accounts/chatgpt", labelKey: "nav.chatgptAccounts", icon: Users },
+  { path: "/kakao-pipeline", label: "Kakao 流水线", icon: ScanLine },
   { path: "/mailboxes", labelKey: "nav.mailboxResources", icon: Mail },
   { path: "/tasks", labelKey: "nav.tasks", icon: ListChecks },
   { path: "/settings", labelKey: "nav.settings", icon: SettingsIcon },
@@ -62,7 +65,7 @@ const SHELL_CONTENT_WIDTH = {
   workspace: "max-w-[1680px]",
 } as const;
 
-const WORKSPACE_ROUTE_PREFIXES = ["/", "/accounts", "/mailboxes", "/tasks"];
+const WORKSPACE_ROUTE_PREFIXES = ["/", "/accounts", "/kakao-pipeline", "/mailboxes", "/tasks"];
 
 function getShellContentWidth(pathname: string) {
   const isWorkspace = WORKSPACE_ROUTE_PREFIXES.some(
@@ -277,6 +280,7 @@ function Shell({
           <Routes>
             <Route path="/" element={<Dashboard />} />
             <Route path="/accounts/chatgpt" element={<Accounts />} />
+            <Route path="/kakao-pipeline" element={<KakaoPipeline />} />
             <Route path="/mailboxes" element={<MailboxResources />} />
             <Route path="/tasks" element={<TaskHistory />} />
             <Route

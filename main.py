@@ -68,6 +68,7 @@ from api.auth import router as auth_router
 from api.config import router as config_router
 from core.auth import AuthMiddleware
 from api.health import router as health_router
+from api.kakao_pipeline import router as kakao_pipeline_router
 from api.mailboxes import router as mailboxes_router
 from api.platforms import router as platforms_router
 from api.provider_definitions import router as provider_definitions_router
@@ -120,6 +121,7 @@ app.add_middleware(
 app.include_router(accounts_router, prefix="/api")
 app.include_router(account_checks_router, prefix="/api")
 app.include_router(actions_router, prefix="/api")
+app.include_router(kakao_pipeline_router, prefix="/api")
 app.include_router(auth_router, prefix="/api")
 app.include_router(config_router, prefix="/api")
 app.include_router(health_router, prefix="/api")

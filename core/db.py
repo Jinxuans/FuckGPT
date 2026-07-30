@@ -455,6 +455,76 @@ class ProviderSettingModel(SQLModel, table=True):
         self.metadata_json = json.dumps(data or {}, ensure_ascii=False)
 
 
+class KakaoPipelineModel(SQLModel, table=True):
+    """One resumable Kakao extraction/scanner record per local account."""
+
+    __tablename__ = "kakao_pipelines"
+    __table_args__ = (
+        UniqueConstraint("account_id", name="uq_kakao_pipelines_account"),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    account_id: int = Field(index=True, foreign_key="accounts.id", ondelete="CASCADE")
+    state: str = Field(default="idle", index=True)
+    payment_method: str = "kakao_pay"
+
+    supplier_setting_id: Optional[int] = Field(default=None, index=True)
+    supplier_name: str = ""
+    supplier_base_url: str = ""
+    supplier_cdk_key: str = ""
+    supplier_order_id: str = ""
+    supplier_customer_token: str = ""
+    supplier_poll_url: str = ""
+    supplier_status: str = ""
+    supplier_response_json: str = "{}"
+
+    payment_url: str = ""
+
+    scanner_setting_id: Optional[int] = Field(default=None, index=True)
+    scanner_driver: str = "customer_api"
+    scanner_name: str = ""
+    scanner_base_url: str = ""
+    scanner_cdk_key: str = ""
+    scanner_order_id: str = ""
+    scanner_customer_token: str = ""
+    scanner_poll_url: str = ""
+    scanner_status: str = ""
+    scanner_response_json: str = "{}"
+    scan_url: str = ""
+    scan_expires_at: str = ""
+
+    plus_status: str = ""
+    final_result: str = ""
+    last_error_code: str = ""
+    last_error_message: str = ""
+    events_json: str = "[]"
+
+    created_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow)
+    completed_at: Optional[datetime] = None
+
+    def get_supplier_response(self) -> dict:
+        data = json.loads(self.supplier_response_json or "{}")
+        return data if isinstance(data, dict) else {}
+
+    def set_supplier_response(self, data: dict):
+        self.supplier_response_json = json.dumps(data or {}, ensure_ascii=False, default=str)
+
+    def get_scanner_response(self) -> dict:
+        data = json.loads(self.scanner_response_json or "{}")
+        return data if isinstance(data, dict) else {}
+
+    def set_scanner_response(self, data: dict):
+        self.scanner_response_json = json.dumps(data or {}, ensure_ascii=False, default=str)
+
+    def get_events(self) -> list[dict]:
+        data = json.loads(self.events_json or "[]")
+        return data if isinstance(data, list) else []
+
+    def set_events(self, data: list[dict]):
+        self.events_json = json.dumps(data or [], ensure_ascii=False, default=str)
+
+
 class TaskModel(SQLModel, table=True):
     __tablename__ = "tasks"
 
@@ -570,6 +640,7 @@ def init_db():
     from infrastructure.provider_definitions_repository import ProviderDefinitionsRepository
 
     _ensure_column("provider_definitions", "category", "TEXT DEFAULT ''")
+    _ensure_column("kakao_pipelines", "scanner_driver", "TEXT DEFAULT 'customer_api'")
     SQLModel.metadata.create_all(engine)
 
     with Session(engine) as session:

@@ -787,6 +787,85 @@ _BUILTIN_DEFINITIONS: list[dict] = [
             {"key": "proxy_gateway_url", "label": "网关地址", "placeholder": "http://user:pass@gate.example.com:7777"},
         ],
     },
+    # ── temporary Kakao pipeline ────────────────────────────────────
+    {
+        "provider_type": "kakao_pipeline",
+        "provider_key": "supplier",
+        "label": "Kakao 提链供应商",
+        "description": "使用本地账号 AT 提取 Kakao / NicePay 支付长链",
+        "driver_type": "customer_api",
+        "default_auth_mode": "apikey",
+        "enabled": True,
+        "category": "custom",
+        "auth_modes": [{"value": "apikey", "label": "X-CDK-Key"}],
+        "fields": [
+            {
+                "key": "base_url",
+                "label": "供应商地址",
+                "placeholder": "http://127.0.0.1:8788",
+                "default_value": "http://127.0.0.1:8788",
+                "category": "connection",
+            },
+            {
+                "key": "cdk_keys",
+                "label": "供应商 CDK（每行一个）",
+                "type": "textarea",
+                "category": "auth",
+            },
+        ],
+    },
+    {
+        "provider_type": "kakao_pipeline",
+        "provider_key": "scanner",
+        "label": "I7wap 扫码平台",
+        "description": "提交已提取的 NicePay 长链并轮询 Plus 结果",
+        "driver_type": "customer_api",
+        "default_auth_mode": "apikey",
+        "enabled": True,
+        "category": "custom",
+        "auth_modes": [{"value": "apikey", "label": "X-CDK-Key"}],
+        "fields": [
+            {
+                "key": "base_url",
+                "label": "扫码接口地址",
+                "placeholder": "https://customer.i7wap.xyz",
+                "default_value": "https://customer.i7wap.xyz",
+                "category": "connection",
+            },
+            {
+                "key": "cdk_keys",
+                "label": "扫码 CDK（每行一个）",
+                "type": "textarea",
+                "category": "auth",
+            },
+        ],
+    },
+    {
+        "provider_type": "kakao_pipeline",
+        "provider_key": "scanner_546789",
+        "label": "546789 扫码平台",
+        "description": "向 Kakao 工作站提交 NicePay 长链并轮询支付确认结果",
+        "driver_type": "payment_submission",
+        "default_auth_mode": "apikey",
+        "enabled": True,
+        "category": "custom",
+        "auth_modes": [{"value": "apikey", "label": "submit_cdk"}],
+        "fields": [
+            {
+                "key": "base_url",
+                "label": "扫码接口地址",
+                "placeholder": "https://kakao.546789.shop",
+                "default_value": "https://kakao.546789.shop",
+                "category": "connection",
+            },
+            {
+                "key": "cdk_keys",
+                "label": "扫码 CDK（每行一个）",
+                "type": "textarea",
+                "category": "auth",
+            },
+        ],
+    },
 ]
 
 
