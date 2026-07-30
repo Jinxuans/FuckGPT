@@ -311,6 +311,25 @@ def _find_first_selector(page, selectors: list[str]) -> str | None:
     return None
 
 
+def _find_first_visible_selector(page, selectors: list[str]) -> str | None:
+    """Return the first rendered matching element, ignoring hidden form fields."""
+    for sel in selectors:
+        try:
+            node = page.query_selector(sel)
+        except Exception:
+            node = None
+        if not node:
+            continue
+        try:
+            if node.is_visible():
+                return sel
+        except Exception:
+            # Non-Playwright test doubles and older backends may not expose
+            # visibility. Preserve their previous existence-based behavior.
+            return sel
+    return None
+
+
 def _wait_for_any_selector(page, selectors: list[str], timeout: int = 30):
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -1291,11 +1310,11 @@ def _derive_registration_state_from_page(page) -> dict:
     if state.get("page_type"):
         return state
 
-    if _find_first_selector(page, PASSWORD_INPUT_SELECTORS):
+    if _find_first_visible_selector(page, PASSWORD_INPUT_SELECTORS):
         page_type = "login_password" if _is_login_password_url(current_url) else "create_account_password"
         return _build_manual_flow_state(page_type, current_url)
 
-    otp_selector = _find_first_selector(page, OTP_INPUT_SELECTORS)
+    otp_selector = _find_first_visible_selector(page, OTP_INPUT_SELECTORS)
     if otp_selector and "password" not in otp_selector:
         return _build_manual_flow_state("email_otp_verification", current_url)
 
@@ -1692,10 +1711,16 @@ def _generate_datadog_trace_headers() -> dict:
 
 def _infer_page_type(data: dict | None, current_url: str = "") -> str:
     raw = data if isinstance(data, dict) else {}
+    url = (current_url or "").lower()
+    try:
+        hostname = str(urlparse(current_url or "").hostname or "").lower()
+    except Exception:
+        hostname = ""
+    if hostname == "accounts.google.com" or hostname.endswith(".accounts.google.com"):
+        return "google_oauth"
     page_type = str(((raw.get("page") or {}).get("type")) or "").strip().lower().replace("-", "_").replace("/", "_").replace(" ", "_")
     if page_type:
         return page_type
-    url = (current_url or "").lower()
     if "code=" in url:
         return "oauth_callback"
     if "create-account/password" in url:
@@ -3282,7 +3307,7 @@ def _browser_registration_flow(
     *,
     prefer_password_registration: bool = False,
     password_provided: bool = True,
-    existing_account_callback: Optional[Callable[[], None]] = None,
+    existing_account_callback: Optional[Callable[..., None]] = None,
 ) -> dict:
     device_id = str(uuid.uuid4())
     _seed_browser_device_id(page, device_id)
@@ -3334,6 +3359,13 @@ def _browser_registration_flow(
                 final_state["existing_account"] = True
                 final_state["account_status"] = "existing_account"
             return final_state
+
+        if str(state.get("page_type") or "") == "google_oauth":
+            reason = "该邮箱已通过 Google 账户注册 ChatGPT"
+            if callable(existing_account_callback):
+                existing_account_callback(reason)
+            log(f"检测到 Google OAuth 跳转，停止注册并停用邮箱: {reason}")
+            raise ExistingAccountAuthenticationError(reason)
 
         if _is_password_registration(state):
             if register_submitted:
@@ -3472,7 +3504,7 @@ class ChatGPTBrowserRegister:
         codex_oauth_timeout: int = 300,
         keep_browser_open: bool = False,
         prefer_password_registration: bool = False,
-        existing_account_callback: Optional[Callable[[], None]] = None,
+        existing_account_callback: Optional[Callable[..., None]] = None,
         log_fn: Callable[[str], None] = print,
         backend_config: Optional[BrowserBackendConfig] = None,
     ):

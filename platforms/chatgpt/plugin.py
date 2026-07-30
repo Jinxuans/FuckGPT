@@ -576,11 +576,11 @@ class ChatGPTPlatform(BasePlatform):
             identity_metadata = dict(getattr(ctx.identity, "metadata", {}) or {})
             allocation_id = str(identity_metadata.get("mailbox_allocation_id") or "")
 
-            def _mark_existing_account():
+            def _mark_existing_account(reason: str = "OpenAI 认证流程进入 login_password"):
                 if allocation_id:
                     MailboxAllocationLifecycle().flag_existing_account(
                         allocation_id,
-                        reason="OpenAI 认证流程进入 login_password",
+                        reason=reason,
                     )
 
             return ChatGPTBrowserRegister(

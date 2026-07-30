@@ -4,6 +4,8 @@ import json
 import sys
 import types
 
+import pytest
+
 from platforms.chatgpt.constants import CHATGPT_APP, OPENAI_API_ENDPOINTS, SENTINEL_REQ_URL
 from platforms.chatgpt.plugin import ChatGPTPlatform
 from platforms.chatgpt.protocol_register import (
@@ -13,6 +15,7 @@ from platforms.chatgpt.protocol_register import (
 )
 from platforms.chatgpt.browser_register import (
     ChatGPTBrowserRegister,
+    ExistingAccountAuthenticationError,
     OTP_SUBMIT_SELECTORS,
     _about_you_checkbox_is_master,
     _about_you_checkbox_is_required,
@@ -22,6 +25,7 @@ from platforms.chatgpt.browser_register import (
     _click_otp_submit_button,
     _collect_visible_text_inputs,
     _extract_auth_error_text,
+    _derive_registration_state_from_page,
     _infer_about_you_mode,
     _is_login_password_url,
     _pick_best_about_you_input,
@@ -31,6 +35,54 @@ from platforms.chatgpt.browser_register import (
     _submit_password_via_page,
     _submit_otp_via_page,
 )
+
+
+def test_google_oauth_url_wins_over_hidden_password_inputs():
+    class HiddenNode:
+        def is_visible(self):
+            return False
+
+    class Page:
+        url = (
+            "https://accounts.google.com/v3/signin/identifier?"
+            "redirect_uri=https%3A%2F%2Fauth.openai.com%2Fapi%2Faccounts%2Fcallback%2Fgoogle"
+        )
+
+        def query_selector(self, _selector):
+            return HiddenNode()
+
+    state = _derive_registration_state_from_page(Page())
+
+    assert state["page_type"] == "google_oauth"
+
+
+def test_google_oauth_stops_registration_and_marks_mailbox_existing(monkeypatch):
+    logs = []
+    reasons = []
+
+    class Page:
+        url = "https://accounts.google.com/v3/signin/identifier"
+
+    monkeypatch.setattr("platforms.chatgpt.browser_register._seed_browser_device_id", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        "platforms.chatgpt.browser_register._start_browser_signup_via_authorize",
+        lambda *args, **kwargs: {"page_type": "google_oauth", "current_url": Page.url},
+    )
+    monkeypatch.setattr("platforms.chatgpt.browser_register._get_cookies", lambda page: {})
+
+    with pytest.raises(ExistingAccountAuthenticationError, match="已通过 Google 账户注册 ChatGPT") as caught:
+        _browser_registration_flow(
+            Page(),
+            "existing@gmail.com",
+            "generated-password-must-not-be-used",
+            lambda: "123456",
+            logs.append,
+            existing_account_callback=reasons.append,
+        )
+
+    assert caught.value.preserve_mailbox is True
+    assert reasons == ["该邮箱已通过 Google 账户注册 ChatGPT"]
+    assert any("停止注册并停用邮箱" in item for item in logs)
 
 
 def test_about_you_mode_uses_stable_age_attributes_for_unknown_locale():
