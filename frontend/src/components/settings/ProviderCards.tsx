@@ -18,12 +18,13 @@ const CATEGORY_GROUPS = [
 /* ------------------------------------------------------------------ */
 /*  Toggle                                                             */
 /* ------------------------------------------------------------------ */
-function Toggle({ checked, onChange, disabled }: { checked: boolean; onChange: (v: boolean) => void; disabled?: boolean }) {
+function Toggle({ checked, onChange, disabled, label }: { checked: boolean; onChange: (v: boolean) => void; disabled?: boolean; label?: string }) {
   return (
     <button
       type="button"
       role="switch"
       aria-checked={checked}
+      aria-label={label}
       disabled={disabled}
       onClick={() => onChange(!checked)}
       className={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors ${
@@ -271,7 +272,8 @@ function EditModal({
             id: setting.id, provider_type: providerType, provider_key: provider.value,
             display_name: setting.display_name || provider.label,
             auth_mode: setting.auth_mode || provider.default_auth_mode || '',
-            enabled: true, is_default: setting.is_default, config, auth, metadata: {},
+            enabled: setting.enabled, is_default: setting.is_default, config, auth,
+            metadata: setting.metadata || {},
           }),
         })
       } else {
@@ -280,7 +282,7 @@ function EditModal({
           body: JSON.stringify({
             provider_type: providerType, provider_key: provider.value,
             display_name: provider.label, auth_mode: provider.default_auth_mode || '',
-            enabled: true, is_default: false, config, auth, metadata: {},
+            enabled: false, is_default: false, config, auth, metadata: {},
           }),
         })
       }
@@ -446,7 +448,7 @@ export default function ProviderCards({ providerType, catalog, settings, onReloa
 
   const settingsMap: Record<string, ProviderSetting> = {}
   for (const s of settings) settingsMap[s.provider_key] = s
-  const defaultKey = settings.find(s => s.is_default)?.provider_key || ''
+  const defaultKey = settings.find(s => s.enabled && s.is_default)?.provider_key || ''
   const providerTypeLabelKey = `providers.type.${providerType}` as TranslationKey
 
   const grouped: Record<string, ProviderOption[]> = {}
@@ -463,17 +465,25 @@ export default function ProviderCards({ providerType, catalog, settings, onReloa
 
   const handleToggle = (provider: ProviderOption, enable: boolean) => withLoading(provider.value, async () => {
     const setting = settingsMap[provider.value]
-    if (enable && !setting) {
+    if (!setting) {
       await apiFetch('/provider-settings', {
         method: 'POST',
         body: JSON.stringify({
           provider_type: providerType, provider_key: provider.value,
           display_name: provider.label, auth_mode: provider.default_auth_mode || '',
-          enabled: true, is_default: settings.length === 0, config: {}, auth: {}, metadata: {},
+          enabled: enable, is_default: false, config: {}, auth: {}, metadata: {},
         }),
       })
-    } else if (!enable && setting) {
-      await apiFetch(`/provider-settings/${setting.id}`, { method: 'DELETE' })
+    } else {
+      await apiFetch('/provider-settings', {
+        method: 'PUT',
+        body: JSON.stringify({
+          id: setting.id, provider_type: providerType, provider_key: provider.value,
+          display_name: setting.display_name, auth_mode: setting.auth_mode,
+          enabled: enable, is_default: setting.is_default,
+          config: setting.config, auth: setting.auth, metadata: setting.metadata || {},
+        }),
+      })
     }
     invalidateConfigOptionsCache()
     await onReload()
@@ -487,7 +497,8 @@ export default function ProviderCards({ providerType, catalog, settings, onReloa
       body: JSON.stringify({
         id: setting.id, provider_type: providerType, provider_key: provider.value,
         display_name: setting.display_name, auth_mode: setting.auth_mode,
-        enabled: true, is_default: true, config: setting.config, auth: setting.auth, metadata: {},
+        enabled: true, is_default: true, config: setting.config, auth: setting.auth,
+        metadata: setting.metadata || {},
       }),
     })
     invalidateConfigOptionsCache()
@@ -520,9 +531,9 @@ export default function ProviderCards({ providerType, catalog, settings, onReloa
 
   const handleDelete = (provider: ProviderOption) => withLoading(provider.value, async () => {
     const setting = settingsMap[provider.value]
-    if (!setting) return
-    // Delete the setting
-    await apiFetch(`/provider-settings/${setting.id}`, { method: 'DELETE' })
+    if (setting) {
+      await apiFetch(`/provider-settings/${setting.id}`, { method: 'DELETE' })
+    }
     // Delete the definition (only works for non-builtin)
     const def = catalog.find(p => p.value === provider.value)
     if (def && !def.is_builtin && (def as any).id) {
@@ -539,7 +550,8 @@ export default function ProviderCards({ providerType, catalog, settings, onReloa
   const renderCard = (provider: ProviderOption, allowDelete = false) => {
     const key = provider.value
     const setting = settingsMap[key]
-    const isEnabled = !!setting
+    const isConfigured = !!setting
+    const isEnabled = Boolean(setting?.enabled)
     const isDefault = key === defaultKey
     const hasFields = (provider.fields || []).length > 0
 
@@ -551,6 +563,7 @@ export default function ProviderCards({ providerType, catalog, settings, onReloa
             <div className="flex items-center gap-2">
               <span className="text-sm font-medium text-[var(--text-primary)]">{provider.label}</span>
               {isDefault && <Badge variant="success">{t('providers.default')}</Badge>}
+              {isConfigured && !isEnabled && <Badge variant="secondary">{t('providers.configured')}</Badge>}
             </div>
             {provider.description && (
               <p className="mt-0.5 text-xs text-[var(--text-muted)] line-clamp-2 sm:line-clamp-1">{provider.description}</p>
@@ -560,17 +573,17 @@ export default function ProviderCards({ providerType, catalog, settings, onReloa
           {/* Right: actions */}
           <div className="flex min-w-0 flex-wrap items-center justify-end gap-1.5 sm:shrink-0 sm:gap-2">
             <button
-              onClick={() => hasFields && isEnabled ? setEditTarget({ provider, setting }) : undefined}
-              disabled={!hasFields || !isEnabled}
-              className={`table-action-btn ${(!hasFields || !isEnabled) ? 'opacity-30 cursor-not-allowed' : ''}`}
+              onClick={() => hasFields ? setEditTarget({ provider, setting: setting || null }) : undefined}
+              disabled={!hasFields}
+              className={`table-action-btn ${!hasFields ? 'opacity-30 cursor-not-allowed' : ''}`}
             >
               <Pencil className="h-3 w-3 mr-1" /> {t('providers.edit')}
             </button>
 
             <button
-              onClick={() => isEnabled ? handleTestInline(provider) : undefined}
-              disabled={!isEnabled || testingKeys[key]}
-              className={`table-action-btn ${!isEnabled ? 'opacity-30 cursor-not-allowed' : ''}`}
+              onClick={() => isConfigured ? handleTestInline(provider) : undefined}
+              disabled={!isConfigured || testingKeys[key]}
+              className={`table-action-btn ${!isConfigured ? 'opacity-30 cursor-not-allowed' : ''}`}
             >
               <FlaskConical className="h-3 w-3 mr-1" /> {testingKeys[key] ? t('providers.testing') : t('providers.test')}
             </button>
@@ -585,9 +598,9 @@ export default function ProviderCards({ providerType, catalog, settings, onReloa
 
             {allowDelete && (
               <button
-                onClick={() => isEnabled ? handleDelete(provider) : undefined}
-                disabled={!isEnabled || isDefault || loading[key]}
-                className={`table-action-btn table-action-btn-danger ${(!isEnabled || isDefault) ? 'opacity-30 cursor-not-allowed' : ''}`}
+                onClick={() => !isDefault ? handleDelete(provider) : undefined}
+                disabled={isDefault || loading[key]}
+                className={`table-action-btn table-action-btn-danger ${isDefault ? 'opacity-30 cursor-not-allowed' : ''}`}
               >
                 <Trash2 className="h-3 w-3 mr-1" /> {t('common.delete')}
               </button>
@@ -596,7 +609,8 @@ export default function ProviderCards({ providerType, catalog, settings, onReloa
             <Toggle
               checked={isEnabled}
               onChange={v => handleToggle(provider, v)}
-              disabled={loading[key] || isDefault}
+              disabled={loading[key]}
+              label={`${provider.label}: ${isEnabled ? t('providers.enabledState') : t('providers.disabledState')}`}
             />
           </div>
         </div>

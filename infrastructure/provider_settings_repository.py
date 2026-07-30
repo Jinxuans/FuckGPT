@@ -87,10 +87,8 @@ class ProviderSettingsRepository:
             if not item:
                 return False
             provider_type = item.provider_type
-            is_default = bool(item.is_default)
             session.delete(item)
-            session.commit()
-
+            session.flush()
             remaining = session.exec(
                 select(ProviderSettingModel)
                 .where(ProviderSettingModel.provider_type == provider_type)
@@ -100,13 +98,8 @@ class ProviderSettingsRepository:
                 remaining = [item for item in remaining if item.provider_key in SUPPORTED_MAILBOX_PROVIDER_KEYS]
             if provider_type == "sms":
                 remaining = [item for item in remaining if item.provider_key in SUPPORTED_SMS_PROVIDER_KEYS]
-            if is_default and remaining:
-                fallback = remaining[0]
-                fallback.is_default = True
-                fallback.updated_at = _utcnow()
-                session.add(fallback)
-                session.commit()
-                self._sync_legacy_config(provider_type, fallback)
+            self._normalize_default(remaining)
+            session.commit()
             return True
 
     def save(
@@ -145,25 +138,44 @@ class ProviderSettingsRepository:
                     )
                     item.created_at = _utcnow()
 
-            if is_default:
-                for other in session.exec(
-                    select(ProviderSettingModel).where(ProviderSettingModel.provider_type == provider_type)
-                ).all():
-                    if other.id != item.id and other.is_default:
-                        other.is_default = False
-                        other.updated_at = _utcnow()
-                        session.add(other)
-
             item.display_name = display_name or definition.label or provider_key
             item.auth_mode = auth_mode or definition.default_auth_mode or ""
             item.enabled = bool(enabled)
-            item.is_default = bool(is_default)
+            item.is_default = bool(is_default and enabled)
             item.set_config(config or {})
             item.set_auth(auth or {})
             item.set_metadata(metadata or {})
             item.updated_at = _utcnow()
             session.add(item)
+            session.flush()
+
+            items = session.exec(
+                select(ProviderSettingModel)
+                .where(ProviderSettingModel.provider_type == provider_type)
+                .order_by(ProviderSettingModel.id)
+            ).all()
+            self._normalize_default(items, preferred=item if item.is_default else None)
             session.commit()
             session.refresh(item)
 
         return item
+
+    @staticmethod
+    def _normalize_default(
+        items: list[ProviderSettingModel],
+        *,
+        preferred: ProviderSettingModel | None = None,
+    ) -> None:
+        """Keep at most one enabled default while allowing no enabled providers."""
+        enabled = [item for item in items if bool(item.enabled)]
+        chosen = preferred if preferred in enabled else next(
+            (item for item in enabled if bool(item.is_default)),
+            enabled[0] if enabled else None,
+        )
+        now = _utcnow()
+        for item in items:
+            should_be_default = item is chosen
+            if bool(item.is_default) == should_be_default:
+                continue
+            item.is_default = should_be_default
+            item.updated_at = now

@@ -441,7 +441,8 @@ function RegisterModal({
     }
   }, [selection.identityProvider, selection.executorType, supportedExecutors])
 
-  const defaultMailboxProvider = (configOptions.mailbox_settings || []).find(item => item.is_default) || configOptions.mailbox_settings?.[0] || null
+  const enabledMailboxProviders = (configOptions.mailbox_settings || []).filter(item => item.enabled)
+  const defaultMailboxProvider = enabledMailboxProviders.find(item => item.is_default) || enabledMailboxProviders[0] || null
 
   const start = async () => {
     setStarting(true)
