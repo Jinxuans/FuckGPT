@@ -876,6 +876,7 @@ export default function KakaoPipeline() {
   const [page, setPage] = useState(1)
   const [total, setTotal] = useState(0)
   const [loading, setLoading] = useState(true)
+  const [pageLoading, setPageLoading] = useState(false)
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [operations, setOperations] = useState<Record<number, string>>({})
   const [expanded, setExpanded] = useState<number | null>(null)
@@ -883,6 +884,7 @@ export default function KakaoPipeline() {
   const [toast, setToast] = useState<{ type: 'success' | 'error'; text: string } | null>(null)
   const activeRequests = useRef(new Set<number>())
   const loadRequestRef = useRef(0)
+  const hasLoadedAccountsRef = useRef(false)
 
   const loadSettings = useCallback(async () => {
     const result = await apiFetch('/kakao-pipeline/settings')
@@ -891,7 +893,9 @@ export default function KakaoPipeline() {
 
   const loadAccounts = useCallback(async (showLoading = true) => {
     const requestId = ++loadRequestRef.current
-    if (showLoading) setLoading(true)
+    const showSkeleton = showLoading && !hasLoadedAccountsRef.current
+    if (showSkeleton) setLoading(true)
+    if (showLoading && !showSkeleton) setPageLoading(true)
     try {
       const params = new URLSearchParams({
         page: String(page),
@@ -902,10 +906,15 @@ export default function KakaoPipeline() {
       if (requestId !== loadRequestRef.current) return
       setAccounts(Array.isArray(result.items) ? result.items : [])
       setTotal(Number(result.total || 0))
+      hasLoadedAccountsRef.current = true
     } catch (error) {
+      if (requestId !== loadRequestRef.current) return
       setToast({ type: 'error', text: parseError(error) })
     } finally {
-      if (showLoading) setLoading(false)
+      if (requestId === loadRequestRef.current && showLoading) {
+        setLoading(false)
+        setPageLoading(false)
+      }
     }
   }, [debouncedSearch, page])
 
@@ -924,11 +933,14 @@ export default function KakaoPipeline() {
   }, [toast])
 
   useEffect(() => {
-    Promise.all([loadSettings(), loadAccounts()]).catch(error => {
+    loadSettings().catch(error => {
       setToast({ type: 'error', text: parseError(error) })
-      setLoading(false)
     })
-  }, [loadAccounts, loadSettings])
+  }, [loadSettings])
+
+  useEffect(() => {
+    void loadAccounts()
+  }, [loadAccounts])
 
   const run = useCallback(async (
     accountId: number,
@@ -945,7 +957,7 @@ export default function KakaoPipeline() {
       if (options?.checkPlusAfter && result?.state === 'scanner_succeeded') {
         await apiFetch(`/kakao-pipeline/accounts/${accountId}/plus/check`, {
           method: 'POST',
-          body: '{}',
+          body: JSON.stringify({ advance_pipeline: true }),
         })
       }
       if (options?.refreshAfter !== false) await loadAccounts(false)
@@ -1003,7 +1015,7 @@ export default function KakaoPipeline() {
             account.id,
             '检测 Plus',
             `/kakao-pipeline/accounts/${account.id}/plus/check`,
-            {},
+            { advance_pipeline: true },
             { quiet: true, refreshAfter: false },
           ))
         }
@@ -1170,7 +1182,12 @@ export default function KakaoPipeline() {
           <Button
             variant="outline"
             size="sm"
-            onClick={() => run(account.id, '检测 Plus', `/kakao-pipeline/accounts/${account.id}/plus/check`)}
+            onClick={() => run(
+              account.id,
+              '检测 Plus',
+              `/kakao-pipeline/accounts/${account.id}/plus/check`,
+              { advance_pipeline: true },
+            )}
           >
             <Check className="mr-1.5 h-3.5 w-3.5" /> 检测 Plus
           </Button>
@@ -1291,7 +1308,7 @@ export default function KakaoPipeline() {
 
       <div className="overflow-hidden border border-[var(--border)] bg-[var(--bg-surface)]">
         <div className="overflow-x-auto">
-          <table className="w-full min-w-[900px] table-fixed text-left">
+          <table className="w-full min-w-[900px] table-fixed text-left" aria-busy={loading || pageLoading}>
             <colgroup>
               <col className="w-[30%]" />
               <col className="w-[38%]" />
@@ -1348,10 +1365,13 @@ export default function KakaoPipeline() {
           </table>
         </div>
         <div className="flex items-center justify-between border-t border-[var(--border)] px-4 py-3">
-          <span className="text-xs text-[var(--text-muted)]">第 {page} / {totalPages} 页</span>
+          <span className="flex items-center gap-1.5 text-xs text-[var(--text-muted)]" role="status" aria-live="polite">
+            {pageLoading ? <LoaderCircle className="h-3.5 w-3.5 animate-spin" /> : null}
+            {pageLoading ? `正在加载第 ${page} 页` : `第 ${page} / ${totalPages} 页`}
+          </span>
           <div className="flex gap-2">
-            <Button variant="outline" size="sm" disabled={page <= 1} onClick={() => setPage(value => value - 1)}>上一页</Button>
-            <Button variant="outline" size="sm" disabled={page >= totalPages} onClick={() => setPage(value => value + 1)}>下一页</Button>
+            <Button variant="outline" size="sm" disabled={pageLoading || page <= 1} onClick={() => setPage(value => value - 1)}>上一页</Button>
+            <Button variant="outline" size="sm" disabled={pageLoading || page >= totalPages} onClick={() => setPage(value => value + 1)}>下一页</Button>
           </div>
         </div>
       </div>

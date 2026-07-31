@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 from core.base_platform import Account
 from core.db import save_account
 from features.kakao_pipeline.client import CustomerApiClient, CustomerApiProblem
@@ -435,6 +437,57 @@ def test_force_reset_can_clear_stuck_active_state():
     assert reset["state"] == "idle"
     listed = service.list_accounts(search="force-reset@test.com")
     assert listed["items"][0]["pipeline"]["state"] == "idle"
+
+
+def test_manual_plus_check_preserves_pipeline_stage(monkeypatch):
+    account_id = _create_account("manual-plus-check@test.com")
+    service = KakaoPipelineService()
+
+    from sqlmodel import Session
+
+    from core.db import KakaoPipelineModel, engine
+
+    with Session(engine) as session:
+        session.add(
+            KakaoPipelineModel(
+                account_id=account_id,
+                state="link_ready",
+                payment_url="https://pay.nicepay.co.kr/v1/checkout/pay/manual-check",
+            )
+        )
+        session.commit()
+
+    monkeypatch.setattr(
+        "features.kakao_pipeline.service.PlatformRuntime.execute_action",
+        lambda *_args, **_kwargs: SimpleNamespace(ok=True, error=""),
+    )
+
+    checked = service.check_plus(account_id, advance_pipeline=False)
+
+    assert checked["state"] == "link_ready"
+    assert checked["payment_url"].endswith("/manual-check")
+
+
+def test_pipeline_plus_check_advances_after_scanner_success(monkeypatch):
+    account_id = _create_account("pipeline-plus-check@test.com")
+    service = KakaoPipelineService()
+
+    from sqlmodel import Session
+
+    from core.db import KakaoPipelineModel, engine
+
+    with Session(engine) as session:
+        session.add(KakaoPipelineModel(account_id=account_id, state="scanner_succeeded"))
+        session.commit()
+
+    monkeypatch.setattr(
+        "features.kakao_pipeline.service.PlatformRuntime.execute_action",
+        lambda *_args, **_kwargs: SimpleNamespace(ok=True, error=""),
+    )
+
+    checked = service.check_plus(account_id, advance_pipeline=True)
+
+    assert checked["state"] == "plus_pending"
 
 
 def test_546789_expired_keeps_link_and_quota_removal_is_isolated(monkeypatch):

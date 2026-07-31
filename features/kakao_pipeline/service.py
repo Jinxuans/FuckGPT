@@ -973,17 +973,21 @@ class KakaoPipelineService:
                 session.commit()
                 return self._serialize_pipeline(pipeline, detail=True)
 
-    def check_plus(self, account_id: int) -> dict:
+    def check_plus(self, account_id: int, *, advance_pipeline: bool = False) -> dict:
         with _account_lock(account_id):
             with Session(engine) as session:
                 pipeline = self._pipeline_for_account(session, account_id, create=True)
                 assert pipeline is not None
-                pipeline.state = "plus_checking"
                 pipeline.plus_status = "checking"
-                pipeline.last_error_code = ""
-                pipeline.last_error_message = ""
+                if advance_pipeline:
+                    pipeline.state = "plus_checking"
+                    pipeline.last_error_code = ""
+                    pipeline.last_error_message = ""
                 pipeline.updated_at = _utcnow()
-                _append_event(pipeline, "开始从本地账号复检 Plus")
+                _append_event(
+                    pipeline,
+                    "开始流水线 Plus 复检" if advance_pipeline else "开始人工检测账号 Plus 状态",
+                )
                 session.add(pipeline)
                 session.commit()
             result = PlatformRuntime().execute_action(
@@ -999,7 +1003,11 @@ class KakaoPipelineService:
                     pipeline = self._pipeline_for_account(session, account_id)
                     assert pipeline is not None
                     pipeline.plus_status = "error"
-                    _set_error(pipeline, "plus_check_failed", "plus_check_failed", result.error or "Plus 检测失败")
+                    if advance_pipeline:
+                        _set_error(pipeline, "plus_check_failed", "plus_check_failed", result.error or "Plus 检测失败")
+                    else:
+                        pipeline.updated_at = _utcnow()
+                        _append_event(pipeline, result.error or "Plus 检测失败", level="error")
                     session.add(pipeline)
                     session.commit()
                     return self._serialize_pipeline(pipeline, detail=True)
@@ -1015,8 +1023,9 @@ class KakaoPipelineService:
                 assert pipeline is not None
                 pipeline.plus_status = "plus" if is_plus else (plan or plan_state or "free")
                 pipeline.final_result = "plus" if is_plus else "not_plus"
-                pipeline.state = "completed" if is_plus else "plus_pending"
-                pipeline.completed_at = _utcnow() if is_plus else None
+                if advance_pipeline:
+                    pipeline.state = "completed" if is_plus else "plus_pending"
+                    pipeline.completed_at = _utcnow() if is_plus else None
                 pipeline.updated_at = _utcnow()
                 _append_event(
                     pipeline,

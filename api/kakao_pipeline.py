@@ -32,6 +32,10 @@ class ResetRequest(BaseModel):
     force: bool = False
 
 
+class PlusCheckRequest(BaseModel):
+    advance_pipeline: bool = False
+
+
 class DefaultScannerRequest(BaseModel):
     scanner_kind: str
 
@@ -162,10 +166,13 @@ def poll_scanner(account_id: int, response: Response):
 
 
 @router.post("/accounts/{account_id}/plus/check")
-def check_plus(account_id: int, response: Response):
+def check_plus(account_id: int, response: Response, body: PlusCheckRequest | None = None):
     response.headers["Cache-Control"] = "no-store"
     try:
-        return service.check_plus(account_id)
+        return service.check_plus(
+            account_id,
+            advance_pipeline=bool(body and body.advance_pipeline),
+        )
     except Exception as exc:  # noqa: BLE001
         _raise_problem(exc)
 
