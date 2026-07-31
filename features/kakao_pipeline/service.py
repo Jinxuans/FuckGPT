@@ -57,6 +57,14 @@ ACTIVE_STATES = {
     "plus_checking",
 }
 
+BACKGROUND_POLL_STATES = {
+    "supplier_processing",
+    "scanner_processing",
+    "scanner_succeeded",
+    "plus_checking",
+    "plus_pending",
+}
+
 TERMINAL_REMOTE_FAILURES = {"FAILED", "CANCELLED", "EXPIRED", "REJECTED"}
 REMOTE_SUCCESS_STATUSES = {"SUCCESS", "SUCCEEDED", "COMPLETED", "CONFIRMED", "PLUS", "ACTIVE"}
 
@@ -639,6 +647,45 @@ class KakaoPipelineService:
                 }
             )
         return {**result, "items": items}
+
+    def list_background_work(self, *, limit: int = 100) -> list[dict]:
+        """Return persisted work that can safely resume without a browser page."""
+        with Session(engine) as session:
+            rows = session.exec(
+                select(KakaoPipelineModel)
+                .where(KakaoPipelineModel.state.in_(BACKGROUND_POLL_STATES))
+                .order_by(KakaoPipelineModel.updated_at, KakaoPipelineModel.id)
+                .limit(min(max(int(limit), 1), 500))
+            ).all()
+            return [
+                {
+                    "account_id": int(row.account_id),
+                    "state": _text(row.state),
+                }
+                for row in rows
+            ]
+
+    def advance_background(self, account_id: int, *, expected_state: str = "") -> dict:
+        """Advance one resumable state while sharing the manual-action account lock."""
+        with _account_lock(account_id):
+            with Session(engine) as session:
+                pipeline = self._pipeline_for_account(session, account_id)
+                if pipeline is None:
+                    return self._serialize_pipeline(None)
+                state = _text(pipeline.state)
+                if expected_state and state != _text(expected_state):
+                    return self._serialize_pipeline(pipeline)
+                if state not in BACKGROUND_POLL_STATES:
+                    return self._serialize_pipeline(pipeline)
+
+            if state == "supplier_processing":
+                return self.poll_supplier(account_id)
+            if state == "scanner_processing":
+                result = self.poll_scanner(account_id)
+                if result.get("state") == "scanner_succeeded":
+                    return self.check_plus(account_id, advance_pipeline=True)
+                return result
+            return self.check_plus(account_id, advance_pipeline=True)
 
     def get_account_pipeline(self, account_id: int) -> dict:
         with Session(engine) as session:

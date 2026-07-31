@@ -112,7 +112,13 @@ const SETTING_TITLES: Record<SettingKind, string> = {
 }
 
 const PAGE_SIZE = 20
-const ACTIVE_POLL_STATES = new Set(['supplier_processing', 'scanner_processing', 'scanner_succeeded'])
+const ACTIVE_PIPELINE_STATES = new Set([
+  'supplier_processing',
+  'scanner_processing',
+  'scanner_succeeded',
+  'plus_checking',
+  'plus_pending',
+])
 
 function parseError(error: unknown) {
   const message = error instanceof Error ? error.message : String(error || '操作失败')
@@ -884,6 +890,7 @@ export default function KakaoPipeline() {
   const [toast, setToast] = useState<{ type: 'success' | 'error'; text: string } | null>(null)
   const activeRequests = useRef(new Set<number>())
   const loadRequestRef = useRef(0)
+  const accountLoadInFlightRef = useRef(false)
   const hasLoadedAccountsRef = useRef(false)
 
   const loadSettings = useCallback(async () => {
@@ -893,6 +900,7 @@ export default function KakaoPipeline() {
 
   const loadAccounts = useCallback(async (showLoading = true) => {
     const requestId = ++loadRequestRef.current
+    accountLoadInFlightRef.current = true
     const showSkeleton = showLoading && !hasLoadedAccountsRef.current
     if (showSkeleton) setLoading(true)
     if (showLoading && !showSkeleton) setPageLoading(true)
@@ -915,6 +923,7 @@ export default function KakaoPipeline() {
         setLoading(false)
         setPageLoading(false)
       }
+      if (requestId === loadRequestRef.current) accountLoadInFlightRef.current = false
     }
   }, [debouncedSearch, page])
 
@@ -989,43 +998,17 @@ export default function KakaoPipeline() {
   }, [loadAccounts, loadSettings])
 
   useEffect(() => {
-    const timer = window.setInterval(() => {
-      const polls: Array<Promise<unknown>> = []
-      for (const account of accounts) {
-        const state = account.pipeline.state
-        if (!ACTIVE_POLL_STATES.has(state) || activeRequests.current.has(account.id)) continue
-        if (state === 'supplier_processing') {
-          polls.push(run(
-            account.id,
-            '刷新提链',
-            `/kakao-pipeline/accounts/${account.id}/supplier/poll`,
-            {},
-            { quiet: true, refreshAfter: false },
-          ))
-        } else if (state === 'scanner_processing') {
-          polls.push(run(
-            account.id,
-            '刷新扫码',
-            `/kakao-pipeline/accounts/${account.id}/scanner/poll`,
-            {},
-            { quiet: true, checkPlusAfter: true, refreshAfter: false },
-          ))
-        } else if (state === 'scanner_succeeded') {
-          polls.push(run(
-            account.id,
-            '检测 Plus',
-            `/kakao-pipeline/accounts/${account.id}/plus/check`,
-            { advance_pipeline: true },
-            { quiet: true, refreshAfter: false },
-          ))
-        }
-      }
-      if (polls.length > 0) {
-        void Promise.allSettled(polls).then(() => loadAccounts(false))
-      }
-    }, 3000)
-    return () => window.clearInterval(timer)
-  }, [accounts, loadAccounts, run])
+    const refreshVisiblePage = () => {
+      if (document.visibilityState !== 'visible' || accountLoadInFlightRef.current) return
+      void loadAccounts(false)
+    }
+    const timer = window.setInterval(refreshVisiblePage, 3000)
+    document.addEventListener('visibilitychange', refreshVisiblePage)
+    return () => {
+      window.clearInterval(timer)
+      document.removeEventListener('visibilitychange', refreshVisiblePage)
+    }
+  }, [loadAccounts])
 
   const toggleDetail = async (accountId: number) => {
     if (expanded === accountId) {
@@ -1204,7 +1187,7 @@ export default function KakaoPipeline() {
   }
 
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE))
-  const activeCount = accounts.filter(account => ACTIVE_POLL_STATES.has(account.pipeline.state)).length
+  const activeCount = accounts.filter(account => ACTIVE_PIPELINE_STATES.has(account.pipeline.state)).length
   const readyCount = accounts.filter(account => account.pipeline.state === 'link_ready').length
   const errorCount = accounts.filter(account => ['supplier_failed', 'scanner_failed', 'plus_check_failed'].includes(account.pipeline.state)).length
   const completedCount = accounts.filter(account => account.pipeline.state === 'completed' || accountIsPlus(account)).length

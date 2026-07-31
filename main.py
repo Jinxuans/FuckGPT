@@ -101,6 +101,8 @@ async def lifespan(app: FastAPI):
     scheduler.start()
     from services.task_runtime import task_runtime
     task_runtime.start()
+    from features.kakao_pipeline.reconciler import kakao_pipeline_reconciler
+    kakao_pipeline_reconciler.start()
     from services.solver_manager import start_async
     start_async()
     from core.lifecycle import lifecycle_manager
@@ -108,6 +110,8 @@ async def lifespan(app: FastAPI):
     yield
     from core.lifecycle import lifecycle_manager as _lifecycle_manager
     _lifecycle_manager.stop()
+    from features.kakao_pipeline.reconciler import kakao_pipeline_reconciler as _kakao_pipeline_reconciler
+    _kakao_pipeline_reconciler.stop()
     from core.scheduler import scheduler as _scheduler
     _scheduler.stop()
     from services.task_runtime import task_runtime as _task_runtime
