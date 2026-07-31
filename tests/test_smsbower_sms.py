@@ -346,6 +346,7 @@ def test_smsbower_is_exposed_in_provider_catalog_and_registry():
         "smsbower_request_max_attempts",
         "smsbower_request_retry_delay",
         "smsbower_request_retry_max_delay",
+        "smsbower_phone_max_attempts",
     }.issubset(field_keys)
     assert "smsbower" in list_registered("sms")
     provider = create_provider("sms", "smsbower", {"smsbower_api_key": "secret-key"})

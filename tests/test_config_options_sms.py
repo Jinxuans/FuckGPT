@@ -25,6 +25,7 @@ def test_config_options_exposes_smsbower_catalog(client):
     assert "smsbower_request_retry_max_delay" in field_keys
     assert "smsbower_number_api" in field_keys
     assert "smsbower_otp_timeout_seconds" in field_keys
+    assert "smsbower_phone_max_attempts" in field_keys
     assert {
         "smsbower_provider_ids",
         "smsbower_except_provider_ids",
@@ -39,8 +40,13 @@ def test_config_options_exposes_smsbower_catalog(client):
     assert fields["smsbower_number_api"]["default_value"] == "getNumber"
     assert len(fields["smsbower_number_api"]["options"]) == 2
     assert fields["smsbower_otp_timeout_seconds"]["default_value"] == "120"
+    assert fields["smsbower_phone_max_attempts"]["default_value"] == "3"
     assert fields["smsbower_buy_max_attempts"]["default_value"] == "20"
     assert fields["smsbower_buy_retry_interval"]["default_value"] == "3"
+    for provider in data["sms_providers"]:
+        provider_fields = {item["key"]: item for item in provider["fields"]}
+        field_key = f"{provider['value']}_phone_max_attempts"
+        assert provider_fields[field_key]["default_value"] == "3"
 
 
 def test_config_options_exposes_proxy_catalog(client):

@@ -1378,6 +1378,54 @@ def test_add_phone_retries_new_number_when_chinese_in_use_error(monkeypatch):
     assert attempts == ["attempt", "cleanup", "reset", ("goto", "https://auth.openai.com/add-phone"), "attempt"]
 
 
+def test_add_phone_uses_configured_phone_attempt_limit(monkeypatch):
+    attempts = []
+    logs = []
+
+    class Page:
+        url = "https://auth.openai.com/add-phone"
+
+        def goto(self, url, **kwargs):
+            attempts.append(("goto", url))
+
+    class PhoneCallback:
+        phone_max_attempts = 5
+
+        def __call__(self):
+            return "+15555550123"
+
+        def cleanup(self):
+            attempts.append("cleanup")
+
+        def reset(self):
+            attempts.append("reset")
+
+    def fake_do_attempt(page, phone_callback, **kwargs):
+        attempts.append("attempt")
+        raise RuntimeError("手机号提交失败: 该电话号码已被使用。请使用其他电话号码。")
+
+    monkeypatch.setattr("platforms.chatgpt.codex_oauth.time.sleep", lambda seconds: None)
+    monkeypatch.setattr("platforms.chatgpt.codex_oauth._do_add_phone_attempt", fake_do_attempt)
+
+    try:
+        _handle_add_phone_challenge(
+            Page(),
+            PhoneCallback(),
+            log=logs.append,
+            resume_url="https://auth.openai.com/oauth/authorize?state=state-test",
+        )
+    except RuntimeError as exc:
+        assert "手机验证失败" in str(exc)
+    else:
+        raise AssertionError("configured phone attempt limit should eventually be exhausted")
+
+    assert attempts.count("attempt") == 5
+    assert attempts.count("reset") == 4
+    assert any("换号重试 5/5" in message for message in logs)
+
+
+
+
 def test_add_phone_retries_new_number_when_japanese_in_use_error(monkeypatch):
     attempts = []
 
@@ -1724,6 +1772,7 @@ def test_codex_phone_callback_uses_smsbower_retry_settings(monkeypatch):
                 "smsbower_buy_max_attempts": "7",
                 "smsbower_buy_retry_interval": "1.5",
                 "smsbower_otp_timeout_seconds": "180",
+                "smsbower_phone_max_attempts": "6",
             }
 
     class Client:
@@ -1740,6 +1789,7 @@ def test_codex_phone_callback_uses_smsbower_retry_settings(monkeypatch):
     assert callback.buy_max_attempts == 7
     assert callback.buy_retry_interval == 1.5
     assert callback.otp_timeout_seconds == 180
+    assert callback.phone_max_attempts == 6
 
 
 def test_codex_phone_callback_supports_non_smsbower_provider(monkeypatch):
