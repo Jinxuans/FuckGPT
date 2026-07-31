@@ -1500,6 +1500,56 @@ def test_add_phone_retries_new_number_when_japanese_invalid_number_error(monkeyp
     assert attempts == ["attempt", "cleanup", "reset", ("goto", "https://auth.openai.com/add-phone"), "attempt"]
 
 
+def test_add_phone_retries_when_japanese_account_link_limit_is_reached(monkeypatch):
+    attempts = []
+    logs = []
+
+    class Page:
+        url = "https://auth.openai.com/add-phone"
+
+        def goto(self, url, **kwargs):
+            attempts.append(("goto", url))
+
+    class PhoneCallback:
+        phone_max_attempts = 3
+
+        def __call__(self):
+            return "+15555550123"
+
+        def cleanup(self):
+            attempts.append("cleanup")
+
+        def reset(self):
+            attempts.append("reset")
+
+    def fake_do_attempt(page, phone_callback, **kwargs):
+        attempts.append("attempt")
+        if attempts.count("attempt") == 1:
+            raise RuntimeError(
+                "手机号提交失败: この電話番号は、すでに上限数のアカウントに関連付けられています。"
+            )
+
+    monkeypatch.setattr("platforms.chatgpt.codex_oauth.time.sleep", lambda seconds: None)
+    monkeypatch.setattr("platforms.chatgpt.codex_oauth._do_add_phone_attempt", fake_do_attempt)
+
+    _handle_add_phone_challenge(
+        Page(),
+        PhoneCallback(),
+        log=logs.append,
+        resume_url="https://auth.openai.com/oauth/authorize?state=state-test",
+    )
+
+    assert attempts == [
+        "attempt",
+        "cleanup",
+        "reset",
+        ("goto", "https://auth.openai.com/add-phone"),
+        "attempt",
+    ]
+    assert any("准备换号" in message for message in logs)
+    assert any("换号重试 2/3" in message for message in logs)
+
+
 def test_resume_oauth_after_add_phone_success_keeps_natural_consent(monkeypatch):
     gotos = []
 

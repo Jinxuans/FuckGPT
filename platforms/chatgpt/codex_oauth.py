@@ -1525,6 +1525,7 @@ def _handle_add_phone_challenge(
                 or "電話番号は無効" in message
                 or "すでに使用" in message
                 or "別の電話番号" in message
+                or "上限数のアカウントに関連付けられ" in message
                 or "phone_number_in_use" in message
                 or "invalid phone" in message.lower()
                 or "invalid number" in message.lower()
