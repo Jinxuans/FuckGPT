@@ -602,6 +602,31 @@ class ChatGPTPlatform(BasePlatform):
             identity_metadata = dict(getattr(ctx.identity, "metadata", {}) or {})
             allocation_id = str(identity_metadata.get("mailbox_allocation_id") or "")
 
+            def _worker_timeout(key: str, default: int, minimum: int, maximum: int) -> int:
+                try:
+                    value = int(float(ctx.extra.get(key, default) or default))
+                except (TypeError, ValueError):
+                    value = default
+                return min(max(value, minimum), maximum)
+
+            worker_idle_timeout = _worker_timeout(
+                "browser_worker_idle_timeout",
+                120,
+                30,
+                600,
+            )
+            try:
+                configured_hard_timeout = int(
+                    float(ctx.extra.get("browser_worker_hard_timeout", 0) or 0)
+                )
+            except (TypeError, ValueError):
+                configured_hard_timeout = 0
+            worker_hard_timeout = (
+                min(max(configured_hard_timeout, worker_idle_timeout), 3600)
+                if configured_hard_timeout > 0
+                else 0
+            )
+
             def _mark_existing_account(reason: str = "OpenAI 认证流程进入 login_password"):
                 if allocation_id:
                     MailboxAllocationLifecycle().flag_existing_account(
@@ -619,6 +644,9 @@ class ChatGPTPlatform(BasePlatform):
                 keep_browser_open=keep_browser_open,
                 prefer_password_registration=_truthy(ctx.extra.get("prefer_password_registration")),
                 existing_account_callback=_mark_existing_account,
+                cancel_check=ctx.platform.is_cancel_requested,
+                worker_idle_timeout=worker_idle_timeout,
+                worker_hard_timeout=worker_hard_timeout,
                 log_fn=ctx.log,
                 backend_config=(ctx.extra or {}).get("_reuse_backend_config"),
             )
@@ -626,7 +654,7 @@ class ChatGPTPlatform(BasePlatform):
         return BrowserRegistrationAdapter(
             result_mapper=lambda ctx, result: self._map_chatgpt_result(result),
             browser_worker_builder=_build_browser_worker,
-            browser_register_runner=lambda worker, ctx, artifacts: worker.run(
+            browser_register_runner=lambda worker, ctx, artifacts: worker.run_isolated(
                 email=ctx.identity.email or "",
                 password=ctx.password or "",
                 password_provided=ctx.password_provided,

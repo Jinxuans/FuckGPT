@@ -2,6 +2,14 @@ import os
 import sys
 from contextlib import asynccontextmanager
 
+if __name__ == "__main__":
+    # Required when the PyInstaller build launches disposable browser workers
+    # through multiprocessing on Windows.  In source/uvicorn mode this is a
+    # harmless no-op.
+    import multiprocessing
+
+    multiprocessing.freeze_support()
+
 # ★ 加载 .env 文件（在导入任何模块之前，确保所有 os.environ.get() 能读到配置）
 _env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
 if os.path.isfile(_env_path):
