@@ -1524,6 +1524,7 @@ def _handle_add_phone_challenge(
                 or "電話番号が無効" in message
                 or "電話番号は無効" in message
                 or "すでに使用" in message
+                or "最近使用された" in message
                 or "別の電話番号" in message
                 or "上限数のアカウントに関連付けられ" in message
                 or "phone_number_in_use" in message
@@ -1534,6 +1535,8 @@ def _handle_add_phone_challenge(
                 or "no number" in message.lower()
                 or "already" in message.lower()
                 or "in use" in message.lower()
+                or "recently used" in message.lower()
+                or "最近使用" in message
             )
             if hasattr(phone_callback, "cleanup"):
                 try:
