@@ -99,6 +99,8 @@ def test_push_codex_payload_and_records_delivery(client, monkeypatch):
     status = listed["items"][0]["push_deliveries"][0]
     assert status["target_key"] == "nvtokens"
     assert status["status"] == "success"
+    assert status["last_attempt_at"].endswith("Z")
+    assert status["pushed_at"].endswith("Z")
     assert "codex-access-secret" not in str(status)
 
 
@@ -152,3 +154,8 @@ def test_failed_push_records_safe_http_error(client, monkeypatch):
         assert delivery.http_status == 401
         assert delivery.last_error == "远端返回 HTTP 401"
         assert "test-api-key" not in delivery.last_error
+
+    listed = client.get("/api/accounts", params={"platform": "chatgpt"}).json()
+    status = listed["items"][0]["push_deliveries"][0]
+    assert status["last_attempt_at"].endswith("Z")
+    assert status["pushed_at"] is None

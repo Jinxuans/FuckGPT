@@ -211,6 +211,38 @@ function getLatestPushDelivery(acc: any) {
   return deliveries[0] || null
 }
 
+function markPushPending(
+  accounts: any[],
+  accountIds: number[],
+  target: PushTarget,
+  attemptedAt: string,
+) {
+  const selected = new Set(accountIds)
+  return accounts.map(account => {
+    if (!selected.has(Number(account?.id))) return account
+    const deliveries = Array.isArray(account?.push_deliveries)
+      ? [...account.push_deliveries]
+      : []
+    const existingIndex = deliveries.findIndex(delivery => delivery?.target_key === target.key)
+    const existing = existingIndex >= 0 ? deliveries[existingIndex] : null
+    const pendingDelivery = {
+      ...(existing || {}),
+      target_key: target.key,
+      target_label: target.label,
+      payload_format: target.payload_format || existing?.payload_format || 'codex',
+      status: 'pending',
+      attempt_count: Number(existing?.attempt_count || 0) + 1,
+      http_status: 0,
+      last_error: '',
+      last_attempt_at: attemptedAt,
+      pushed_at: existing?.pushed_at || null,
+    }
+    if (existingIndex >= 0) deliveries.splice(existingIndex, 1)
+    deliveries.unshift(pendingDelivery)
+    return { ...account, push_deliveries: deliveries }
+  })
+}
+
 function formatOptionalDateTime(value: string, language: Parameters<typeof formatDateTime>[1]) {
   if (!value) return ''
   try {
@@ -2158,22 +2190,31 @@ export default function Accounts() {
   useEffect(() => { load(page) }, [load, page])
 
   const pushAccounts = useCallback(async (ids: number[], targetKey = '') => {
-    const result = await apiFetch('/accounts/push', {
-      method: 'POST',
-      body: JSON.stringify({
-        platform: tab,
-        ids,
-        select_all: false,
-        target_key: targetKey,
-      }),
-    })
-    setActionResult({
-      title: `${result?.target_label || '远端'}推送结果：成功 ${result?.succeeded || 0}，失败 ${result?.failed || 0}`,
-      payload: result,
-    })
-    await load()
-    return result
-  }, [load, tab])
+    const target = pushTargets.find(item => item.key === targetKey)
+      || pushTargets.find(item => item.is_default)
+      || pushTargets[0]
+    if (!target) throw new Error('未配置已启用的推送目标')
+
+    setAccounts(current => markPushPending(current, ids, target, new Date().toISOString()))
+    try {
+      const result = await apiFetch('/accounts/push', {
+        method: 'POST',
+        body: JSON.stringify({
+          platform: tab,
+          ids,
+          select_all: false,
+          target_key: target.key,
+        }),
+      })
+      setActionResult({
+        title: `${result?.target_label || target.label}推送结果：成功 ${result?.succeeded || 0}，失败 ${result?.failed || 0}`,
+        payload: result,
+      })
+      return result
+    } finally {
+      await load()
+    }
+  }, [load, pushTargets, tab])
 
   
   const exportCsv = () => {
@@ -2544,6 +2585,9 @@ export default function Accounts() {
                 const planBadge = accountPlan && accountPlan !== 'unknown' ? accountPlan : ''
                 const codexStatus = getCodexStatus(acc)
                 const pushDelivery = getLatestPushDelivery(acc)
+                const pushDisplayTime = pushDelivery?.status === 'success'
+                  ? pushDelivery?.pushed_at || pushDelivery?.last_attempt_at
+                  : pushDelivery?.last_attempt_at
                 const registeredDate = acc.created_at ? formatDateTime(acc.created_at, language, {
                   month: '2-digit', day: '2-digit',
                 }) : '-'
@@ -2654,7 +2698,7 @@ export default function Accounts() {
                       </span>
                       <div className="truncate text-[11px] text-[var(--text-muted)]">
                         {pushDelivery.target_label || pushDelivery.target_key}
-                        {pushDelivery.pushed_at ? ` · ${formatOptionalDateTime(pushDelivery.pushed_at, language)}` : ''}
+                        {pushDisplayTime ? ` · ${formatOptionalDateTime(pushDisplayTime, language)}` : ''}
                       </div>
                     </div>
                   ) : (
