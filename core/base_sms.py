@@ -5,6 +5,8 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 import time
 
+from core.network_retry import is_retryable_network_error
+
 
 @dataclass(frozen=True)
 class SmsActivation:
@@ -61,13 +63,26 @@ class BaseSmsProvider(ABC):
         deadline = time.monotonic() + max(float(timeout or 0), 0.1)
         interval = max(float(poll_interval or 0), 0)
         last_status = ""
+        network_failures = 0
         while time.monotonic() < deadline:
-            status = self.get_status(activation_id)
+            try:
+                status = self.get_status(activation_id)
+                network_failures = 0
+            except Exception as exc:
+                if not is_retryable_network_error(exc):
+                    raise
+                network_failures += 1
+                last_status = f"瞬时网络/代理异常（连续 {network_failures} 次）: {exc}"
+                remaining = max(deadline - time.monotonic(), 0)
+                if remaining <= 0:
+                    break
+                time.sleep(min(max(interval, 1.0), remaining))
+                continue
             last_status = status.raw or status.status
             if status.code:
                 return status.code
             if status.status == "cancelled":
                 raise RuntimeError(f"短信激活已取消: {activation_id}")
             if interval > 0:
-                time.sleep(interval)
+                time.sleep(min(interval, max(deadline - time.monotonic(), 0)))
         raise TimeoutError(f"等待短信验证码超时 ({timeout}s)，最后状态: {last_status or 'none'}")

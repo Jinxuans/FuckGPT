@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 
 from core.base_platform import BasePlatform, Account, AccountStatus, RegisterConfig
 from core.base_mailbox import BaseMailbox
+from core.network_retry import is_retryable_network_error
 from core.registration import BrowserRegistrationAdapter, OtpSpec, ProtocolMailboxAdapter, RegistrationResult
 from core.registry import register
 from core.proxy_pool import proxy_pool
@@ -314,26 +315,7 @@ class _CodexSmsPhoneCallback:
             or "no stock" in lowered
             or "暂无库存" in message
             or "无库存" in message
-            or any(
-                token in lowered
-                for token in (
-                    "connectionreseterror",
-                    "connection reset",
-                    "connection aborted",
-                    "remotedisconnected",
-                    "remote end closed connection",
-                    "temporarily unavailable",
-                    "connect timeout",
-                    "read timed out",
-                    "timed out",
-                    "sslerror",
-                    "ssleoferror",
-                    "unexpected_eof",
-                    "eof occurred",
-                    "network is unreachable",
-                    "proxyerror",
-                )
-            )
+            or is_retryable_network_error(exc)
         )
 
     def _buy_number_with_retry(self):
@@ -368,22 +350,47 @@ class _CodexSmsPhoneCallback:
         deadline = time.monotonic() + self.otp_timeout_seconds
         interval = max(float(getattr(self.provider, "poll_interval", 3) or 0), 0)
         last_status = ""
+        network_failures = 0
         while time.monotonic() < deadline:
             self._raise_if_cancelled()
-            status = self.provider.get_status(self.activation.activation_id)
+            try:
+                status = self.provider.get_status(self.activation.activation_id)
+                network_failures = 0
+            except Exception as exc:
+                if not is_retryable_network_error(exc):
+                    raise
+                network_failures += 1
+                last_status = f"瞬时网络/代理异常: {exc}"
+                remaining = max(deadline - time.monotonic(), 0)
+                if remaining <= 0:
+                    break
+                retry_delay = min(max(interval, 1.0), remaining)
+                if network_failures <= 3 or network_failures % 10 == 0:
+                    self._log(
+                        f"Codex OAuth 查码遇到瞬时网络/代理异常，{retry_delay:g}s 后继续重试 "
+                        f"(连续 {network_failures} 次): {exc}"
+                    )
+                self._sleep_interruptibly(retry_delay)
+                continue
             last_status = status.raw or status.status
             if status.code:
                 return status.code
             if status.status == "cancelled":
                 raise RuntimeError(f"短信激活已取消: {self.activation.activation_id}")
-            if interval > 0 and not self._has_cancel_check:
-                time.sleep(interval)
-                continue
-            sleep_deadline = time.monotonic() + interval
-            while time.monotonic() < sleep_deadline:
-                self._raise_if_cancelled()
-                time.sleep(min(0.5, max(sleep_deadline - time.monotonic(), 0)))
+            self._sleep_interruptibly(interval)
         raise TimeoutError(f"等待短信验证码超时 ({self.otp_timeout_seconds}s)，最后状态: {last_status or 'none'}")
+
+    def _sleep_interruptibly(self, seconds: float) -> None:
+        interval = max(float(seconds or 0), 0)
+        if interval <= 0:
+            return
+        if not self._has_cancel_check:
+            time.sleep(interval)
+            return
+        sleep_deadline = time.monotonic() + interval
+        while time.monotonic() < sleep_deadline:
+            self._raise_if_cancelled()
+            time.sleep(min(0.5, max(sleep_deadline - time.monotonic(), 0)))
 
     def mark_send_succeeded(self) -> None:
         if self.activation is None or self.sent:
@@ -392,9 +399,13 @@ class _CodexSmsPhoneCallback:
             self.provider.mark_sms_sent(self.activation.activation_id)
         except Exception as exc:
             message = str(exc or "")
-            if "BAD_STATUS" not in message and "状态码无效" not in message:
+            if (
+                "BAD_STATUS" not in message
+                and "状态码无效" not in message
+                and not is_retryable_network_error(exc)
+            ):
                 raise
-            self._log(f"Codex OAuth 接码平台不接受已发送状态，继续轮询验证码: {message}")
+            self._log(f"Codex OAuth 接码状态回写未完成，继续轮询验证码: {message}")
         self.sent = True
 
     def mark_send_failed(self, reason: str = "") -> None:
@@ -414,6 +425,11 @@ class _CodexSmsPhoneCallback:
             return
         try:
             self.provider.finish(self.activation.activation_id)
+        except Exception as exc:
+            # OAuth and phone verification have already succeeded.  A failed
+            # best-effort provider cleanup must not turn that success into a
+            # failed account task.
+            self._log(f"Codex OAuth 已成功，接码完成状态回写失败（忽略）: {exc}")
         finally:
             self.completed = True
 

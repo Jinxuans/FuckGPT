@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from urllib.parse import parse_qs, urlparse
 
-from core.base_sms import SmsActivation
+import requests
+
+from core.base_sms import SmsActivation, SmsStatus
 from core.base_platform import Account, RegisterConfig
 from infrastructure.platform_runtime import (
     PERSISTED_ACTION_DATA_KEYS,
@@ -21,6 +23,7 @@ from platforms.chatgpt.codex_oauth import (
     _observe_callback_request_on_page,
     _detect_codex_next_step_from_dom,
     _do_add_phone_attempt,
+    _exchange_code_for_tokens,
     _resume_oauth_after_add_phone_success,
     _submit_add_phone_number,
     build_codex_authorize_url,
@@ -49,6 +52,41 @@ def test_codex_oauth_callback_broker_routes_by_state():
     assert not first.event.is_set()
     assert second.event.is_set()
     assert second.wait(1)["code"] == "code-two"
+
+
+def test_codex_token_exchange_retries_transient_proxy_error(monkeypatch):
+    calls = []
+    sleeps = []
+    logs = []
+
+    class Response:
+        status_code = 200
+
+        def json(self):
+            return {"access_token": "access", "refresh_token": "refresh"}
+
+    def fake_post(*args, **kwargs):
+        calls.append((args, kwargs))
+        if len(calls) < 3:
+            raise requests.exceptions.ProxyError(
+                "Max retries exceeded (Caused by ProxyError('Unable to connect to proxy'))"
+            )
+        return Response()
+
+    monkeypatch.setattr("platforms.chatgpt.codex_oauth.requests.post", fake_post)
+    monkeypatch.setattr("core.network_retry.time.sleep", lambda seconds: sleeps.append(seconds))
+
+    payload = _exchange_code_for_tokens(
+        "authorization-code",
+        PKCECodes(code_verifier="verifier", code_challenge="challenge"),
+        proxy="http://proxy.example:8080",
+        log=logs.append,
+    )
+
+    assert payload["access_token"] == "access"
+    assert len(calls) == 3
+    assert sleeps == [1, 2]
+    assert any("自动重试" in item for item in logs)
 
 
 def test_codex_oauth_callback_broker_logs_first_delivery():
@@ -1496,6 +1534,62 @@ def test_codex_sms_phone_callback_retries_when_no_numbers(monkeypatch):
     assert provider.calls == 3
     assert sleeps == [2, 2]
     assert any("接码暂无号码" in item for item in logs)
+
+
+def test_codex_sms_phone_callback_keeps_polling_after_proxy_error(monkeypatch):
+    class Provider:
+        poll_interval = 0
+
+        def __init__(self):
+            self.calls = 0
+
+        def get_status(self, activation_id):
+            assert activation_id == "activation-1"
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError(
+                    "SMSBower 请求失败: HTTPSConnectionPool: Max retries exceeded "
+                    "(Caused by ProxyError('Unable to connect to proxy', "
+                    "ConnectionResetError(10054, 'remote reset')))"
+                )
+            return SmsStatus(status="ok", code="654321", raw="STATUS_OK:654321")
+
+    sleeps = []
+    logs = []
+    monkeypatch.setattr("platforms.chatgpt.plugin.time.sleep", lambda seconds: sleeps.append(seconds))
+    provider = Provider()
+    callback = _CodexSmsPhoneCallback(provider, log_fn=logs.append, otp_timeout_seconds=30)
+    callback.activation = SmsActivation(
+        activation_id="activation-1",
+        phone_number="+15555550123",
+        provider="smsbower",
+    )
+
+    assert callback() == "654321"
+    assert provider.calls == 2
+    assert sleeps == [1]
+    assert any("继续重试" in item for item in logs)
+
+
+def test_codex_sms_phone_callback_ignores_finish_network_failure():
+    logs = []
+
+    class Provider:
+        def finish(self, activation_id):
+            assert activation_id == "activation-1"
+            raise RuntimeError("ProxyError: Unable to connect to proxy")
+
+    callback = _CodexSmsPhoneCallback(Provider(), log_fn=logs.append)
+    callback.activation = SmsActivation(
+        activation_id="activation-1",
+        phone_number="+15555550123",
+        provider="smsbower",
+    )
+
+    callback.report_success()
+
+    assert callback.completed is True
+    assert any("回写失败" in item for item in logs)
 
 
 def test_codex_sms_phone_callback_retries_transient_connection_reset(monkeypatch):
