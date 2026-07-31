@@ -261,6 +261,8 @@ const ZH_MESSAGES = {
     "并发分配规则：每次 acquire 取「当前最少使用」的 profile，跑完 release。池里至少要有 N 个 profile 才能支持 N 并发。池为空时回落到 BitBrowser Profile ID 输入框/BIT_PROFILE_ID 环境变量。",
 
   "accounts.count": "共 {count} 个",
+  "accounts.range": "显示第 {start}–{end} 条，共 {total} 条",
+  "accounts.page": "第 {current} / {total} 页",
   "accounts.trial": "试用 {count}",
   "accounts.subscribed": "订阅 {count}",
   "accounts.linked": "链接 {count}",
@@ -689,6 +691,8 @@ const EN_MESSAGES: Record<TranslationKey, string> = {
     "Allocation rule: each acquire picks the least-used profile, releases on completion. The pool must contain at least N profiles for N concurrent tasks. When the pool is empty, the system falls back to the BitBrowser Profile ID field / BIT_PROFILE_ID env var.",
 
   "accounts.count": "{count} total",
+  "accounts.range": "Showing {start}–{end} of {total}",
+  "accounts.page": "Page {current} / {total}",
   "accounts.trial": "{count} trial",
   "accounts.subscribed": "{count} subscribed",
   "accounts.linked": "{count} linked",
