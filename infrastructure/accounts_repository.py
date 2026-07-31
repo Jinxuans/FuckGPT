@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+from sqlalchemy import func
 from sqlmodel import Session, select
 
 from core.account_display import build_account_display_summary
@@ -112,25 +113,40 @@ class AccountsRepository:
 
     def list(self, query: AccountQuery) -> tuple[int, list[AccountRecord]]:
         page = max(query.page, 1)
-        page_size = max(query.page_size, 1)
+        page_size = min(max(query.page_size, 1), 200)
+        start = (page - 1) * page_size
         with Session(engine) as session:
-            statement = select(AccountModel)
+            filters = []
             if query.platform:
-                statement = statement.where(AccountModel.platform == query.platform)
+                filters.append(AccountModel.platform == query.platform)
             if query.email:
-                statement = statement.where(AccountModel.email.contains(query.email))
+                filters.append(AccountModel.email.contains(query.email))
+
+            statement = select(AccountModel)
+            if filters:
+                statement = statement.where(*filters)
             statement = statement.order_by(AccountModel.created_at.desc(), AccountModel.id.desc())
+
+            # Status is derived from the account graph, so that filter still needs
+            # the hydrated records. The common unfiltered path can count and page
+            # in SQL, avoiding graph work for every account on every refresh.
+            if not query.status:
+                count_statement = select(func.count()).select_from(AccountModel)
+                if filters:
+                    count_statement = count_statement.where(*filters)
+                total = int(session.exec(count_statement).one())
+                models = session.exec(statement.offset(start).limit(page_size)).all()
+                return total, self._load_records(session, models)
+
             models = session.exec(statement).all()
             records = self._load_records(session, models)
-            if query.status:
-                records = [item for item in records if matches_status_filter({
-                    "display_status": item.display_status,
-                    "lifecycle_status": item.lifecycle_status,
-                    "plan_state": item.plan_state,
-                    "validity_status": item.validity_status,
-                }, query.status)]
+            records = [item for item in records if matches_status_filter({
+                "display_status": item.display_status,
+                "lifecycle_status": item.lifecycle_status,
+                "plan_state": item.plan_state,
+                "validity_status": item.validity_status,
+            }, query.status)]
         total = len(records)
-        start = (page - 1) * page_size
         end = start + page_size
         return total, records[start:end]
 

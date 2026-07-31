@@ -24,6 +24,7 @@ const platformActionsCache = new Map<string, any[]>()
 const platformActionsPromiseCache = new Map<string, Promise<any[]>>()
 
 const ACCOUNT_TOOL_BUTTON_CLASS = 'h-8 shrink-0 whitespace-nowrap bg-transparent'
+const ACCOUNT_PAGE_SIZE = 50
 
 type AccountCredential = {
   scope: string
@@ -1942,6 +1943,7 @@ export default function Accounts() {
 
   const [accounts, setAccounts] = useState<any[]>([])
   const [total, setTotal] = useState(0)
+  const [page, setPage] = useState(1)
   const [loading, setLoading] = useState(false)
   const [search, setSearch] = useState('')
   const [debouncedSearch, setDebouncedSearch] = useState('')
@@ -1960,6 +1962,7 @@ export default function Accounts() {
   const [batchProxyMode, setBatchProxyMode] = useState('direct')
   const [batchProxyValue, setBatchProxyValue] = useState('')
   const [batchCodexConcurrency, setBatchCodexConcurrency] = useState(2)
+  const loadRequestRef = useRef(0)
 
   useEffect(() => {
     getPlatforms().then((list: any[]) => {
@@ -1970,7 +1973,10 @@ export default function Accounts() {
   }, [])
 
   useEffect(() => {
-    const timer = setTimeout(() => setDebouncedSearch(search), 400)
+    const timer = setTimeout(() => {
+      setPage(1)
+      setDebouncedSearch(search)
+    }, 400)
     return () => clearTimeout(timer)
   }, [search])
 
@@ -1978,25 +1984,30 @@ export default function Accounts() {
     setSelectedIds(new Set())
   }, [tab, filterStatus, debouncedSearch])
 
-  const load = useCallback(async (p = tab, s = debouncedSearch, fs = filterStatus) => {
+  const load = useCallback(async (requestedPage = page) => {
+    const requestId = ++loadRequestRef.current
     setLoading(true)
     try {
-      const params = new URLSearchParams({ platform: p, page: '1', page_size: '100' })
-      if (s) params.set('email', s)
-      if (fs) params.set('status', fs)
+      const params = new URLSearchParams({
+        platform: tab,
+        page: String(requestedPage),
+        page_size: String(ACCOUNT_PAGE_SIZE),
+      })
+      if (debouncedSearch) params.set('email', debouncedSearch)
+      if (filterStatus) params.set('status', filterStatus)
       const data = await apiFetch(`/accounts?${params}`)
-      setAccounts(data.items); setTotal(data.total)
-    } finally { setLoading(false) }
-  }, [tab, debouncedSearch, filterStatus])
+      if (requestId !== loadRequestRef.current) return
+      const nextTotal = Number(data.total || 0)
+      const lastPage = Math.max(1, Math.ceil(nextTotal / ACCOUNT_PAGE_SIZE))
+      setAccounts(data.items)
+      setTotal(nextTotal)
+      if (requestedPage > lastPage) setPage(lastPage)
+    } finally {
+      if (requestId === loadRequestRef.current) setLoading(false)
+    }
+  }, [tab, debouncedSearch, filterStatus, page])
 
-  useEffect(() => { load(tab, debouncedSearch, filterStatus) }, [tab, debouncedSearch, filterStatus])
-
-  useEffect(() => {
-    setSelectedIds(prev => {
-      const visible = new Set(accounts.map(acc => acc.id))
-      return new Set([...prev].filter(id => visible.has(id)))
-    })
-  }, [accounts])
+  useEffect(() => { load(page) }, [load, page])
 
   
   const exportCsv = () => {
@@ -2019,6 +2030,9 @@ export default function Accounts() {
   const pageIds = accounts.map(acc => acc.id)
   const allSelectedOnPage = pageIds.length > 0 && pageIds.every(id => selectedIds.has(id))
   const selectedCount = selectedIds.size
+  const totalPages = Math.max(1, Math.ceil(total / ACCOUNT_PAGE_SIZE))
+  const rangeStart = total > 0 ? (page - 1) * ACCOUNT_PAGE_SIZE + 1 : 0
+  const rangeEnd = total > 0 ? Math.min(page * ACCOUNT_PAGE_SIZE, total) : 0
 
   const toggleOne = (id: number) => {
     setSelectedIds(prev => {
@@ -2136,7 +2150,10 @@ export default function Accounts() {
             </div>
             <select
               value={filterStatus}
-              onChange={e => setFilterStatus(e.target.value)}
+              onChange={e => {
+                setPage(1)
+                setFilterStatus(e.target.value)
+              }}
               className="rounded-md border border-[var(--border)] bg-transparent py-1.5 pl-3 pr-8 text-sm text-[var(--text-primary)] transition-colors focus:border-[var(--text-primary)] focus:outline-none focus:ring-1 focus:ring-[var(--text-primary)] appearance-none"
               style={{ backgroundImage: `url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='14' height='14' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E")`, backgroundPosition: 'right 8px center', backgroundRepeat: 'no-repeat' }}
             >
@@ -2477,6 +2494,36 @@ export default function Accounts() {
             ))}
           </tbody>
         </table>
+          </div>
+          <div className="flex shrink-0 flex-wrap items-center justify-between gap-3 border-t border-[var(--border)] px-4 py-2.5 text-xs text-[var(--text-muted)]">
+            <span>
+              {t('accounts.range', { start: rangeStart, end: rangeEnd, total })}
+            </span>
+            <div className="flex items-center gap-2">
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                className="h-7 px-2.5"
+                disabled={loading || page <= 1}
+                onClick={() => setPage(current => Math.max(1, current - 1))}
+              >
+                {t('taskHistory.prevPage')}
+              </Button>
+              <span className="min-w-20 text-center text-[var(--text-secondary)]">
+                {t('accounts.page', { current: page, total: totalPages })}
+              </span>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                className="h-7 px-2.5"
+                disabled={loading || page >= totalPages}
+                onClick={() => setPage(current => Math.min(totalPages, current + 1))}
+              >
+                {t('taskHistory.nextPage')}
+              </Button>
+            </div>
           </div>
         </div>
       </Card>
