@@ -49,6 +49,7 @@ const SETTINGS_NAV_ITEMS: { labelKey: TranslationKey; hash: string }[] = [
   { labelKey: "nav.settings.mailbox", hash: "mailbox" },
   { labelKey: "nav.settings.sms", hash: "sms" },
   { labelKey: "nav.settings.proxy", hash: "proxy" },
+  { labelKey: "nav.settings.push", hash: "push" },
 ];
 
 const NAV_ITEMS: NavItem[] = [

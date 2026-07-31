@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field
 
 from application.account_exports import AccountExportsService, ExportArtifact
 from application.accounts import AccountsService
+from application.account_pushes import AccountPushService
 from application.tasks import create_codex_oauth_batch_task
 from services.task_runtime import task_runtime
 from domain.accounts import AccountExportSelection, AccountQuery, AccountUpdateCommand
@@ -17,6 +18,7 @@ from infrastructure.accounts_repository import AccountsRepository
 router = APIRouter(prefix="/accounts", tags=["accounts"])
 service = AccountsService()
 exports_service = AccountExportsService()
+push_service = AccountPushService()
 
 
 class AccountUpdateRequest(BaseModel):
@@ -54,6 +56,11 @@ class CodexOAuthBatchRequest(BatchExportRequest):
     concurrency: int = 1
 
 
+class AccountPushRequest(BatchExportRequest):
+    target_key: str = ""
+    payload_format: Literal["codex", "sub2api"] | None = None
+
+
 def _stream_artifact(artifact: ExportArtifact) -> StreamingResponse:
     if isinstance(artifact.content, io.BytesIO):
         body = artifact.content
@@ -82,6 +89,29 @@ def list_accounts(
 @router.get("/stats")
 def get_stats():
     return service.get_stats()
+
+
+@router.get("/push-targets")
+def list_push_targets():
+    return {"items": push_service.list_targets()}
+
+
+@router.post("/push")
+def push_accounts(body: AccountPushRequest):
+    try:
+        return push_service.push_accounts(
+            AccountExportSelection(
+                platform=body.platform,
+                ids=body.ids,
+                select_all=body.select_all,
+                status_filter=body.status_filter or "",
+                search_filter=body.search_filter or "",
+            ),
+            target_key=body.target_key,
+            payload_format=body.payload_format or "",
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
 
 
 @router.post("/export/json")

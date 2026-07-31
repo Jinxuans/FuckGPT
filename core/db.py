@@ -455,6 +455,35 @@ class ProviderSettingModel(SQLModel, table=True):
         self.metadata_json = json.dumps(data or {}, ensure_ascii=False)
 
 
+class AccountPushDeliveryModel(SQLModel, table=True):
+    """Latest delivery state for one account and one remote push target.
+
+    The remote payload is deliberately not persisted because it contains OAuth
+    credentials.  ``target_key`` is a stable snapshot rather than a foreign key
+    to provider settings, so status remains readable if a target is removed.
+    """
+
+    __tablename__ = "account_push_deliveries"
+    __table_args__ = (
+        UniqueConstraint("account_id", "target_key", name="uq_account_push_delivery_target"),
+        Index("ix_account_push_delivery_status", "target_key", "status"),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    account_id: int = Field(index=True, foreign_key="accounts.id", ondelete="CASCADE")
+    target_key: str = Field(index=True)
+    target_label: str = ""
+    payload_format: str = Field(default="codex", index=True)
+    status: str = Field(default="pending", index=True)
+    attempt_count: int = 0
+    http_status: int = 0
+    last_error: str = ""
+    last_attempt_at: Optional[datetime] = None
+    pushed_at: Optional[datetime] = None
+    created_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow)
+
+
 class KakaoPipelineModel(SQLModel, table=True):
     """One resumable Kakao extraction/scanner record per local account."""
 

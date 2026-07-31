@@ -12,7 +12,7 @@ import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
 import { getTaskStatusText, TASK_STATUS_VARIANTS } from '@/lib/tasks'
-import { RefreshCw, Copy, Check, KeyRound, ExternalLink, Download, Upload, Plus, X, Mail, Trash2, Zap, ShieldCheck } from 'lucide-react'
+import { RefreshCw, Copy, Check, KeyRound, ExternalLink, Download, Upload, Plus, X, Mail, Trash2, Zap, ShieldCheck, Send } from 'lucide-react'
 
 const STATUS_VARIANT: Record<string, any> = {
   registered: 'default', trial: 'success', subscribed: 'success',
@@ -197,6 +197,18 @@ function getCodexStatus(acc: any) {
     hasAccessToken: normalized.has_access_token === true,
     hasRefreshToken: normalized.has_refresh_token === true,
   }
+}
+
+type PushTarget = {
+  key: string
+  label: string
+  is_default: boolean
+  payload_format: string
+}
+
+function getLatestPushDelivery(acc: any) {
+  const deliveries = Array.isArray(acc?.push_deliveries) ? acc.push_deliveries : []
+  return deliveries[0] || null
 }
 
 function formatOptionalDateTime(value: string, language: Parameters<typeof formatDateTime>[1]) {
@@ -1068,18 +1080,23 @@ function ActionMenu({
   onDelete,
   onResult,
   onChanged,
+  canPush,
+  onPush,
 }: {
   acc: any
   onDetail: () => void
   onDelete: () => void
   onResult: (title: string, payload: any) => void
   onChanged: () => void
+  canPush: boolean
+  onPush: () => Promise<any>
 }) {
   const { language } = useI18n()
   const [open, setOpen] = useState(false)
   const [actions, setActions] = useState<any[]>([])
   const [running, setRunning] = useState<string | null>(null)
   const [copyingToken, setCopyingToken] = useState(false)
+  const [pushing, setPushing] = useState(false)
   const [tokenCopied, setTokenCopied] = useState(false)
   const [toast, setToast] = useState<{ type: 'success' | 'error'; text: string } | null>(null)
   const [actionTask, setActionTask] = useState<{ taskId: string; title: string } | null>(null)
@@ -1316,7 +1333,7 @@ function ActionMenu({
         {copyingToken ? '复制中…' : tokenCopied ? '已复制' : '复制 Token'}
       </button>
       <button onClick={onDetail} className="table-action-btn">详情</button>
-      {actions.length > 0 && (
+      {(actions.length > 0 || canPush) && (
         <div className="relative">
           <button ref={triggerRef} onClick={() => setOpen(o => !o)}
             className="table-action-btn">更多 ▾</button>
@@ -1326,6 +1343,33 @@ function ActionMenu({
               className="fixed z-[9999] w-[220px] overflow-y-auto rounded-2xl border border-[var(--border)] bg-[var(--bg-card)]/96 py-1.5 shadow-[var(--shadow-soft)] "
               style={{ top: menuPosition.top, left: menuPosition.left, maxHeight: menuPosition.maxHeight }}
             >
+              {canPush && (
+                <>
+                  <button
+                    onClick={async () => {
+                      setOpen(false)
+                      setPushing(true)
+                      try {
+                        const result = await onPush()
+                        if (Number(result?.failed || 0) > 0) {
+                          throw new Error(result?.results?.[0]?.error || '推送失败')
+                        }
+                        setToast({ type: 'success', text: '推送成功' })
+                      } catch (error: any) {
+                        setToast({ type: 'error', text: error?.message || '推送失败' })
+                      } finally {
+                        setPushing(false)
+                      }
+                    }}
+                    disabled={pushing || !!running}
+                    className="flex w-full items-center gap-2 px-3 py-2 text-left text-xs text-[var(--text-secondary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)] disabled:opacity-50"
+                  >
+                    <Send className="h-3.5 w-3.5" />
+                    {pushing ? '推送中...' : '推送到默认目标'}
+                  </button>
+                  <div className="my-1 border-t border-[var(--border)]/70" />
+                </>
+              )}
               {actions.map(a => (
                 <button key={a.id}
                   onClick={() => {
@@ -1361,7 +1405,7 @@ function ActionMenu({
           )}
         </div>
       )}
-      {actions.length === 0 && (
+      {actions.length === 0 && !canPush && (
         <button
           onClick={() => { if (confirm(`确认删除 ${getAccountEmail(acc)}？`)) apiFetch(`/accounts/${acc.id}`, { method: 'DELETE' }).then(onDelete) }}
           className="table-action-btn table-action-btn-danger"
@@ -1553,6 +1597,7 @@ function DetailModal({ acc, onClose, onSave }: { acc: any; onClose: () => void; 
   const warnings = getDisplayWarnings(acc)
   const displayBadges = getDisplayBadges(acc)
   const displaySections = getDisplaySections(acc)
+  const pushDeliveries = Array.isArray(acc?.push_deliveries) ? acc.push_deliveries : []
   const amr = Array.isArray(security?.amr) ? security.amr.filter(Boolean) : []
   const credits: Record<string, unknown> = usage?.credits && typeof usage.credits === 'object' ? usage.credits : {}
   const creditFields = [
@@ -1768,6 +1813,28 @@ function DetailModal({ acc, onClose, onSave }: { acc: any; onClose: () => void; 
               <AccountDetailField label="Codex Refresh Token" value={booleanLabel(codex.hasRefreshToken, '已保存', '未保存')} />
             </AccountDetailSection>
 
+            <AccountDetailSection title="远端推送">
+              {pushDeliveries.length > 0 ? pushDeliveries.map((delivery: any) => (
+                <AccountDetailField
+                  key={delivery.target_key}
+                  wide
+                  label={delivery.target_label || delivery.target_key}
+                  value={
+                    <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+                      <span className={delivery.status === 'success' ? 'text-emerald-500' : delivery.status === 'failed' ? 'text-red-500' : 'text-amber-500'}>
+                        {delivery.status === 'success' ? '已推送' : delivery.status === 'failed' ? '推送失败' : '推送中'}
+                      </span>
+                      <span className="text-[var(--text-muted)]">{delivery.payload_format || 'codex'} · 尝试 {delivery.attempt_count || 0} 次</span>
+                      {delivery.last_attempt_at && <span className="text-[var(--text-muted)]">{formatOptionalDateTime(delivery.last_attempt_at, language)}</span>}
+                      {delivery.last_error && <span className="w-full text-red-400">{delivery.last_error}</span>}
+                    </div>
+                  }
+                />
+              )) : (
+                <AccountDetailField wide label="状态" value="尚未推送到任何远端目标" />
+              )}
+            </AccountDetailSection>
+
             <AccountDetailSection title="验证邮箱">
               {verificationMailbox ? (
                 <>
@@ -1936,6 +2003,83 @@ function ExportMenu({
   )
 }
 
+function PushMenu({
+  targets,
+  selectedIds,
+  onPush,
+}: {
+  targets: PushTarget[]
+  selectedIds: number[]
+  onPush: (ids: number[], targetKey: string) => Promise<any>
+}) {
+  const [open, setOpen] = useState(false)
+  const [loading, setLoading] = useState(false)
+  const menuRef = useRef<HTMLDivElement>(null)
+  const defaultTarget = targets.find(target => target.is_default) || targets[0]
+
+  useEffect(() => {
+    if (!open) return
+    const handler = (event: MouseEvent) => {
+      if (menuRef.current && !menuRef.current.contains(event.target as Node)) setOpen(false)
+    }
+    document.addEventListener('mousedown', handler)
+    return () => document.removeEventListener('mousedown', handler)
+  }, [open])
+
+  const pushTo = async (target: PushTarget) => {
+    if (!selectedIds.length) return
+    if (!window.confirm(`将 ${selectedIds.length} 个已选账号推送到 ${target.label}？`)) return
+    setLoading(true)
+    try {
+      await onPush(selectedIds, target.key)
+      setOpen(false)
+    } catch (error: any) {
+      window.alert(error?.message || '推送失败')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const title = targets.length === 0
+    ? '请先到设置 → 推送目标中配置并启用目标'
+    : selectedIds.length === 0
+      ? '请先勾选要推送的账号'
+      : `推送 ${selectedIds.length} 个已选账号`
+
+  return (
+    <div className="relative" ref={menuRef} title={title}>
+      <Button
+        variant="outline"
+        size="sm"
+        disabled={!selectedIds.length || targets.length === 0 || loading}
+        onClick={() => {
+          if (targets.length === 1 && defaultTarget) void pushTo(defaultTarget)
+          else setOpen(value => !value)
+        }}
+        className={ACCOUNT_TOOL_BUTTON_CLASS}
+      >
+        <Send className="mr-1.5 h-3.5 w-3.5 shrink-0" />
+        {loading ? '推送中...' : selectedIds.length ? `推送已选(${selectedIds.length})` : '推送已选'}
+      </Button>
+      {open && targets.length > 1 && (
+        <div className="absolute right-0 top-10 z-20 min-w-[190px] rounded-lg border border-[var(--border)] bg-[var(--bg-card)] py-1 shadow-lg">
+          <div className="px-3 py-1 text-[11px] text-[var(--text-muted)]">选择推送目标</div>
+          {targets.map(target => (
+            <button
+              key={target.key}
+              onClick={() => void pushTo(target)}
+              className="flex w-full items-center justify-between gap-3 px-3 py-1.5 text-left text-xs text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
+            >
+              <span>{target.label}</span>
+              <span className="text-[10px] text-[var(--text-muted)]">{target.payload_format}</span>
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
 // ── Main ────────────────────────────────────────────────────
 export default function Accounts() {
   const { t, language } = useI18n()
@@ -1962,6 +2106,7 @@ export default function Accounts() {
   const [batchProxyMode, setBatchProxyMode] = useState('direct')
   const [batchProxyValue, setBatchProxyValue] = useState('')
   const [batchCodexConcurrency, setBatchCodexConcurrency] = useState(2)
+  const [pushTargets, setPushTargets] = useState<PushTarget[]>([])
   const loadRequestRef = useRef(0)
 
   useEffect(() => {
@@ -1970,6 +2115,9 @@ export default function Accounts() {
       list.forEach(p => { map[p.name] = p })
       setPlatformsMap(map)
     }).catch(() => {})
+    apiFetch('/accounts/push-targets')
+      .then(data => setPushTargets(Array.isArray(data?.items) ? data.items : []))
+      .catch(() => setPushTargets([]))
   }, [])
 
   useEffect(() => {
@@ -2008,6 +2156,24 @@ export default function Accounts() {
   }, [tab, debouncedSearch, filterStatus, page])
 
   useEffect(() => { load(page) }, [load, page])
+
+  const pushAccounts = useCallback(async (ids: number[], targetKey = '') => {
+    const result = await apiFetch('/accounts/push', {
+      method: 'POST',
+      body: JSON.stringify({
+        platform: tab,
+        ids,
+        select_all: false,
+        target_key: targetKey,
+      }),
+    })
+    setActionResult({
+      title: `${result?.target_label || '远端'}推送结果：成功 ${result?.succeeded || 0}，失败 ${result?.failed || 0}`,
+      payload: result,
+    })
+    await load()
+    return result
+  }, [load, tab])
 
   
   const exportCsv = () => {
@@ -2130,6 +2296,11 @@ export default function Accounts() {
                 {t('accounts.export')}
               </Button>
             )}
+            <PushMenu
+              targets={pushTargets}
+              selectedIds={[...selectedIds]}
+              onPush={pushAccounts}
+            />
           </div>
         </div>
         
@@ -2318,13 +2489,14 @@ export default function Accounts() {
       <Card className="min-h-0 flex-1 overflow-hidden p-0 border border-[var(--border)] shadow-sm">
         <div className="flex h-full min-h-0 flex-col">
           <div className="glass-table-wrap min-h-0 flex-1 overflow-auto">
-        <table className="table-fixed w-full min-w-[1140px] text-sm">
+        <table className="table-fixed w-full min-w-[1280px] text-sm">
           <colgroup>
             <col className="w-10" />
             <col className="w-[240px]" />
             <col className="w-[110px]" />
             <col className="w-[220px]" />
             <col className="w-[120px]" />
+            <col className="w-[150px]" />
             <col className="w-[64px]" />
             <col className="w-[128px]" />
             <col className="w-[218px]" />
@@ -2343,6 +2515,7 @@ export default function Accounts() {
               <th className="px-3 py-2 text-left">{t('common.password')}</th>
               <th className="px-3 py-2 text-left">{t('common.status')}</th>
               <th className="px-3 py-2 text-left">Codex</th>
+              <th className="px-3 py-2 text-left">推送状态</th>
               <th className="px-3 py-2 text-left">{t('accounts.link')}</th>
               <th className="px-3 py-2 text-left">{t('accounts.registeredAt')}</th>
               <th className="px-3 py-2 text-right">{t('common.actions')}</th>
@@ -2351,7 +2524,7 @@ export default function Accounts() {
           <tbody>
             {accounts.length === 0 && (
               <tr>
-                <td colSpan={8} className="px-4 py-24 text-center">
+                <td colSpan={9} className="px-4 py-24 text-center">
                   <div className="flex flex-col items-center justify-center space-y-3">
                     <div className="flex h-12 w-12 items-center justify-center rounded-full bg-[var(--bg-pane)] border border-[var(--border)] shadow-sm">
                       <svg className="h-6 w-6 text-[var(--text-muted)]" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M20 13V6a2 2 0 00-2-2H6a2 2 0 00-2 2v7m16 0v5a2 2 0 01-2 2H6a2 2 0 01-2-2v-5m16 0h-2.586a1 1 0 00-.707.293l-2.414 2.414a1 1 0 01-.707.293h-3.172a1 1 0 01-.707-.293l-2.414-2.414A1 1 0 006.586 13H4" /></svg>
@@ -2370,6 +2543,7 @@ export default function Accounts() {
                 const accountPlan = getPlanName(acc)
                 const planBadge = accountPlan && accountPlan !== 'unknown' ? accountPlan : ''
                 const codexStatus = getCodexStatus(acc)
+                const pushDelivery = getLatestPushDelivery(acc)
                 const registeredDate = acc.created_at ? formatDateTime(acc.created_at, language, {
                   month: '2-digit', day: '2-digit',
                 }) : '-'
@@ -2467,6 +2641,27 @@ export default function Accounts() {
                   )}
                 </td>
                 <td className="overflow-hidden px-3 py-2.5 align-top">
+                  {pushDelivery ? (
+                    <div className="min-w-0 space-y-1" title={pushDelivery.last_error || pushDelivery.target_label || pushDelivery.target_key}>
+                      <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ring-1 ring-inset ${
+                        pushDelivery.status === 'success'
+                          ? 'bg-emerald-500/10 text-emerald-500 ring-emerald-500/20'
+                          : pushDelivery.status === 'failed'
+                            ? 'bg-red-500/10 text-red-500 ring-red-500/20'
+                            : 'bg-amber-500/10 text-amber-500 ring-amber-500/20'
+                      }`}>
+                        {pushDelivery.status === 'success' ? '已推送' : pushDelivery.status === 'failed' ? '推送失败' : '推送中'}
+                      </span>
+                      <div className="truncate text-[11px] text-[var(--text-muted)]">
+                        {pushDelivery.target_label || pushDelivery.target_key}
+                        {pushDelivery.pushed_at ? ` · ${formatOptionalDateTime(pushDelivery.pushed_at, language)}` : ''}
+                      </div>
+                    </div>
+                  ) : (
+                    <span className="text-xs text-[var(--text-muted)]/70">未推送</span>
+                  )}
+                </td>
+                <td className="overflow-hidden px-3 py-2.5 align-top">
                   {getCashierUrl(acc) ? (
                     <div className="flex items-center gap-1.5 whitespace-nowrap opacity-70 group-hover:opacity-100 transition-opacity">
                       <button onClick={e => { e.stopPropagation(); copy(getCashierUrl(acc)) }} className="text-[var(--text-muted)] hover:text-[var(--text-primary)] transition-colors p-0.5 rounded hover:bg-[var(--bg-pane)]" title="复制链接"><Copy className="h-3 w-3" /></button>
@@ -2485,6 +2680,8 @@ export default function Accounts() {
                       onDelete={() => load()}
                       onResult={(title, payload) => setActionResult({ title, payload })}
                       onChanged={() => load()}
+                      canPush={pushTargets.length > 0}
+                      onPush={() => pushAccounts([acc.id], '')}
                     />
                   </div>
                 </td>

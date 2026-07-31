@@ -112,6 +112,8 @@ def test_provider(body: ProviderTestRequest):
         return _test_sms(definition.driver_type or body.provider_key, extra, definition.label)
     elif body.provider_type == "proxy":
         return _test_proxy(definition.driver_type or body.provider_key, extra)
+    elif body.provider_type == "push":
+        return _test_push(definition.driver_type or body.provider_key, extra, definition.label)
     return {"ok": False, "error": f"不支持测试的 provider 类型: {body.provider_type}"}
 
 
@@ -230,3 +232,18 @@ def _test_proxy(driver_type: str, extra: dict) -> dict:
             "error": f"代理连接失败: {str(exc)}",
             "proxy": _mask_proxy(proxy),
         }
+
+
+def _test_push(driver_type: str, extra: dict, label: str) -> dict:
+    """Validate a push target without sending account credentials."""
+    from providers.registry import create_provider, load_all
+
+    try:
+        load_all()
+        provider = create_provider("push", driver_type, extra)
+        error = getattr(provider, "configuration_error", lambda: "")()
+        if error:
+            return {"ok": False, "error": error}
+        return {"ok": True, "message": f"{label} 配置有效，可在账号列表选择账号后推送"}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": f"{label} 配置无效: {type(exc).__name__}"}

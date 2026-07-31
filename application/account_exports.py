@@ -265,6 +265,46 @@ def _make_cockpit_token(item: AccountRecord) -> dict:
     }
 
 
+def make_codex_inventory_payload(item: AccountRecord) -> dict:
+    """Build a strict Codex payload without platform-credential fallback."""
+    access_token = _credential_value(
+        item,
+        "codex_access_token",
+        "access_token",
+        scope="codex",
+    )
+    refresh_token = _credential_value(
+        item,
+        "codex_refresh_token",
+        "refresh_token",
+        scope="codex",
+    )
+    email = (
+        _codex_view_value(item, "email")
+        or _credential_value(item, "codex_email", "email", scope="codex")
+        or item.email
+    )
+    if not access_token:
+        raise ValueError("账号缺少 Codex access_token")
+    if not refresh_token:
+        raise ValueError("账号缺少 Codex refresh_token")
+    if not email:
+        raise ValueError("账号缺少邮箱")
+    return {
+        "data": {
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "email": email,
+            "type": "codex",
+        }
+    }
+
+
+def make_sub2api_payload(item: AccountRecord) -> dict:
+    """Public push adapter for the existing Sub2Api export shape."""
+    return _make_sub2api_json(item)
+
+
 def _make_kiro_go_account(item: AccountRecord) -> dict:
     """Convert a Kiro AccountRecord to Kiro-Go Account JSON format."""
     import uuid

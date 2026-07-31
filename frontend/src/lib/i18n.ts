@@ -56,6 +56,7 @@ const ZH_MESSAGES = {
   "nav.settings.mailbox": "邮箱服务",
   "nav.settings.sms": "接码服务",
   "nav.settings.proxy": "代理服务",
+  "nav.settings.push": "推送目标",
   "sidebar.theme.light": "浅色",
   "sidebar.theme.dark": "深色",
   "sidebar.theme.system": "系统",
@@ -94,6 +95,7 @@ const ZH_MESSAGES = {
   "settings.title.sms": "接码服务",
   "settings.title.captcha": "验证服务",
   "settings.title.proxy": "代理服务",
+  "settings.title.push": "推送目标",
   "settings.title.proxies": "代理资源",
   "settings.title.chatgpt": "ChatGPT",
   "settings.title.advanced": "高级设置",
@@ -140,6 +142,8 @@ const ZH_MESSAGES = {
     "用于 Codex OAuth 的 add_phone 自动绑定流程。支持 SMSBower、HeroSMS、SMSPool、5sim 和 SMSToMe；测试连接不会购买手机号。",
   "settings.provider.proxyUsage":
     "用于保存 API 提取或旋转网关代理配置。当前 ChatGPT 注册任务仍需在注册弹窗选择或填写代理；批量检测会自动尝试已启用的代理服务。",
+  "settings.provider.pushUsage":
+    "配置账号凭据的远端推送目标。API Key 仅在后端请求时使用；账号列表会记录每个目标的最新推送结果。",
   "settings.provider.captchaUsage":
     "协议模式会按已启用顺序自动选择远程打码服务；浏览器模式使用当前默认的验证码 provider。列表行内可以直接查看详情、编辑、设默认、删除。",
   "settings.chatgpt.cpaDesc": "注册完成后自动上传到 CPA 管理平台",
@@ -362,6 +366,7 @@ const ZH_MESSAGES = {
   "providers.type.captcha": "验证",
   "providers.type.sms": "接码",
   "providers.type.proxy": "代理",
+  "providers.type.push": "推送",
   "taskLog.status": "Status",
   "taskLog.progress": "Progress",
   "taskLog.events": "Events",
@@ -476,6 +481,7 @@ const EN_MESSAGES: Record<TranslationKey, string> = {
   "nav.settings.mailbox": "Mailbox",
   "nav.settings.sms": "SMS",
   "nav.settings.proxy": "Proxy",
+  "nav.settings.push": "Push Targets",
   "sidebar.theme.light": "Light",
   "sidebar.theme.dark": "Dark",
   "sidebar.theme.system": "System",
@@ -514,6 +520,7 @@ const EN_MESSAGES: Record<TranslationKey, string> = {
   "settings.title.sms": "SMS Services",
   "settings.title.captcha": "Captcha Services",
   "settings.title.proxy": "Proxy Services",
+  "settings.title.push": "Push Targets",
   "settings.title.proxies": "Proxy Resources",
   "settings.title.chatgpt": "ChatGPT",
   "settings.title.advanced": "Advanced Settings",
@@ -560,6 +567,8 @@ const EN_MESSAGES: Record<TranslationKey, string> = {
     "Used by Codex OAuth during add_phone. Supports SMSBower, HeroSMS, SMSPool, 5sim, and SMSToMe; connection tests never purchase a number.",
   "settings.provider.proxyUsage":
     "Save API extraction or rotating gateway proxy settings. ChatGPT registration still uses the proxy chosen in the registration dialog; batch checks can automatically try enabled proxy services.",
+  "settings.provider.pushUsage":
+    "Configure remote destinations for account credentials. API keys are used only by backend requests; the account list records the latest result for each target.",
   "settings.provider.captchaUsage":
     "Protocol mode selects remote captcha services in enabled order; browser mode uses the current default captcha provider. Rows support details, editing, default selection, and deletion.",
   "settings.chatgpt.cpaDesc":
@@ -795,6 +804,7 @@ const EN_MESSAGES: Record<TranslationKey, string> = {
   "providers.type.captcha": "Captcha",
   "providers.type.sms": "SMS",
   "providers.type.proxy": "Proxy",
+  "providers.type.push": "Push",
   "taskLog.status": "Status",
   "taskLog.progress": "Progress",
   "taskLog.events": "Events",
