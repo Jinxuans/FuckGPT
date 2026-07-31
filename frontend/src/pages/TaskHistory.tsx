@@ -49,7 +49,14 @@ const STATUS_OPTIONS = [
   "cancelled",
 ];
 
-const TYPE_OPTIONS = ["", "register", "account_check_all", "platform_action"];
+const TYPE_OPTIONS = [
+  "",
+  "register",
+  "account_check_all",
+  "platform_action",
+  "codex_oauth_batch",
+  "account_push",
+];
 
 function taskTypeLabel(type: string, t: (key: TranslationKey) => string) {
   switch (type) {
@@ -59,6 +66,10 @@ function taskTypeLabel(type: string, t: (key: TranslationKey) => string) {
       return t("taskHistory.type.account_check_all");
     case "platform_action":
       return t("taskHistory.type.platform_action");
+    case "codex_oauth_batch":
+      return t("taskHistory.type.codex_oauth_batch");
+    case "account_push":
+      return t("taskHistory.type.account_push");
     default:
       return type || "-";
   }

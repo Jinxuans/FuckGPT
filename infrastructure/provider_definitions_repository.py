@@ -879,6 +879,14 @@ _BUILTIN_DEFINITIONS: list[dict] = [
                 ],
             },
             {
+                "key": "nvtokens_auto_push_after_codex_oauth",
+                "label": "授权成功后自动推送",
+                "type": "toggle",
+                "default_value": "false",
+                "category": "connection",
+                "hint": "Codex OAuth 成功并保存凭据后，在后台推送到 NexusVault；推送失败不影响授权结果。",
+            },
+            {
                 "key": "nvtokens_timeout",
                 "label": "请求超时秒",
                 "default_value": "20",
