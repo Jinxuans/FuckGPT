@@ -358,6 +358,7 @@ class AccountsService:
             "credentials": safe_credentials,
             "provider_accounts": safe_provider_accounts,
             "provider_resources": _sanitize_debug_value(item.provider_resources),
+            "push_deliveries": item.push_deliveries,
             "created_at": serialize_datetime(item.created_at),
             "updated_at": serialize_datetime(item.updated_at),
         }

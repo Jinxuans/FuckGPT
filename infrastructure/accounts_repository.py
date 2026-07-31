@@ -6,7 +6,7 @@ from sqlalchemy import func
 from sqlmodel import Session, select
 
 from core.account_display import build_account_display_summary
-from core.db import AccountModel, engine
+from core.db import AccountModel, AccountPushDeliveryModel, engine
 from core.account_graph import (
     build_account_view,
     compute_account_stats,
@@ -50,7 +50,11 @@ def _build_credential_updates(
     return dict(credentials or {}) or None
 
 
-def _to_record(model: AccountModel, graph: dict | None = None) -> AccountRecord:
+def _to_record(
+    model: AccountModel,
+    graph: dict | None = None,
+    push_deliveries: list[dict] | None = None,
+) -> AccountRecord:
     graph = graph or {}
     overview = graph.get("overview") or {}
     lifecycle_status = graph.get("lifecycle_status") or "registered"
@@ -89,6 +93,7 @@ def _to_record(model: AccountModel, graph: dict | None = None) -> AccountRecord:
         credentials=list(graph.get("credentials") or []),
         provider_accounts=list(graph.get("provider_accounts") or []),
         provider_resources=provider_resources,
+        push_deliveries=list(push_deliveries or []),
         created_at=model.created_at,
         updated_at=model.updated_at,
     )
@@ -109,7 +114,33 @@ class AccountsRepository:
                 sync_account_graph(session, model)
             session.commit()
             graphs = load_account_graphs(session, account_ids)
-        return [_to_record(model, graphs.get(int(model.id or 0), {})) for model in models]
+        deliveries_by_account: dict[int, list[dict]] = {account_id: [] for account_id in account_ids}
+        if account_ids:
+            deliveries = session.exec(
+                select(AccountPushDeliveryModel)
+                .where(AccountPushDeliveryModel.account_id.in_(account_ids))
+                .order_by(AccountPushDeliveryModel.updated_at.desc())
+            ).all()
+            for delivery in deliveries:
+                deliveries_by_account.setdefault(delivery.account_id, []).append({
+                    "target_key": delivery.target_key,
+                    "target_label": delivery.target_label,
+                    "payload_format": delivery.payload_format,
+                    "status": delivery.status,
+                    "attempt_count": delivery.attempt_count,
+                    "http_status": delivery.http_status,
+                    "last_error": delivery.last_error,
+                    "last_attempt_at": delivery.last_attempt_at.isoformat() if delivery.last_attempt_at else None,
+                    "pushed_at": delivery.pushed_at.isoformat() if delivery.pushed_at else None,
+                })
+        return [
+            _to_record(
+                model,
+                graphs.get(int(model.id or 0), {}),
+                deliveries_by_account.get(int(model.id or 0), []),
+            )
+            for model in models
+        ]
 
     def list(self, query: AccountQuery) -> tuple[int, list[AccountRecord]]:
         page = max(query.page, 1)

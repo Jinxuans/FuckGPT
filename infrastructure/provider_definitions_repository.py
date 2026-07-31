@@ -839,6 +839,54 @@ _BUILTIN_DEFINITIONS: list[dict] = [
             {"key": "proxy_preflight_url", "label": "自定义出口检测地址", "placeholder": "留空使用 Cloudflare Trace，失败回退 api64.ipify.org", "category": "advanced"},
         ],
     },
+    # ── remote account push targets ─────────────────────────────────
+    {
+        "provider_type": "push",
+        "provider_key": "nvtokens",
+        "label": "NexusVault",
+        "description": "将已授权的 Codex 账号凭据推送到 NexusVault inventory",
+        "driver_type": "nvtokens",
+        "default_auth_mode": "apikey",
+        "enabled": True,
+        "category": "thirdparty",
+        "auth_modes": [{"value": "apikey", "label": "X-API-Key"}],
+        "fields": [
+            {
+                "key": "nvtokens_endpoint",
+                "label": "推送地址",
+                "default_value": "https://nvtokens.com/api/inventory/cards/import",
+                "placeholder": "https://nvtokens.com/api/inventory/cards/import",
+                "category": "connection",
+                "hint": "NexusVault 接收账号 JSON 的完整 HTTPS 地址。",
+            },
+            {
+                "key": "nvtokens_api_key",
+                "label": "API Key",
+                "placeholder": "irk-...",
+                "secret": True,
+                "category": "auth",
+                "hint": "请求时仅通过 x-api-key 请求头发送，不会写入推送状态或日志。",
+            },
+            {
+                "key": "nvtokens_payload_format",
+                "label": "默认数据格式",
+                "type": "select",
+                "default_value": "codex",
+                "category": "connection",
+                "options": [
+                    {"value": "codex", "label": "Codex（推荐）"},
+                    {"value": "sub2api", "label": "Sub2Api"},
+                ],
+            },
+            {
+                "key": "nvtokens_timeout",
+                "label": "请求超时秒",
+                "default_value": "20",
+                "placeholder": "20",
+                "category": "connection",
+            },
+        ],
+    },
 ]
 
 

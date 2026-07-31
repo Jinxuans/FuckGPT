@@ -38,18 +38,19 @@ def test_sidebar_hides_accounts_menu_and_other_business_links():
     assert "nav.plusManager" not in source
 
 
-def test_sidebar_keeps_general_mailbox_sms_and_proxy_settings_submenu_items():
+def test_sidebar_keeps_general_mailbox_sms_proxy_and_push_settings_submenu_items():
     source = APP_TSX.read_text(encoding="utf-8")
 
     start = source.index("const SETTINGS_NAV_ITEMS:")
     end = source.index("];", start)
     block = source[start:end]
 
-    assert block.count('hash: "') == 4
+    assert block.count('hash: "') == 5
     assert 'labelKey: "nav.settings.general", hash: "general"' in block
     assert 'labelKey: "nav.settings.mailbox", hash: "mailbox"' in block
     assert 'labelKey: "nav.settings.sms", hash: "sms"' in block
     assert 'labelKey: "nav.settings.proxy", hash: "proxy"' in block
+    assert 'labelKey: "nav.settings.push", hash: "push"' in block
 
     assert "currentTab" in source
     assert "/settings?tab=${item.hash}" in source
