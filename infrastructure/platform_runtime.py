@@ -16,6 +16,7 @@ from core.db import AccountModel, engine
 from core.platform_accounts import build_platform_account
 from core.proxy_resolution import (
     PROXY_MODE_DIRECT,
+    PROXY_MODE_PROXY_SERVICE,
     mask_proxy_url,
     normalize_proxy_mode,
     resolve_proxy_by_mode,
@@ -596,8 +597,12 @@ class PlatformRuntime:
                 manual_proxy=proxy_value,
                 proxy_getter=proxy_pool.get_next,
             )
-        except Exception:
+        except Exception as exc:
+            if proxy_mode == PROXY_MODE_PROXY_SERVICE:
+                return ActionExecutionResult(ok=False, error=f"代理获取失败: {exc}")
             action_proxy = None
+        if proxy_mode == PROXY_MODE_PROXY_SERVICE and not action_proxy:
+            return ActionExecutionResult(ok=False, error="代理服务未返回可用代理")
         instance = platform_cls(
             config=RegisterConfig(
                 proxy=action_proxy,
@@ -607,9 +612,10 @@ class PlatformRuntime:
         if log_fn:
             instance.set_logger(log_fn)
             if params.get("platform_proxy_mode") or action_proxy:
+                proxy_log_mode = str(params.get("_proxy_log_mode") or proxy_mode)
                 log_fn(
                     f"ChatGPT/Codex 代理: {mask_proxy_url(action_proxy) if action_proxy else '直连'}"
-                    f"（{proxy_mode}）"
+                    f"（{proxy_log_mode}）"
                 )
         if callable(cancel_check):
             if hasattr(instance, "set_cancel_checker"):
@@ -632,7 +638,9 @@ class PlatformRuntime:
         try:
             if callable(cancel_check) and cancel_check():
                 return ActionExecutionResult(ok=False, error="任务已取消")
-            result = instance.execute_action(command.action_id, account, command.params)
+            action_params = dict(command.params or {})
+            action_params.pop("_proxy_log_mode", None)
+            result = instance.execute_action(command.action_id, account, action_params)
         except NotImplementedError as exc:
             return ActionExecutionResult(ok=False, data={"error_type": "not_supported"}, error=str(exc))
         except Exception as exc:

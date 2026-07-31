@@ -20,6 +20,7 @@ from core.account_graph import (
 from core.base_platform import AccountStatus, RegisterConfig
 from core.datetime_utils import format_local_clock, serialize_datetime
 from core.db import AccountModel, TaskEventModel, TaskModel, engine, save_account
+from core.network_retry import is_retryable_network_error
 from core.platform_accounts import build_platform_account
 from core.proxy_resolution import (
     PROXY_MODE_DIRECT,
@@ -729,6 +730,7 @@ def _run_single_account_check(
     *,
     proxy: str | None = None,
     disable_proxy_pool: bool = False,
+    strict_proxy: bool = False,
 ) -> tuple[bool, dict[str, Any]]:
     with Session(engine) as session:
         model = session.get(AccountModel, account_id)
@@ -737,7 +739,10 @@ def _run_single_account_check(
         plugin = get(model.platform)(
             config=RegisterConfig(
                 proxy=proxy,
-                extra={"disable_proxy_pool": bool(disable_proxy_pool)},
+                extra={
+                    "disable_proxy_pool": bool(disable_proxy_pool),
+                    "strict_proxy": bool(strict_proxy),
+                },
             )
         )
         account = build_platform_account(session, model)
@@ -829,7 +834,9 @@ def _registration_platform_proxy(payload: dict[str, Any], proxy_getter: Callable
         str(payload.get("platform_proxy_mode") or "").strip(),
         default=PROXY_MODE_MANUAL if explicit_proxy else PROXY_MODE_DIRECT,
     )
-    proxy = resolve_proxy_by_mode(
+    # Proxy-service mode is resolved inside each worker so concurrent accounts
+    # never inherit one task-level IP.
+    proxy = None if mode == PROXY_MODE_PROXY_SERVICE else resolve_proxy_by_mode(
         mode,
         manual_proxy=str(payload.get("platform_proxy_value") or "").strip() or explicit_proxy,
         proxy_getter=proxy_getter,
@@ -837,27 +844,9 @@ def _registration_platform_proxy(payload: dict[str, Any], proxy_getter: Callable
     return proxy, mode
 
 
-def _registration_mailbox_proxy(
-    payload: dict[str, Any],
-    *,
-    platform_proxy: str | None,
-    proxy_getter: Callable[[], str | None],
-) -> tuple[str | None, str]:
+def _registration_mailbox_proxy() -> tuple[str | None, str]:
     """Mailbox/provider APIs always use the local direct connection."""
     return None, PROXY_MODE_DIRECT
-
-
-def _check_task_proxy(payload: dict[str, Any], proxy_getter: Callable[[], str | None]) -> tuple[str | None, str, bool]:
-    mode = normalize_proxy_mode(
-        str(payload.get("platform_proxy_mode") or "").strip(),
-        default=PROXY_MODE_PROXY_SERVICE,
-    )
-    proxy = resolve_proxy_by_mode(
-        mode,
-        manual_proxy=str(payload.get("platform_proxy_value") or payload.get("proxy") or "").strip(),
-        proxy_getter=proxy_getter,
-    )
-    return proxy, mode, mode == PROXY_MODE_DIRECT
 
 
 def _registration_concurrency(requested: Any, count: int) -> int:
@@ -893,6 +882,7 @@ def _bounded_int(value: Any, default: int, *, minimum: int = 1, maximum: int | N
 
 def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
     from core.proxy_pool import proxy_pool
+    from core.worker_proxy import WorkerProxyPolicy, worker_proxy_manager
 
     count = max(int(payload.get("count", 1) or 1), 1)
     concurrency = _registration_concurrency(payload.get("concurrency", 1), count)
@@ -902,12 +892,9 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
     extra = dict(payload.get("extra") or {})
     extra["_log_fn"] = logger.log
     task_id = str(getattr(logger, "task_id", "") or "")
-    platform_proxy, platform_proxy_mode = _registration_platform_proxy(payload, proxy_pool.get_next)
-    mailbox_proxy, mailbox_proxy_mode = _registration_mailbox_proxy(
-        payload,
-        platform_proxy=platform_proxy,
-        proxy_getter=proxy_pool.get_next,
-    )
+    task_platform_proxy, platform_proxy_mode = _registration_platform_proxy(payload, proxy_pool.get_next)
+    proxy_policy = WorkerProxyPolicy.load()
+    mailbox_proxy, _ = _registration_mailbox_proxy()
     extra["mailbox_proxy"] = mailbox_proxy or ""
     payload["extra"] = extra
 
@@ -990,32 +977,75 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
         subtask_id = f"worker_{index + 1}"
         logger.set_subtask(subtask_id, f"Worker {index + 1}")
         platform = None
+        platform_proxy = task_platform_proxy
+        proxy_lease = None
         allocation_id = ""
         allocation_succeeded = False
         failure_reason = ""
         existing_account_failure = False
         try:
-            platform = _build_platform_instance(
-                platform_name,
-                payload,
-                logger,
-                platform_proxy=platform_proxy,
-                mailbox_proxy=mailbox_proxy,
-                shared_mailbox=shared_mailbox,
-                task_id=task_id,
-                subtask_id=subtask_id,
-            )
             logger.log(f"开始注册第 {index + 1}/{count} 个账号")
-            logger.log(
-                f"ChatGPT/Codex 代理: {mask_proxy_url(platform_proxy) if platform_proxy else '直连'}"
-                f"（{platform_proxy_mode}）"
-            )
-            if logger.is_cancel_requested():
-                return "__cancel_requested__"
-            account = platform.register(email=email, password=password)
             from core.mailbox_lifecycle import MailboxAllocationLifecycle
 
-            allocation_id = MailboxAllocationLifecycle.allocation_id_from_account(account)
+            attempts = proxy_policy.replace_max_attempts if platform_proxy_mode == PROXY_MODE_PROXY_SERVICE else 1
+            account = None
+            for proxy_attempt in range(1, attempts + 1):
+                if logger.is_cancel_requested():
+                    return "__cancel_requested__"
+                if platform_proxy_mode == PROXY_MODE_PROXY_SERVICE:
+                    proxy_lease = worker_proxy_manager.acquire(
+                        scope_id=task_id,
+                        log_fn=logger.log,
+                        cancel_check=logger.is_cancel_requested,
+                        policy=proxy_policy,
+                    )
+                    platform_proxy = proxy_lease.url
+                platform = _build_platform_instance(
+                    platform_name,
+                    payload,
+                    logger,
+                    platform_proxy=platform_proxy,
+                    mailbox_proxy=mailbox_proxy,
+                    shared_mailbox=shared_mailbox,
+                    task_id=task_id,
+                    subtask_id=subtask_id,
+                )
+                logger.log(
+                    f"ChatGPT/Codex 代理: {mask_proxy_url(platform_proxy) if platform_proxy else '直连'}"
+                    f"（{platform_proxy_mode}）"
+                )
+                try:
+                    account = platform.register(email=email, password=password)
+                    allocation_id = MailboxAllocationLifecycle.allocation_id_from_account(account)
+                    break
+                except Exception as exc:
+                    allocation_id = MailboxAllocationLifecycle.allocation_id_from_platform(platform)
+                    retry_proxy = (
+                        platform_proxy_mode == PROXY_MODE_PROXY_SERVICE
+                        and proxy_attempt < attempts
+                        and is_retryable_network_error(exc)
+                    )
+                    if not retry_proxy:
+                        raise
+                    if proxy_lease is not None:
+                        proxy_lease.report_failure()
+                        proxy_lease.release()
+                        proxy_lease = None
+                    if allocation_id:
+                        MailboxAllocationLifecycle().release(
+                            allocation_id,
+                            outcome="failed",
+                            reason=f"代理异常换 IP 重试: {exc}",
+                        )
+                        allocation_id = ""
+                    logger.log(
+                        f"代理网络异常，关闭当前注册实例并换 IP 重试 "
+                        f"({proxy_attempt + 1}/{attempts}): {exc}",
+                        level="warning",
+                    )
+                    platform = None
+            if account is None:
+                raise RuntimeError("注册流程未返回账号")
             if logger.is_cancel_requested():
                 return "__cancel_requested__"
             with Session(engine) as registration_session:
@@ -1032,10 +1062,8 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
                 registration_session.commit()
             if allocation_id:
                 allocation_succeeded = True
-            if platform_proxy and platform_proxy_mode == PROXY_MODE_PROXY_SERVICE:
-                proxy_pool.report_success(platform_proxy)
-            if mailbox_proxy and mailbox_proxy_mode == PROXY_MODE_PROXY_SERVICE and mailbox_proxy != platform_proxy:
-                proxy_pool.report_success(mailbox_proxy)
+            if proxy_lease is not None:
+                proxy_lease.report_success()
             post_codex_oauth = dict((account.extra or {}).get("post_codex_oauth") or {})
             auto_codex_oauth_enabled = str(extra.get("auto_codex_oauth_after_register") or "").strip().lower() in {
                 "1",
@@ -1097,10 +1125,8 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
             existing_account_failure = bool(getattr(exc, "preserve_mailbox", False))
             if logger.is_cancel_requested() or str(exc) == "任务已取消":
                 return "__cancel_requested__"
-            if platform_proxy and platform_proxy_mode == PROXY_MODE_PROXY_SERVICE:
-                proxy_pool.report_fail(platform_proxy)
-            if mailbox_proxy and mailbox_proxy_mode == PROXY_MODE_PROXY_SERVICE and mailbox_proxy != platform_proxy:
-                proxy_pool.report_fail(mailbox_proxy)
+            if proxy_lease is not None and is_retryable_network_error(exc):
+                proxy_lease.report_failure()
             error = str(exc)
             logger.record_error(error)
             logger.log(f"注册失败: {error}", level="error")
@@ -1130,6 +1156,8 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
                         outcome=ALLOCATION_CANCELLED if cancelled else ALLOCATION_FAILED,
                         reason=failure_reason or ("任务已取消" if cancelled else "注册未成功"),
                     )
+            if proxy_lease is not None:
+                proxy_lease.release()
             logger.clear_subtask()
 
     success = 0
@@ -1187,6 +1215,7 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
                 shared_mailbox.shutdown_prefetch()
             except Exception as exc:
                 logger.log(f"邮箱预取停止失败: {exc}", level="warning")
+        worker_proxy_manager.clear_scope(task_id)
 
     result_data = {
         "success": success,
@@ -1211,17 +1240,24 @@ def _execute_platform_action_task(payload: dict[str, Any], logger: TaskLogger) -
     account_id = int(payload.get("account_id", 0) or 0)
     action_id = str(payload.get("action_id", ""))
     params = dict(payload.get("params") or {})
-    runtime = PlatformRuntime()
-    result = runtime.execute_action(
-        type("Command", (), {
-            "platform": command_platform,
-            "account_id": account_id,
-            "action_id": action_id,
-            "params": params,
-        })(),
-        log_fn=logger.log,
-        cancel_check=logger.is_cancel_requested,
-    )
+    task_id = str(getattr(logger, "task_id", "") or "")
+    try:
+        result = _execute_runtime_action_with_worker_proxy(
+            platform=command_platform,
+            account_id=account_id,
+            action_id=action_id,
+            params=params,
+            logger=logger,
+            scope_id=task_id,
+        )
+    except Exception as exc:
+        logger.record_error(str(exc))
+        logger.finish(TASK_STATUS_FAILED, error=str(exc))
+        return
+    finally:
+        from core.worker_proxy import worker_proxy_manager
+
+        worker_proxy_manager.clear_scope(task_id)
     if logger.is_cancel_requested() or str(result.error or "") == "任务已取消":
         logger.finish(TASK_STATUS_CANCELLED, error="任务已取消")
         return
@@ -1239,6 +1275,74 @@ def _execute_platform_action_task(payload: dict[str, Any], logger: TaskLogger) -
     logger.finish(TASK_STATUS_SUCCEEDED)
 
 
+def _execute_runtime_action_with_worker_proxy(
+    *,
+    platform: str,
+    account_id: int,
+    action_id: str,
+    params: dict[str, Any],
+    logger: TaskLogger,
+    scope_id: str,
+):
+    """Execute one action with a worker-owned, replaceable proxy lease."""
+    from core.worker_proxy import WorkerProxyPolicy, worker_proxy_manager
+
+    proxy_mode = normalize_proxy_mode(
+        str(params.get("platform_proxy_mode") or "").strip(),
+        default=PROXY_MODE_DIRECT,
+    )
+    policy = WorkerProxyPolicy.load()
+    attempts = policy.replace_max_attempts if proxy_mode == PROXY_MODE_PROXY_SERVICE else 1
+    result = None
+    for proxy_attempt in range(1, attempts + 1):
+        lease = None
+        runtime_params = dict(params)
+        try:
+            if proxy_mode == PROXY_MODE_PROXY_SERVICE:
+                lease = worker_proxy_manager.acquire(
+                    scope_id=scope_id,
+                    log_fn=logger.log,
+                    cancel_check=logger.is_cancel_requested,
+                    policy=policy,
+                )
+                runtime_params["platform_proxy_mode"] = PROXY_MODE_MANUAL
+                runtime_params["platform_proxy_value"] = lease.url
+                runtime_params["_proxy_log_mode"] = PROXY_MODE_PROXY_SERVICE
+            runtime = PlatformRuntime()
+            result = runtime.execute_action(
+                type("Command", (), {
+                    "platform": platform,
+                    "account_id": account_id,
+                    "action_id": action_id,
+                    "params": runtime_params,
+                })(),
+                log_fn=logger.log,
+                cancel_check=logger.is_cancel_requested,
+            )
+            network_error = RuntimeError(str(result.error or ""))
+            retry_proxy = (
+                not result.ok
+                and proxy_mode == PROXY_MODE_PROXY_SERVICE
+                and is_retryable_network_error(network_error)
+            )
+            if lease is not None:
+                if retry_proxy:
+                    lease.report_failure()
+                else:
+                    lease.report_success()
+            if retry_proxy and proxy_attempt < attempts:
+                logger.log(
+                    f"代理网络异常，换 IP 重试 ({proxy_attempt + 1}/{attempts}): {result.error}",
+                    level="warning",
+                )
+                continue
+            return result
+        finally:
+            if lease is not None:
+                lease.release()
+    return result
+
+
 def _execute_codex_oauth_batch_task(payload: dict[str, Any], logger: TaskLogger) -> None:
     platform = str(payload.get("platform") or "chatgpt")
     account_ids = [
@@ -1252,6 +1356,7 @@ def _execute_codex_oauth_batch_task(payload: dict[str, Any], logger: TaskLogger)
     if not params.get("keep_browser_open"):
         params["keep_browser_open"] = "false"
     concurrency = _codex_oauth_batch_concurrency(payload.get("concurrency", 1), len(account_ids))
+    task_id = str(getattr(logger, "task_id", "") or "")
 
     with Session(engine) as session:
         records = session.exec(
@@ -1278,16 +1383,13 @@ def _execute_codex_oauth_batch_task(payload: dict[str, Any], logger: TaskLogger)
             if logger.is_cancel_requested():
                 return {"account_id": account_id, "email": email, "cancelled": True}
             logger.log(f"{email}: 开始 Codex OAuth 授权")
-            runtime = PlatformRuntime()
-            result = runtime.execute_action(
-                type("Command", (), {
-                    "platform": platform,
-                    "account_id": account_id,
-                    "action_id": "codex_oauth_authorize",
-                    "params": params,
-                })(),
-                log_fn=logger.log,
-                cancel_check=logger.is_cancel_requested,
+            result = _execute_runtime_action_with_worker_proxy(
+                platform=platform,
+                account_id=account_id,
+                action_id="codex_oauth_authorize",
+                params=params,
+                logger=logger,
+                scope_id=task_id,
             )
             if logger.is_cancel_requested() or str(result.error or "") == "任务已取消":
                 return {"account_id": account_id, "email": email, "cancelled": True}
@@ -1359,6 +1461,9 @@ def _execute_codex_oauth_batch_task(payload: dict[str, Any], logger: TaskLogger)
     finally:
         if pool is not None:
             pool.shutdown(wait=not cancel_pool, cancel_futures=cancel_pool)
+        from core.worker_proxy import worker_proxy_manager
+
+        worker_proxy_manager.clear_scope(task_id)
 
     result_data = {
         "success": success,
@@ -1373,7 +1478,7 @@ def _execute_codex_oauth_batch_task(payload: dict[str, Any], logger: TaskLogger)
 
 
 def _execute_account_check_all_task(payload: dict[str, Any], logger: TaskLogger) -> None:
-    from core.proxy_pool import proxy_pool
+    from core.worker_proxy import WorkerProxyPolicy, worker_proxy_manager
 
     platform = str(payload.get("platform", "") or "")
     limit = max(int(payload.get("limit", 50) or 50), 1)
@@ -1406,22 +1511,65 @@ def _execute_account_check_all_task(payload: dict[str, Any], logger: TaskLogger)
 
     results = {"valid": 0, "invalid": 0, "error": 0}
     completed = 0
-    task_proxy, proxy_mode, disable_proxy_pool = _check_task_proxy(payload, proxy_pool.get_next)
-    logger.log(
-        f"账号检测代理: {mask_proxy_url(task_proxy) if task_proxy else '直连'}"
-        f"（{proxy_mode}）"
+    task_id = str(getattr(logger, "task_id", "") or "")
+    proxy_mode = normalize_proxy_mode(
+        str(payload.get("platform_proxy_mode") or "").strip(),
+        default=PROXY_MODE_PROXY_SERVICE,
     )
+    manual_proxy = str(payload.get("platform_proxy_value") or payload.get("proxy") or "").strip() or None
+    proxy_policy = WorkerProxyPolicy.load()
     for model in accounts:
         if logger.is_cancel_requested():
+            worker_proxy_manager.clear_scope(task_id)
             logger.finish(TASK_STATUS_CANCELLED, error="任务已取消")
             return
         try:
-            valid, _ = _run_single_account_check(
-                int(model.id or 0),
-                logger,
-                proxy=task_proxy,
-                disable_proxy_pool=disable_proxy_pool,
-            )
+            attempts = proxy_policy.replace_max_attempts if proxy_mode == PROXY_MODE_PROXY_SERVICE else 1
+            valid = False
+            for proxy_attempt in range(1, attempts + 1):
+                lease = None
+                account_proxy = manual_proxy if proxy_mode == PROXY_MODE_MANUAL else None
+                try:
+                    if proxy_mode == PROXY_MODE_PROXY_SERVICE:
+                        lease = worker_proxy_manager.acquire(
+                            scope_id=task_id,
+                            log_fn=logger.log,
+                            cancel_check=logger.is_cancel_requested,
+                            policy=proxy_policy,
+                        )
+                        account_proxy = lease.url
+                    logger.log(
+                        f"{model.email}: 账号检测代理 "
+                        f"{mask_proxy_url(account_proxy) if account_proxy else '直连'}（{proxy_mode}）"
+                    )
+                    valid, _ = _run_single_account_check(
+                        int(model.id or 0),
+                        logger,
+                        proxy=account_proxy,
+                        disable_proxy_pool=True,
+                        strict_proxy=proxy_mode != PROXY_MODE_DIRECT,
+                    )
+                    if lease is not None:
+                        lease.report_success()
+                    break
+                except Exception as exc:
+                    if lease is not None and is_retryable_network_error(exc):
+                        lease.report_failure()
+                    if (
+                        proxy_mode == PROXY_MODE_PROXY_SERVICE
+                        and proxy_attempt < attempts
+                        and is_retryable_network_error(exc)
+                    ):
+                        logger.log(
+                            f"{model.email}: 检测代理异常，换 IP 重试 "
+                            f"({proxy_attempt + 1}/{attempts}): {exc}",
+                            level="warning",
+                        )
+                        continue
+                    raise
+                finally:
+                    if lease is not None:
+                        lease.release()
             if valid:
                 results["valid"] += 1
             else:
@@ -1434,3 +1582,4 @@ def _execute_account_check_all_task(payload: dict[str, Any], logger: TaskLogger)
         logger.set_progress(completed, total)
     logger.set_result_data(results)
     logger.finish(TASK_STATUS_SUCCEEDED)
+    worker_proxy_manager.clear_scope(task_id)

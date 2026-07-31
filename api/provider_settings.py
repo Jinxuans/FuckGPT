@@ -198,9 +198,9 @@ def _mask_proxy(proxy_url: str) -> str:
 
 
 def _test_proxy(driver_type: str, extra: dict) -> dict:
-    """Validate proxy provider config by resolving one proxy and probing httpbin."""
-    import requests
+    """Validate proxy config with the same exit-IP probe used by workers."""
     from core.proxy_providers import create_proxy_provider
+    from core.worker_proxy import WorkerProxyPolicy, probe_proxy
 
     try:
         provider = create_proxy_provider(driver_type, extra)
@@ -212,17 +212,17 @@ def _test_proxy(driver_type: str, extra: dict) -> dict:
         return {"ok": False, "error": "代理服务未返回可用代理"}
 
     try:
-        response = requests.get(
-            "https://httpbin.org/ip",
-            proxies={"http": proxy, "https": proxy},
-            timeout=12,
-        )
-        response.raise_for_status()
+        probe = probe_proxy(proxy, policy=WorkerProxyPolicy.from_config(extra))
         return {
             "ok": True,
-            "message": f"代理连接成功：{_mask_proxy(proxy)}",
+            "message": (
+                f"代理连接成功：{_mask_proxy(proxy)}，"
+                f"出口 {probe.exit_ip}，延迟 {probe.latency_ms}ms"
+            ),
             "proxy": _mask_proxy(proxy),
-            "origin": response.json().get("origin", ""),
+            "origin": probe.exit_ip,
+            "latency_ms": probe.latency_ms,
+            "check_endpoint": probe.endpoint,
         }
     except Exception as exc:  # noqa: BLE001
         return {

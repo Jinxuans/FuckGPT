@@ -3557,6 +3557,7 @@ class ChatGPTBrowserRegister:
         browser_context = self._open_browser(launch_opts)
         browser = browser_context.__enter__()
         keep_open = bool(self.keep_browser_open and not self.backend_config.is_headless)
+        completed = False
         try:
             page = browser.new_page()
             self.log("启动浏览器上下文注册状态机")
@@ -3621,9 +3622,10 @@ class ChatGPTBrowserRegister:
                 except Exception as exc:
                     result["post_codex_oauth"] = {"ok": False, "error": str(exc)}
                     self.log(f"注册后 Codex OAuth 授权失败: {exc}")
+            completed = True
             return result
         finally:
-            if keep_open:
+            if keep_open and completed:
                 keep_browser_context_open(browser_context, browser, label=f"chatgpt-register:{email}")
                 self.log("浏览器窗口已保留，可手动关闭")
             else:
