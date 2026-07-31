@@ -13,6 +13,7 @@ from typing import Any
 import requests
 
 from core.base_sms import BaseSmsProvider, SmsActivation, SmsStatus
+from core.network_retry import retry_network_call
 
 
 DEFAULT_BASE_URL = "https://smsbower.page/stubs/handler_api.php"
@@ -97,6 +98,9 @@ class SMSBowerClient(BaseSmsProvider):
         default_ref: str = DEFAULT_REF,
         number_api: str = "getNumber",
         request_timeout: float | str = 15,
+        request_max_attempts: int | str = 4,
+        request_retry_delay: float | str = 1,
+        request_retry_max_delay: float | str = 8,
         poll_interval: float | str = 3,
         proxy: str | None = None,
         session: requests.Session | None = None,
@@ -115,6 +119,9 @@ class SMSBowerClient(BaseSmsProvider):
         self.default_ref = DEFAULT_REF if self.lock_ref else _string(default_ref)
         self.number_api = "getNumberV2" if _string(number_api).lower() in {"getnumberv2", "v2", "2"} else "getNumber"
         self.request_timeout = _float_value(request_timeout, 15, minimum=0.5)
+        self.request_max_attempts = _int_value(request_max_attempts, 4, minimum=1)
+        self.request_retry_delay = _float_value(request_retry_delay, 1, minimum=0)
+        self.request_retry_max_delay = _float_value(request_retry_max_delay, 8, minimum=0)
         self.poll_interval = _float_value(poll_interval, 3, minimum=0)
         self.proxy = {"http": proxy, "https": proxy} if proxy else None
         self.session = session or requests.Session()
@@ -136,6 +143,9 @@ class SMSBowerClient(BaseSmsProvider):
             default_ref=DEFAULT_REF,
             number_api=config.get("smsbower_number_api", "getNumber"),
             request_timeout=config.get("smsbower_request_timeout", 15),
+            request_max_attempts=config.get("smsbower_request_max_attempts", 4),
+            request_retry_delay=config.get("smsbower_request_retry_delay", 1),
+            request_retry_max_delay=config.get("smsbower_request_retry_max_delay", 8),
             poll_interval=config.get("smsbower_poll_interval", 3),
             proxy=config.get("proxy") or config.get("sms_proxy") or None,
             log_fn=config.get("_log_fn"),
@@ -180,7 +190,7 @@ class SMSBowerClient(BaseSmsProvider):
         for key, value in dict(params or {}).items():
             if value not in (None, ""):
                 query[key] = value
-        try:
+        def perform_request() -> str:
             response = self.session.get(
                 self.base_url,
                 params=query,
@@ -189,7 +199,19 @@ class SMSBowerClient(BaseSmsProvider):
                 timeout=self.request_timeout,
             )
             response.raise_for_status()
-            raw = str(response.text or "").strip()
+            return str(response.text or "").strip()
+
+        try:
+            raw = retry_network_call(
+                perform_request,
+                max_attempts=self.request_max_attempts,
+                base_delay=self.request_retry_delay,
+                max_delay=self.request_retry_max_delay,
+                on_retry=lambda attempt, attempts, delay, exc: self._log(
+                    f"SMSBower {action} 遇到瞬时网络/代理异常，{delay:g}s 后自动重试 "
+                    f"({attempt}/{attempts}): {exc}"
+                ),
+            )
         except Exception as exc:  # noqa: BLE001
             raise SMSBowerError(self._redact(f"SMSBower 请求失败: {exc}")) from exc
         if not raw:

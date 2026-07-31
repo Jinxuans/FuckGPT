@@ -18,6 +18,8 @@ from urllib.parse import parse_qs, urlencode, urlparse
 
 import requests
 
+from core.network_retry import retry_network_call
+
 from .._browser_backend import BrowserBackendConfig, keep_browser_context_open, open_browser_backend
 from .browser_register import (
     EMAIL_INPUT_SELECTORS,
@@ -519,23 +521,43 @@ def _exchange_code_for_tokens(
     *,
     proxy: str | None = None,
     timeout: int = 60,
+    log: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
-    response = requests.post(
-        CODEX_TOKEN_URL,
-        data={
-            "grant_type": "authorization_code",
-            "client_id": CODEX_CLIENT_ID,
-            "code": code,
-            "redirect_uri": CODEX_REDIRECT_URI,
-            "code_verifier": pkce.code_verifier,
-        },
-        headers={
-            "Accept": "application/json",
-            "Content-Type": "application/x-www-form-urlencoded",
-            "User-Agent": CODEX_USER_AGENT,
-        },
-        proxies={"http": proxy, "https": proxy} if proxy else None,
-        timeout=timeout,
+    def request_tokens():
+        response = requests.post(
+            CODEX_TOKEN_URL,
+            data={
+                "grant_type": "authorization_code",
+                "client_id": CODEX_CLIENT_ID,
+                "code": code,
+                "redirect_uri": CODEX_REDIRECT_URI,
+                "code_verifier": pkce.code_verifier,
+            },
+            headers={
+                "Accept": "application/json",
+                "Content-Type": "application/x-www-form-urlencoded",
+                "User-Agent": CODEX_USER_AGENT,
+            },
+            proxies={"http": proxy, "https": proxy} if proxy else None,
+            timeout=timeout,
+        )
+        if int(getattr(response, "status_code", 0) or 0) in {408, 425, 429, 500, 502, 503, 504}:
+            error = requests.exceptions.HTTPError(
+                f"Codex OAuth token exchange transient HTTP {response.status_code}",
+                response=response,
+            )
+            raise error
+        return response
+
+    response = retry_network_call(
+        request_tokens,
+        max_attempts=4,
+        base_delay=1,
+        max_delay=8,
+        on_retry=lambda attempt, attempts, delay, exc: (log or (lambda _message: None))(
+            f"Codex OAuth token 交换遇到瞬时网络/代理异常，{delay:g}s 后自动重试 "
+            f"({attempt}/{attempts}): {exc}"
+        ),
     )
     if response.status_code < 200 or response.status_code >= 300:
         raise RuntimeError(f"Codex OAuth token exchange 失败 HTTP {response.status_code}: {response.text[:500]}")
@@ -1444,7 +1466,7 @@ def _resume_oauth_after_add_phone_success(
 
     if resume_url:
         log(f"Codex OAuth add_phone: 手机验证后仍停留 add_phone，重新打开授权链接 {last_url[:110]}")
-        page.goto(resume_url, wait_until="domcontentloaded", timeout=30000)
+        _goto_with_retry(page, resume_url, wait_until="domcontentloaded", timeout=30000, log=log)
 
 
 def _handle_add_phone_challenge(
@@ -1463,7 +1485,13 @@ def _handle_add_phone_challenge(
         if attempt:
             log(f"Codex OAuth add_phone: 换号重试 {attempt + 1}/{max_phone_attempts}")
             try:
-                page.goto("https://auth.openai.com/add-phone", wait_until="domcontentloaded", timeout=15000)
+                _goto_with_retry(
+                    page,
+                    "https://auth.openai.com/add-phone",
+                    wait_until="domcontentloaded",
+                    timeout=15000,
+                    log=log,
+                )
                 time.sleep(1)
             except Exception:
                 pass
@@ -1527,7 +1555,13 @@ def _do_add_phone_attempt(
 
     current_url = str(getattr(page, "url", "") or "")
     if "add-phone" not in current_url:
-        page.goto("https://auth.openai.com/add-phone", wait_until="domcontentloaded", timeout=30000)
+        _goto_with_retry(
+            page,
+            "https://auth.openai.com/add-phone",
+            wait_until="domcontentloaded",
+            timeout=30000,
+            log=log,
+        )
     time.sleep(1)
 
     dial_code, local_number, country_name = _parse_phone_country_and_local(phone_number)
@@ -1665,7 +1699,7 @@ def _do_add_phone_attempt(
 def _try_skip_add_phone(page, *, auth_url: str, callback_server: _OAuthCallbackServer, log: Callable[[str], None]) -> bool:
     log("Codex OAuth add_phone: 未配置接码，尝试重新访问授权链接跳过")
     try:
-        page.goto(auth_url, wait_until="domcontentloaded", timeout=15000)
+        _goto_with_retry(page, auth_url, wait_until="domcontentloaded", timeout=15000, log=log)
         for _ in range(8):
             if callback_server.event.is_set():
                 return True
@@ -2027,7 +2061,7 @@ def _finalize_codex_oauth_callback(
         raise RuntimeError("Codex OAuth 回调缺少 code")
 
     log("Codex OAuth 回调已收到，正在交换 token")
-    token_payload = _exchange_code_for_tokens(code, pkce, proxy=proxy)
+    token_payload = _exchange_code_for_tokens(code, pkce, proxy=proxy, log=log)
     expires_in = int(token_payload.get("expires_in") or 0)
     identity = _token_identity(str(token_payload.get("id_token") or ""))
     identity_email = str(identity.get("email") or "").strip()

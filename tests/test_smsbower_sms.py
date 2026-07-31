@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 
 import pytest
+import requests
 
 from core.smsbower_sms import SMSBowerClient, SMSBowerError
 from infrastructure.provider_definitions_repository import (
@@ -260,6 +261,46 @@ def test_smsbower_wait_for_code_polls_until_status_ok():
     assert len(session.calls) == 2
 
 
+def test_smsbower_retries_transient_proxy_reset_and_then_succeeds(monkeypatch):
+    sleeps = []
+    logs = []
+    proxy_error = requests.exceptions.ProxyError(
+        "HTTPSConnectionPool: Max retries exceeded "
+        "(Caused by ConnectionResetError(10054, 'remote reset')) api_key=secret-key"
+    )
+    session = FakeSession([proxy_error, proxy_error, "STATUS_OK:222333"])
+    client = SMSBowerClient(
+        api_key="secret-key",
+        session=session,
+        request_max_attempts=4,
+        request_retry_delay=1,
+        request_retry_max_delay=2,
+        log_fn=logs.append,
+    )
+    monkeypatch.setattr("core.network_retry.time.sleep", lambda seconds: sleeps.append(seconds))
+
+    status = client.get_status("123")
+
+    assert status.code == "222333"
+    assert len(session.calls) == 3
+    assert sleeps == [1, 2]
+    assert any("自动重试" in item for item in logs)
+    assert all("secret-key" not in item for item in logs)
+
+
+def test_smsbower_does_not_retry_provider_business_error(monkeypatch):
+    sleeps = []
+    session = FakeSession(["BAD_KEY", "STATUS_OK:should-not-be-used"])
+    client = SMSBowerClient(api_key="secret-key", session=session, request_max_attempts=4)
+    monkeypatch.setattr("core.network_retry.time.sleep", lambda seconds: sleeps.append(seconds))
+
+    with pytest.raises(SMSBowerError, match="BAD_KEY"):
+        client.get_status("123")
+
+    assert len(session.calls) == 1
+    assert sleeps == []
+
+
 def test_smsbower_balance_supports_plain_and_prefixed_response():
     plain = SMSBowerClient(api_key="secret-key", session=FakeSession(["12.34"]))
     prefixed = SMSBowerClient(api_key="secret-key", session=FakeSession(["ACCESS_BALANCE:56.78"]))
@@ -299,6 +340,13 @@ def test_smsbower_is_exposed_in_provider_catalog_and_registry():
 
     assert {item.provider_key for item in definitions} == set(SUPPORTED_SMS_PROVIDER_KEYS)
     assert {item["driver_type"] for item in drivers} == set(SUPPORTED_SMS_PROVIDER_KEYS)
+    smsbower = next(item for item in definitions if item.provider_key == "smsbower")
+    field_keys = {field["key"] for field in smsbower.get_fields()}
+    assert {
+        "smsbower_request_max_attempts",
+        "smsbower_request_retry_delay",
+        "smsbower_request_retry_max_delay",
+    }.issubset(field_keys)
     assert "smsbower" in list_registered("sms")
     provider = create_provider("sms", "smsbower", {"smsbower_api_key": "secret-key"})
     assert isinstance(provider, SMSBowerClient)

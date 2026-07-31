@@ -20,6 +20,9 @@ def test_config_options_exposes_smsbower_catalog(client):
     assert "smsbower_min_price" in field_keys
     assert "smsbower_buy_max_attempts" in field_keys
     assert "smsbower_buy_retry_interval" in field_keys
+    assert "smsbower_request_max_attempts" in field_keys
+    assert "smsbower_request_retry_delay" in field_keys
+    assert "smsbower_request_retry_max_delay" in field_keys
     assert "smsbower_number_api" in field_keys
     assert "smsbower_otp_timeout_seconds" in field_keys
     assert {
