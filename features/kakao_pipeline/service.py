@@ -1027,13 +1027,13 @@ class KakaoPipelineService:
                 session.commit()
                 return self._serialize_pipeline(pipeline, detail=True)
 
-    def reset(self, account_id: int) -> dict:
+    def reset(self, account_id: int, *, force: bool = False) -> dict:
         with _account_lock(account_id):
             with Session(engine) as session:
                 pipeline = self._pipeline_for_account(session, account_id)
                 if pipeline is None:
                     return self._serialize_pipeline(None)
-                if pipeline.state in ACTIVE_STATES:
+                if pipeline.state in ACTIVE_STATES and not force:
                     raise ValueError("任务进行中，不能重置")
                 session.delete(pipeline)
                 session.commit()

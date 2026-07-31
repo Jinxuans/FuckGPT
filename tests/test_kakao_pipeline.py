@@ -412,6 +412,31 @@ def test_546789_scanner_flow_uses_independent_driver(monkeypatch):
     assert completed["scanner_status"] == "COMPLETED"
 
 
+def test_force_reset_can_clear_stuck_active_state():
+    account_id = _create_account("force-reset@test.com")
+    service = KakaoPipelineService()
+
+    from sqlmodel import Session
+
+    from core.db import KakaoPipelineModel, engine
+
+    with Session(engine) as session:
+        session.add(
+            KakaoPipelineModel(
+                account_id=account_id,
+                state="scanner_processing",
+                payment_url="https://pay.nicepay.co.kr/v1/checkout/pay/stuck-task",
+            )
+        )
+        session.commit()
+
+    reset = service.reset(account_id, force=True)
+
+    assert reset["state"] == "idle"
+    listed = service.list_accounts(search="force-reset@test.com")
+    assert listed["items"][0]["pipeline"]["state"] == "idle"
+
+
 def test_546789_expired_keeps_link_and_quota_removal_is_isolated(monkeypatch):
     account_id = _create_account("expired-workstation@test.com")
     from infrastructure.provider_definitions_repository import ProviderDefinitionsRepository

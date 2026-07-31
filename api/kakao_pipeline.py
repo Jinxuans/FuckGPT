@@ -28,6 +28,10 @@ class ScannerRequest(BaseModel):
     scanner_kind: str = ""
 
 
+class ResetRequest(BaseModel):
+    force: bool = False
+
+
 class DefaultScannerRequest(BaseModel):
     scanner_kind: str
 
@@ -167,8 +171,8 @@ def check_plus(account_id: int, response: Response):
 
 
 @router.post("/accounts/{account_id}/reset")
-def reset_pipeline(account_id: int):
+def reset_pipeline(account_id: int, body: ResetRequest | None = None):
     try:
-        return service.reset(account_id)
+        return service.reset(account_id, force=bool(body and body.force))
     except Exception as exc:  # noqa: BLE001
         _raise_problem(exc)

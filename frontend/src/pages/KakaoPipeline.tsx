@@ -1,11 +1,10 @@
-import { Fragment, useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import {
   AlertTriangle,
   Check,
   CheckCircle2,
   ChevronDown,
-  ChevronUp,
   Copy,
   ExternalLink,
   FileText,
@@ -175,21 +174,31 @@ function planBadge(account: KakaoAccount) {
   return <Badge variant="secondary">{account.plan || '未检测'}</Badge>
 }
 
-function statusBadge(label: string, variant: 'default' | 'success' | 'warning' | 'danger' | 'secondary') {
-  return <Badge variant={variant}>{label}</Badge>
+function accountIsPlus(account: KakaoAccount) {
+  const plan = String(account.plan || '').toLowerCase()
+  return account.plan_state === 'subscribed' || ['plus', 'pro', 'team', 'business'].some(item => plan.includes(item))
 }
 
 function AccountMoreMenu({
   accountId,
   onCopyCredential,
+  onForceReset,
+  onCheckPlus,
+  actionDisabled = false,
+  onShowLog,
 }: {
   accountId: number
   onCopyCredential: (accountId: number, credentialType: 'session' | 'access') => void
+  onForceReset: () => void
+  onCheckPlus: () => void
+  actionDisabled?: boolean
+  onShowLog?: () => void
 }) {
   const [open, setOpen] = useState(false)
   const [menuPosition, setMenuPosition] = useState({ top: 0, left: 0 })
   const triggerRef = useRef<HTMLButtonElement | null>(null)
   const menuRef = useRef<HTMLDivElement | null>(null)
+  const menuItemCount = 4 + (onShowLog ? 1 : 0)
 
   useEffect(() => {
     if (!open) return
@@ -198,7 +207,7 @@ function AccountMoreMenu({
       const rect = triggerRef.current?.getBoundingClientRect()
       if (!rect) return
       const width = 136
-      const height = 82
+      const height = 20 + menuItemCount * 34
       const gap = 6
       const openUp = window.innerHeight - rect.bottom < height + 16 && rect.top > height
       setMenuPosition({
@@ -226,7 +235,7 @@ function AccountMoreMenu({
       document.removeEventListener('mousedown', closeOnOutsideClick)
       document.removeEventListener('keydown', closeOnEscape)
     }
-  }, [open])
+  }, [menuItemCount, open])
 
   const copyCredential = (credentialType: 'session' | 'access') => {
     setOpen(false)
@@ -249,9 +258,34 @@ function AccountMoreMenu({
         <div
           ref={menuRef}
           role="menu"
-          className="fixed z-[9999] w-[136px] overflow-hidden rounded-lg border border-[var(--border)] bg-[var(--bg-card)] py-1 shadow-[var(--shadow-soft)]"
+          className="fixed z-[60] w-[136px] overflow-hidden rounded-lg border border-[var(--border)] bg-[var(--bg-card)] py-1 shadow-[var(--shadow-soft)]"
           style={{ top: menuPosition.top, left: menuPosition.left }}
         >
+          <button
+            type="button"
+            role="menuitem"
+            disabled={actionDisabled}
+            className="flex w-full items-center px-3 py-2 text-left text-xs font-medium text-[var(--text-primary)] transition-colors hover:bg-[var(--bg-hover)] focus-visible:bg-[var(--bg-hover)] focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-40"
+            onClick={() => {
+              setOpen(false)
+              onCheckPlus()
+            }}
+          >
+            <Check className="mr-2 h-3.5 w-3.5" /> 检测 Plus
+          </button>
+          <button
+            type="button"
+            role="menuitem"
+            disabled={actionDisabled}
+            className="flex w-full items-center px-3 py-2 text-left text-xs font-medium text-red-500 transition-colors hover:bg-red-500/10 focus-visible:bg-red-500/10 focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-40"
+            onClick={() => {
+              setOpen(false)
+              onForceReset()
+            }}
+          >
+            <RotateCcw className="mr-2 h-3.5 w-3.5" /> 重置记录
+          </button>
+          <div className="my-1 h-px bg-[var(--border)]" />
           <button
             type="button"
             role="menuitem"
@@ -268,6 +302,19 @@ function AccountMoreMenu({
           >
             <KeyRound className="mr-2 h-3.5 w-3.5" /> 复制 ST
           </button>
+          {onShowLog ? (
+            <button
+              type="button"
+              role="menuitem"
+              className="flex w-full items-center px-3 py-2 text-left text-xs text-[var(--text-secondary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)] focus-visible:outline-none focus-visible:bg-[var(--bg-hover)]"
+              onClick={() => {
+                setOpen(false)
+                onShowLog()
+              }}
+            >
+              <FileText className="mr-2 h-3.5 w-3.5" /> 查看日志
+            </button>
+          ) : null}
         </div>,
         document.body,
       )}
@@ -275,113 +322,228 @@ function AccountMoreMenu({
   )
 }
 
-function SupplierState({ pipeline }: { pipeline: Pipeline }) {
-  if (pipeline.state === 'idle') return statusBadge('未提取', 'secondary')
-  if (pipeline.state === 'supplier_submitting') return statusBadge('正在提交', 'default')
-  if (pipeline.state === 'supplier_processing') {
-    return (
-      <div className="space-y-1">
-        {statusBadge('提链中', 'default')}
-        <div className="text-[11px] text-[var(--text-muted)]">
-          {pipeline.supplier_stage_total
-            ? `${pipeline.supplier_stage || 0}/${pipeline.supplier_stage_total} · `
-            : ''}
-          {pipeline.supplier_stage_name || pipeline.supplier_status || '等待供应商'}
-        </div>
+type StepState = 'waiting' | 'active' | 'complete' | 'error'
+
+function PipelineProgress({ account }: { account: KakaoAccount }) {
+  const pipeline = account.pipeline
+  const alreadyPlus = accountIsPlus(account)
+  const scannerComplete = ['scanner_succeeded', 'plus_checking', 'plus_pending', 'plus_check_failed', 'completed'].includes(pipeline.state)
+  const steps: Array<{ label: string; state: StepState }> = [
+    {
+      label: '提链',
+      state: pipeline.state === 'supplier_failed'
+        ? 'error'
+        : pipeline.payment_url
+          ? 'complete'
+          : ['supplier_submitting', 'supplier_processing'].includes(pipeline.state)
+            ? 'active'
+            : 'waiting',
+    },
+    {
+      label: '扫码',
+      state: pipeline.state === 'scanner_failed'
+        ? 'error'
+        : scannerComplete
+          ? 'complete'
+          : ['scanner_submitting', 'scanner_processing'].includes(pipeline.state)
+            ? 'active'
+            : 'waiting',
+    },
+    {
+      label: 'Plus',
+      state: pipeline.state === 'plus_check_failed'
+        ? 'error'
+        : pipeline.state === 'completed' || pipeline.final_result === 'plus' || alreadyPlus
+          ? 'complete'
+          : pipeline.state === 'plus_checking'
+            ? 'active'
+            : 'waiting',
+    },
+  ]
+
+  const stateText = (() => {
+    if (pipeline.state === 'completed' || pipeline.final_result === 'plus') return '已确认升级 Plus'
+    if (alreadyPlus) return '账号当前已是 Plus'
+    if (pipeline.state === 'supplier_processing') {
+      const stage = pipeline.supplier_stage_total ? `${pipeline.supplier_stage || 0}/${pipeline.supplier_stage_total} ` : ''
+      return `${stage}${pipeline.supplier_stage_name || pipeline.supplier_status || '供应商处理中'}`
+    }
+    if (pipeline.state === 'scanner_processing') return `${pipeline.scanner_name || '扫码平台'}处理中`
+    if (pipeline.state === 'link_ready') return '长链已就绪，等待上传扫码'
+    if (pipeline.state === 'scanner_succeeded' || pipeline.state === 'plus_pending') return '扫码成功，等待 Plus 同步'
+    if (pipeline.state === 'plus_checking') return '正在复检 Plus 状态'
+    if (['supplier_failed', 'scanner_failed', 'plus_check_failed'].includes(pipeline.state)) {
+      return pipeline.last_error_message || '本次操作失败'
+    }
+    return '等待提取 Kakao 长链'
+  })()
+
+  return (
+    <div className="min-w-[320px] max-w-[460px]">
+      <div className="flex items-start" aria-label={`流水线状态：${stateText}`}>
+        {steps.map((step, index) => (
+          <div key={step.label} className="relative flex flex-1 flex-col items-center gap-1">
+            {index > 0 ? (
+              <div className={cn(
+                'absolute right-1/2 top-[6px] h-px w-full',
+                steps[index - 1].state === 'complete' ? 'bg-emerald-500/60' : 'bg-[var(--border)]',
+              )} />
+            ) : null}
+            <span className={cn(
+              'relative z-10 h-3 w-3 rounded-full ring-4 ring-[var(--bg-surface)]',
+              step.state === 'complete' && 'bg-emerald-500',
+              step.state === 'active' && 'bg-[var(--accent)]',
+              step.state === 'error' && 'bg-red-500',
+              step.state === 'waiting' && 'bg-[var(--border)]',
+            )} />
+            <span className={cn(
+              'text-[11px]',
+              step.state === 'complete' && 'text-emerald-500',
+              step.state === 'active' && 'font-medium text-[var(--accent)]',
+              step.state === 'error' && 'font-medium text-red-500',
+              step.state === 'waiting' && 'text-[var(--text-muted)]',
+            )}>{step.label}</span>
+          </div>
+        ))}
       </div>
-    )
-  }
-  if (pipeline.state === 'supplier_failed') {
-    return (
-      <div className="space-y-1">
-        {statusBadge('提取失败', 'danger')}
-        <p className="max-w-64 text-[11px] leading-4 text-red-500">{pipeline.last_error_message}</p>
-      </div>
-    )
-  }
-  if (pipeline.payment_url) {
-    return (
-      <div className="space-y-1">
-        {statusBadge('提链成功', 'success')}
-        <div className="text-[11px] text-[var(--text-muted)]">KAKAO_PAY · 0 KRW 已验证</div>
-      </div>
-    )
-  }
-  return statusBadge(pipeline.supplier_status || '等待', 'secondary')
+      <p className={cn(
+        'mt-2 truncate text-center text-xs',
+        ['supplier_failed', 'scanner_failed', 'plus_check_failed'].includes(pipeline.state)
+          ? 'text-red-500'
+          : 'text-[var(--text-secondary)]',
+      )} title={stateText}>{stateText}</p>
+    </div>
+  )
 }
 
-function ScannerState({ pipeline }: { pipeline: Pipeline }) {
-  if (!pipeline.payment_url) return statusBadge('未提交', 'secondary')
-  if (pipeline.state === 'link_ready') {
-    return (
-      <div className="space-y-1">
-        {statusBadge('等待上传', 'warning')}
-        {pipeline.last_error_code === 'auto_upload_failed' ? (
-          <p className="max-w-64 text-[11px] leading-4 text-red-500">{pipeline.last_error_message}</p>
-        ) : null}
-      </div>
-    )
-  }
-  if (pipeline.state === 'scanner_submitting') return statusBadge('正在提交', 'default')
-  if (pipeline.state === 'scanner_processing') {
-    return (
-      <div className="space-y-1">
-        {statusBadge('扫码任务运行中', 'warning')}
-        <div className="text-[11px] text-[var(--text-muted)]">
-          {pipeline.scanner_name ? `${pipeline.scanner_name} · ` : ''}{pipeline.scanner_status || 'PENDING'}
-          {pipeline.scan_expires_at ? ` · ${pipeline.scan_expires_at}` : ''}
-        </div>
-      </div>
-    )
-  }
-  if (pipeline.state === 'scanner_failed') {
-    return (
-      <div className="space-y-1">
-        {statusBadge('扫码失败', 'danger')}
-        {pipeline.scanner_name ? <div className="text-[11px] text-[var(--text-muted)]">{pipeline.scanner_name}</div> : null}
-        <p className="max-w-64 text-[11px] leading-4 text-red-500">{pipeline.last_error_message}</p>
-      </div>
-    )
-  }
-  if (['scanner_succeeded', 'plus_checking', 'plus_pending', 'plus_check_failed', 'completed'].includes(pipeline.state)) {
-    return statusBadge('扫码成功', 'success')
-  }
-  return statusBadge(pipeline.scanner_status || '未提交', 'secondary')
-}
+function PipelineLogDrawer({
+  account,
+  detail,
+  onClose,
+  onCopyLink,
+}: {
+  account: KakaoAccount
+  detail?: Pipeline
+  onClose: () => void
+  onCopyLink: (value: string) => void
+}) {
+  useEffect(() => {
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') onClose()
+    }
+    document.addEventListener('keydown', closeOnEscape)
+    return () => document.removeEventListener('keydown', closeOnEscape)
+  }, [onClose])
 
-function FinalState({ pipeline, account }: { pipeline: Pipeline; account: KakaoAccount }) {
-  if (pipeline.state === 'completed' || pipeline.final_result === 'plus') {
-    return (
-      <div className="flex items-center gap-1.5 text-xs font-medium text-emerald-500">
-        <CheckCircle2 className="h-4 w-4" /> 已升级 Plus
-      </div>
-    )
-  }
-  if (pipeline.state === 'plus_checking') {
-    return (
-      <div className="flex items-center gap-1.5 text-xs text-[var(--accent)]">
-        <LoaderCircle className="h-4 w-4 animate-spin" /> 正在复检 Plus
-      </div>
-    )
-  }
-  if (pipeline.state === 'plus_pending') {
-    return (
-      <div className="flex items-center gap-1.5 text-xs text-amber-500">
-        <AlertTriangle className="h-4 w-4" /> 扫码成功，暂未同步
-      </div>
-    )
-  }
-  if (pipeline.state === 'plus_check_failed') {
-    return <span className="text-xs text-red-500">Plus 检测失败</span>
-  }
-  const plan = String(account.plan || '').toLowerCase()
-  if (account.plan_state === 'subscribed' || plan.includes('plus') || plan.includes('team')) {
-    return <span className="text-xs text-emerald-500">本地账号已是 Plus</span>
-  }
-  if (pipeline.last_error_message && ['supplier_failed', 'scanner_failed'].includes(pipeline.state)) {
-    return <span className="text-xs text-red-500">操作失败</span>
-  }
-  return <span className="text-xs text-[var(--text-muted)]">等待操作</span>
+  if (typeof document === 'undefined') return null
+
+  return createPortal(
+    <div className="fixed inset-0 z-[50]">
+      <button
+        type="button"
+        className="absolute inset-0 bg-black/60"
+        aria-label="关闭日志"
+        onClick={onClose}
+      />
+      <aside
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="kakao-log-title"
+        className="absolute inset-y-0 right-0 flex w-full max-w-3xl flex-col border-l border-[var(--border)] bg-[var(--bg-surface)] shadow-[-4px_0_8px_rgba(0,0,0,0.2)]"
+      >
+        <header className="flex shrink-0 items-start justify-between gap-4 border-b border-[var(--border)] px-5 py-4">
+          <div className="min-w-0">
+            <h2 id="kakao-log-title" className="text-base font-semibold text-[var(--text-primary)]">流水线日志</h2>
+            <div className="mt-1 flex min-w-0 flex-wrap items-center gap-2 text-xs text-[var(--text-muted)]">
+              <span className="max-w-md truncate text-[var(--text-secondary)]" title={account.email}>{account.email}</span>
+              <span className="font-mono">#{account.id}</span>
+              {planBadge(account)}
+            </div>
+          </div>
+          <Button variant="ghost" size="icon" autoFocus onClick={onClose} aria-label="关闭日志">
+            <X className="h-4 w-4" />
+          </Button>
+        </header>
+
+        <div className="min-h-0 flex-1 overflow-y-auto px-5 py-5">
+          {!detail ? (
+            <div className="space-y-3" aria-label="正在读取日志">
+              <div className="h-4 w-32 animate-pulse rounded bg-[var(--chip-bg)]" />
+              {Array.from({ length: 6 }).map((_, index) => (
+                <div key={index} className="h-9 animate-pulse rounded-md bg-[var(--bg-hover)]" />
+              ))}
+            </div>
+          ) : (
+            <div className="space-y-6">
+              <section>
+                <div className="mb-3 flex items-center justify-between gap-3">
+                  <h3 className="text-sm font-semibold text-[var(--text-primary)]">操作记录</h3>
+                  <span className="text-xs text-[var(--text-muted)]">{(detail.events || []).length} 条</span>
+                </div>
+                {(detail.events || []).length === 0 ? (
+                  <p className="rounded-lg bg-[var(--bg-hover)] px-4 py-6 text-center text-sm text-[var(--text-muted)]">暂无日志</p>
+                ) : (
+                  <div className="divide-y divide-[var(--border-soft)] border-y border-[var(--border)]">
+                    {[...(detail.events || [])].reverse().map((event, index) => (
+                      <div key={`${event.time}-${index}`} className="grid grid-cols-[76px_minmax(0,1fr)] gap-3 py-3 text-xs">
+                        <time className="font-mono text-[var(--text-muted)]">
+                          {new Date(event.time).toLocaleTimeString()}
+                        </time>
+                        <span className={cn(
+                          'leading-5',
+                          event.level === 'error'
+                            ? 'text-red-500'
+                            : event.level === 'warning'
+                              ? 'text-amber-500'
+                              : 'text-[var(--text-secondary)]',
+                        )}>{event.message}</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </section>
+
+              {detail.payment_url ? (
+                <section>
+                  <h3 className="mb-2 text-sm font-semibold text-[var(--text-primary)]">Kakao 长链</h3>
+                  <div className="flex min-w-0 items-center gap-2 rounded-lg bg-[var(--bg-input)] p-2">
+                    <code className="min-w-0 flex-1 truncate px-1 text-xs text-[var(--text-secondary)]">{detail.payment_url}</code>
+                    <Button variant="outline" size="sm" onClick={() => onCopyLink(detail.payment_url || '')}>
+                      <Copy className="mr-1.5 h-3.5 w-3.5" /> 复制
+                    </Button>
+                    <Button variant="outline" size="sm" onClick={() => window.open(detail.payment_url, '_blank', 'noopener,noreferrer')}>
+                      <ExternalLink className="mr-1.5 h-3.5 w-3.5" /> 打开
+                    </Button>
+                  </div>
+                </section>
+              ) : null}
+
+              <details className="border-t border-[var(--border)] pt-4">
+                <summary className="cursor-pointer text-sm font-medium text-[var(--text-secondary)] hover:text-[var(--text-primary)]">
+                  查看脱敏接口响应
+                </summary>
+                <div className="mt-3 grid gap-3 lg:grid-cols-2">
+                  <div className="min-w-0">
+                    <div className="mb-1 text-xs text-[var(--text-muted)]">供应商</div>
+                    <pre className="max-h-80 overflow-auto rounded-md bg-[var(--bg-input)] p-3 font-mono text-[11px] leading-5 text-[var(--text-secondary)]">
+                      {JSON.stringify(detail.supplier_response || {}, null, 2)}
+                    </pre>
+                  </div>
+                  <div className="min-w-0">
+                    <div className="mb-1 text-xs text-[var(--text-muted)]">扫码平台</div>
+                    <pre className="max-h-80 overflow-auto rounded-md bg-[var(--bg-input)] p-3 font-mono text-[11px] leading-5 text-[var(--text-secondary)]">
+                      {JSON.stringify(detail.scanner_response || {}, null, 2)}
+                    </pre>
+                  </div>
+                </div>
+              </details>
+            </div>
+          )}
+        </div>
+      </aside>
+    </div>,
+    document.body,
+  )
 }
 
 function SettingsPanel({
@@ -411,6 +573,7 @@ function SettingsPanel({
     },
   })
   const [busy, setBusy] = useState('')
+  const [activeKind, setActiveKind] = useState<SettingKind>('supplier')
   const [feedback, setFeedback] = useState<Record<SettingKind, string>>({ supplier: '', scanner: '', scanner_546789: '' })
   const [checkResults, setCheckResults] = useState<Record<SettingKind, CdkCheckResult[]>>({ supplier: [], scanner: [], scanner_546789: [] })
 
@@ -580,12 +743,38 @@ function SettingsPanel({
           </Button>
         </div>
       </div>
-      <div className="grid divide-y divide-[var(--border)] xl:grid-cols-3 xl:divide-x xl:divide-y-0">
-        {SETTING_KINDS.map(kind => {
+      <div className="grid lg:grid-cols-[220px_minmax(0,1fr)]">
+        <nav className="flex gap-1 overflow-x-auto border-b border-[var(--border)] p-2 lg:flex-col lg:border-b-0 lg:border-r" aria-label="接口类型">
+          {SETTING_KINDS.map(kind => {
+            const setting = settings[kind]
+            const selected = activeKind === kind
+            return (
+              <button
+                key={kind}
+                type="button"
+                aria-current={selected ? 'page' : undefined}
+                onClick={() => setActiveKind(kind)}
+                className={cn(
+                  'flex min-w-44 items-center justify-between gap-3 rounded-lg px-3 py-2.5 text-left text-sm transition-colors lg:min-w-0',
+                  selected
+                    ? 'bg-[var(--bg-active)] font-medium text-[var(--text-primary)]'
+                    : 'text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]',
+                )}
+              >
+                <span>{SETTING_TITLES[kind]}</span>
+                <span className={cn(
+                  'h-2 w-2 shrink-0 rounded-full',
+                  setting.has_cdk ? 'bg-emerald-500' : 'bg-amber-500',
+                )} aria-label={setting.has_cdk ? `${setting.cdk_count} 个 CDK` : 'CDK 未配置'} />
+              </button>
+            )
+          })}
+        </nav>
+        {SETTING_KINDS.filter(kind => kind === activeKind).map(kind => {
           const title = SETTING_TITLES[kind]
           const setting = settings[kind]
           return (
-            <section key={kind} className="p-4">
+            <section key={kind} className="min-w-0 p-4 lg:p-5">
               <div className="mb-3 flex items-center justify-between gap-3">
                 <h3 className="text-sm font-medium text-[var(--text-primary)]">{title}</h3>
                 <Badge variant={setting.has_cdk ? 'success' : 'warning'}>
@@ -693,6 +882,7 @@ export default function KakaoPipeline() {
   const [details, setDetails] = useState<Record<number, Pipeline>>({})
   const [toast, setToast] = useState<{ type: 'success' | 'error'; text: string } | null>(null)
   const activeRequests = useRef(new Set<number>())
+  const loadRequestRef = useRef(0)
 
   const loadSettings = useCallback(async () => {
     const result = await apiFetch('/kakao-pipeline/settings')
@@ -700,6 +890,7 @@ export default function KakaoPipeline() {
   }, [])
 
   const loadAccounts = useCallback(async (showLoading = true) => {
+    const requestId = ++loadRequestRef.current
     if (showLoading) setLoading(true)
     try {
       const params = new URLSearchParams({
@@ -708,6 +899,7 @@ export default function KakaoPipeline() {
       })
       if (debouncedSearch) params.set('search', debouncedSearch)
       const result = await apiFetch(`/kakao-pipeline/accounts?${params.toString()}`)
+      if (requestId !== loadRequestRef.current) return
       setAccounts(Array.isArray(result.items) ? result.items : [])
       setTotal(Number(result.total || 0))
     } catch (error) {
@@ -726,6 +918,12 @@ export default function KakaoPipeline() {
   }, [search])
 
   useEffect(() => {
+    if (!toast) return
+    const timer = window.setTimeout(() => setToast(null), 4500)
+    return () => window.clearTimeout(timer)
+  }, [toast])
+
+  useEffect(() => {
     Promise.all([loadSettings(), loadAccounts()]).catch(error => {
       setToast({ type: 'error', text: parseError(error) })
       setLoading(false)
@@ -737,7 +935,7 @@ export default function KakaoPipeline() {
     label: string,
     path: string,
     body: Record<string, unknown> = {},
-    options?: { quiet?: boolean; checkPlusAfter?: boolean },
+    options?: { quiet?: boolean; checkPlusAfter?: boolean; refreshAfter?: boolean },
   ) => {
     if (activeRequests.current.has(accountId)) return null
     activeRequests.current.add(accountId)
@@ -750,18 +948,26 @@ export default function KakaoPipeline() {
           body: '{}',
         })
       }
-      await loadAccounts(false)
+      if (options?.refreshAfter !== false) await loadAccounts(false)
       if (!options?.quiet) setToast({ type: 'success', text: `${label}完成` })
       return result
     } catch (error) {
       if (!options?.quiet) setToast({ type: 'error', text: parseError(error) })
       await Promise.all([
-        loadAccounts(false),
+        options?.refreshAfter !== false ? loadAccounts(false) : Promise.resolve(),
         path.endsWith('/scanner') ? loadSettings() : Promise.resolve(),
       ])
       return null
     } finally {
       activeRequests.current.delete(accountId)
+      if (!options?.quiet) {
+        setDetails(current => {
+          if (!(accountId in current)) return current
+          const next = { ...current }
+          delete next[accountId]
+          return next
+        })
+      }
       setOperations(current => {
         const next = { ...current }
         delete next[accountId]
@@ -772,38 +978,42 @@ export default function KakaoPipeline() {
 
   useEffect(() => {
     const timer = window.setInterval(() => {
+      const polls: Array<Promise<unknown>> = []
       for (const account of accounts) {
         const state = account.pipeline.state
         if (!ACTIVE_POLL_STATES.has(state) || activeRequests.current.has(account.id)) continue
         if (state === 'supplier_processing') {
-          void run(
+          polls.push(run(
             account.id,
             '刷新提链',
             `/kakao-pipeline/accounts/${account.id}/supplier/poll`,
             {},
-            { quiet: true },
-          )
+            { quiet: true, refreshAfter: false },
+          ))
         } else if (state === 'scanner_processing') {
-          void run(
+          polls.push(run(
             account.id,
             '刷新扫码',
             `/kakao-pipeline/accounts/${account.id}/scanner/poll`,
             {},
-            { quiet: true, checkPlusAfter: true },
-          )
+            { quiet: true, checkPlusAfter: true, refreshAfter: false },
+          ))
         } else if (state === 'scanner_succeeded') {
-          void run(
+          polls.push(run(
             account.id,
             '检测 Plus',
             `/kakao-pipeline/accounts/${account.id}/plus/check`,
             {},
-            { quiet: true },
-          )
+            { quiet: true, refreshAfter: false },
+          ))
         }
+      }
+      if (polls.length > 0) {
+        void Promise.allSettled(polls).then(() => loadAccounts(false))
       }
     }, 3000)
     return () => window.clearInterval(timer)
-  }, [accounts, run])
+  }, [accounts, loadAccounts, run])
 
   const toggleDetail = async (accountId: number) => {
     if (expanded === accountId) {
@@ -811,10 +1021,12 @@ export default function KakaoPipeline() {
       return
     }
     setExpanded(accountId)
+    if (details[accountId]) return
     try {
       const detail = await apiFetch(`/kakao-pipeline/accounts/${accountId}`)
       setDetails(current => ({ ...current, [accountId]: detail }))
     } catch (error) {
+      setExpanded(null)
       setToast({ type: 'error', text: parseError(error) })
     }
   }
@@ -848,11 +1060,6 @@ export default function KakaoPipeline() {
     }
   }
 
-  const isAlreadyPlus = (account: KakaoAccount) => {
-    const plan = String(account.plan || '').toLowerCase()
-    return account.plan_state === 'subscribed' || ['plus', 'pro', 'team', 'business'].some(item => plan.includes(item))
-  }
-
   const renderActions = (account: KakaoAccount) => {
     const pipeline = account.pipeline
     const busy = operations[account.id]
@@ -860,19 +1067,43 @@ export default function KakaoPipeline() {
     const scannerKind = settings?.default_scanner_kind || 'scanner'
     const selectedScanner = settings?.[scannerKind]
     const scannerReady = Boolean(selectedScanner?.has_cdk)
+
+    const checkPlus = () => {
+      void run(account.id, '检测 Plus', `/kakao-pipeline/accounts/${account.id}/plus/check`)
+    }
+
+    const forceReset = () => {
+      const confirmed = window.confirm(
+        `确认强制重置 ${account.email} 的 Kakao 流水线？正在执行或卡住的任务记录也会被清除。`,
+      )
+      if (!confirmed) return
+      void run(
+        account.id,
+        '重置记录',
+        `/kakao-pipeline/accounts/${account.id}/reset`,
+        { force: true },
+      )
+    }
+
     if (busy) {
       return (
         <div className="flex items-center justify-end gap-1.5">
           <Button variant="outline" size="sm" disabled>
             <LoaderCircle className="mr-1.5 h-3.5 w-3.5 animate-spin" /> {busy}
           </Button>
-          <AccountMoreMenu accountId={account.id} onCopyCredential={copyAccountCredential} />
+          <AccountMoreMenu
+            accountId={account.id}
+            onCopyCredential={copyAccountCredential}
+            onForceReset={forceReset}
+            onCheckPlus={checkPlus}
+            actionDisabled
+          />
         </div>
       )
     }
     return (
       <div className="flex flex-wrap items-center justify-end gap-1.5">
-        {(pipeline.state === 'idle' || pipeline.state === 'supplier_failed') && !isAlreadyPlus(account) && (
+        {(pipeline.state === 'idle' || pipeline.state === 'supplier_failed') && !accountIsPlus(account) && (
           <Button
             size="sm"
             disabled={!supplierReady}
@@ -935,7 +1166,7 @@ export default function KakaoPipeline() {
             <QrCode className="mr-1.5 h-3.5 w-3.5" /> 扫码信息
           </Button>
         )}
-        {['scanner_succeeded', 'plus_pending', 'plus_check_failed', 'completed'].includes(pipeline.state) || isAlreadyPlus(account) ? (
+        {['scanner_succeeded', 'plus_pending', 'plus_check_failed', 'completed'].includes(pipeline.state) || accountIsPlus(account) ? (
           <Button
             variant="outline"
             size="sm"
@@ -944,37 +1175,38 @@ export default function KakaoPipeline() {
             <Check className="mr-1.5 h-3.5 w-3.5" /> 检测 Plus
           </Button>
         ) : null}
-        {pipeline.state !== 'idle' && !ACTIVE_POLL_STATES.has(pipeline.state) && (
-          <Button
-            variant="ghost"
-            size="sm"
-            title="清除该账号的 Kakao 操作记录"
-            onClick={() => {
-              if (!window.confirm(`确认重置 ${account.email} 的 Kakao 操作记录？`)) return
-              void run(account.id, '重置记录', `/kakao-pipeline/accounts/${account.id}/reset`)
-            }}
-          >
-            <RotateCcw className="h-3.5 w-3.5" />
-          </Button>
-        )}
-        {pipeline.state !== 'idle' && (
-          <Button variant="ghost" size="sm" onClick={() => toggleDetail(account.id)}>
-            <FileText className="mr-1.5 h-3.5 w-3.5" /> 日志
-            {expanded === account.id ? <ChevronUp className="ml-1 h-3.5 w-3.5" /> : <ChevronDown className="ml-1 h-3.5 w-3.5" />}
-          </Button>
-        )}
-        <AccountMoreMenu accountId={account.id} onCopyCredential={copyAccountCredential} />
+        <AccountMoreMenu
+          accountId={account.id}
+          onCopyCredential={copyAccountCredential}
+          onForceReset={forceReset}
+          onCheckPlus={checkPlus}
+          onShowLog={pipeline.state !== 'idle' ? () => toggleDetail(account.id) : undefined}
+        />
       </div>
     )
   }
 
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE))
+  const activeCount = accounts.filter(account => ACTIVE_POLL_STATES.has(account.pipeline.state)).length
+  const readyCount = accounts.filter(account => account.pipeline.state === 'link_ready').length
+  const errorCount = accounts.filter(account => ['supplier_failed', 'scanner_failed', 'plus_check_failed'].includes(account.pipeline.state)).length
+  const completedCount = accounts.filter(account => account.pipeline.state === 'completed' || accountIsPlus(account)).length
+  const expandedAccount = expanded === null ? null : accounts.find(account => account.id === expanded) || null
 
   return (
     <div className="space-y-5">
+      {expandedAccount ? (
+        <PipelineLogDrawer
+          account={expandedAccount}
+          detail={details[expandedAccount.id]}
+          onClose={() => setExpanded(null)}
+          onCopyLink={copyLink}
+        />
+      ) : null}
       {toast && (
         <button
           type="button"
+          aria-live="polite"
           onClick={() => setToast(null)}
           className={cn(
             'fixed right-5 top-5 z-[70] flex max-w-md items-center gap-2 rounded-lg border px-4 py-3 text-left text-sm shadow-[var(--shadow-hard)]',
@@ -996,7 +1228,7 @@ export default function KakaoPipeline() {
             </div>
             <div>
               <h1 className="text-lg font-semibold text-[var(--text-primary)]">Kakao 流水线</h1>
-              <p className="mt-0.5 text-sm text-[var(--text-muted)]">从本地账号提链，人工确认上传扫码，成功后复检 Plus。</p>
+              <p className="mt-0.5 text-sm text-[var(--text-muted)]">按账号完成提链、扫码与 Plus 复检。</p>
             </div>
           </div>
         </div>
@@ -1005,7 +1237,7 @@ export default function KakaoPipeline() {
             <RefreshCw className="mr-1.5 h-3.5 w-3.5" /> 刷新账号
           </Button>
           <Button variant={settingsOpen ? 'default' : 'outline'} size="sm" onClick={() => setSettingsOpen(value => !value)}>
-            <Settings2 className="mr-1.5 h-3.5 w-3.5" /> 接口配置
+            <Settings2 className="mr-1.5 h-3.5 w-3.5" /> 配置供应商
           </Button>
         </div>
       </header>
@@ -1015,31 +1247,24 @@ export default function KakaoPipeline() {
       )}
 
       {settings && (
-        <div className="flex flex-wrap items-center gap-x-5 gap-y-2 border-y border-[var(--border)] py-3 text-xs">
+        <div className="flex flex-wrap items-center gap-x-6 gap-y-2 border-y border-[var(--border)] py-3 text-xs">
           <div className="flex items-center gap-2">
-            <span className="text-[var(--text-muted)]">默认扫码</span>
-            <Badge variant="default">{settings[settings.default_scanner_kind].display_name}</Badge>
-          </div>
-          <div className="flex items-center gap-2">
-            <span className="text-[var(--text-muted)]">提链供应商</span>
+            <span className={cn('h-2 w-2 rounded-full', settings.supplier.has_cdk ? 'bg-emerald-500' : 'bg-amber-500')} />
+            <span className="text-[var(--text-muted)]">提链</span>
             <span className="font-medium text-[var(--text-primary)]">{settings.supplier.display_name}</span>
-            <Badge variant={settings.supplier.has_cdk ? 'success' : 'warning'}>
-              {settings.supplier.has_cdk ? `${settings.supplier.cdk_count} 个 CDK` : 'CDK 未配置'}
-            </Badge>
+            <span className="text-[var(--text-secondary)]">{settings.supplier.has_cdk ? `${settings.supplier.cdk_count} 个 CDK` : '未配置 CDK'}</span>
           </div>
           <div className="flex items-center gap-2">
-            <span className="text-[var(--text-muted)]">扫码平台</span>
-            <span className="font-medium text-[var(--text-primary)]">{settings.scanner.display_name}</span>
-            <Badge variant={settings.scanner.has_cdk ? 'success' : 'warning'}>
-              {settings.scanner.has_cdk ? `${settings.scanner.cdk_count} 个 CDK` : 'CDK 未配置'}
-            </Badge>
+            <span className={cn('h-2 w-2 rounded-full', settings[settings.default_scanner_kind].has_cdk ? 'bg-emerald-500' : 'bg-amber-500')} />
+            <span className="text-[var(--text-muted)]">扫码</span>
+            <span className="font-medium text-[var(--text-primary)]">{settings[settings.default_scanner_kind].display_name}</span>
+            <span className="text-[var(--text-secondary)]">
+              {settings[settings.default_scanner_kind].has_cdk ? `${settings[settings.default_scanner_kind].cdk_count} 个 CDK` : '未配置 CDK'}
+            </span>
           </div>
           <div className="flex items-center gap-2">
-            <span className="text-[var(--text-muted)]">备用扫码</span>
-            <span className="font-medium text-[var(--text-primary)]">{settings.scanner_546789.display_name}</span>
-            <Badge variant={settings.scanner_546789.has_cdk ? 'success' : 'warning'}>
-              {settings.scanner_546789.has_cdk ? `${settings.scanner_546789.cdk_count} 个 CDK` : 'CDK 未配置'}
-            </Badge>
+            <span className="text-[var(--text-muted)]">提链后</span>
+            <span className="font-medium text-[var(--text-primary)]">{settings.auto_upload_after_extract ? '自动上传扫码' : '人工确认上传'}</span>
           </div>
         </div>
       )}
@@ -1054,28 +1279,36 @@ export default function KakaoPipeline() {
             onChange={event => setSearch(event.target.value)}
           />
         </div>
-        <div className="text-xs text-[var(--text-muted)]">共 {total} 个账号，进行中的状态每 3 秒自动刷新</div>
+        <div className="flex flex-wrap items-center justify-end gap-x-4 gap-y-1 text-xs">
+          <span className="text-[var(--text-muted)]">本页</span>
+          {activeCount > 0 ? <span className="text-[var(--accent)]">处理中 {activeCount}</span> : null}
+          {readyCount > 0 ? <span className="text-amber-500">待上传 {readyCount}</span> : null}
+          {errorCount > 0 ? <span className="text-red-500">异常 {errorCount}</span> : null}
+          {completedCount > 0 ? <span className="text-emerald-500">已完成 {completedCount}</span> : null}
+          <span className="text-[var(--text-muted)]">共 {total} 个账号</span>
+        </div>
       </div>
 
       <div className="overflow-hidden border border-[var(--border)] bg-[var(--bg-surface)]">
         <div className="overflow-x-auto">
-          <table className="w-full min-w-[960px] text-left">
+          <table className="w-full min-w-[900px] table-fixed text-left">
+            <colgroup>
+              <col className="w-[30%]" />
+              <col className="w-[38%]" />
+              <col className="w-[32%]" />
+            </colgroup>
             <thead className="border-b border-[var(--border)] bg-[var(--bg-pane)] text-[var(--text-muted)]">
               <tr>
-                <th className="w-14 px-4 py-3">ID</th>
-                <th className="min-w-48 px-4 py-3">账号</th>
-                <th className="w-20 px-4 py-3">套餐</th>
-                <th className="min-w-36 px-4 py-3">提链状态</th>
-                <th className="min-w-36 px-4 py-3">扫码状态</th>
-                <th className="min-w-32 px-4 py-3">最终结果</th>
-                <th className="min-w-52 px-4 py-3 text-right">操作</th>
+                <th className="px-4 py-3">账号</th>
+                <th className="px-4 py-3 text-center">流程进度</th>
+                <th className="px-4 py-3 text-right">下一步</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-[var(--border-soft)]">
               {loading ? (
                 Array.from({ length: 6 }).map((_, index) => (
                   <tr key={index}>
-                    {Array.from({ length: 7 }).map((__, cell) => (
+                    {Array.from({ length: 3 }).map((__, cell) => (
                       <td key={cell} className="px-4 py-4">
                         <div className="h-4 animate-pulse rounded bg-[var(--chip-bg)]" />
                       </td>
@@ -1084,15 +1317,12 @@ export default function KakaoPipeline() {
                 ))
               ) : accounts.length === 0 ? (
                 <tr>
-                  <td colSpan={7} className="px-4 py-14 text-center text-sm text-[var(--text-muted)]">
+                  <td colSpan={3} className="px-4 py-14 text-center text-sm text-[var(--text-muted)]">
                     没有找到本地 ChatGPT 账号。
                   </td>
                 </tr>
-              ) : accounts.map(account => {
-                const detail = details[account.id]
-                return (
-                  <Fragment key={account.id}>
-                    <tr className={cn(
+              ) : accounts.map(account => (
+                    <tr key={account.id} className={cn(
                       'align-top transition-colors hover:bg-[var(--bg-hover)]',
                       account.pipeline.state === 'supplier_failed' || account.pipeline.state === 'scanner_failed'
                         ? 'bg-red-500/[0.025]'
@@ -1100,84 +1330,20 @@ export default function KakaoPipeline() {
                           ? 'bg-emerald-500/[0.025]'
                           : '',
                     )}>
-                      <td className="px-4 py-4 font-mono text-xs text-[var(--text-muted)]">{account.id}</td>
                       <td className="px-4 py-4">
-                        <div className="max-w-80 truncate text-sm font-medium text-[var(--text-primary)]" title={account.email}>
+                        <div className="max-w-full truncate text-sm font-medium text-[var(--text-primary)]" title={account.email}>
                           {account.email}
                         </div>
-                        <div className="mt-1 text-[11px] text-[var(--text-muted)]">
-                          {account.validity === 'valid' ? '账号有效' : `有效性：${account.validity || '未检测'}`}
+                        <div className="mt-1.5 flex flex-wrap items-center gap-2 text-[11px] text-[var(--text-muted)]">
+                          <span className="font-mono">#{account.id}</span>
+                          {planBadge(account)}
+                          <span>{account.validity === 'valid' ? '账号有效' : `有效性：${account.validity || '未检测'}`}</span>
                         </div>
                       </td>
-                      <td className="px-4 py-4">{planBadge(account)}</td>
-                      <td className="px-4 py-4"><SupplierState pipeline={account.pipeline} /></td>
-                      <td className="px-4 py-4"><ScannerState pipeline={account.pipeline} /></td>
-                      <td className="px-4 py-4"><FinalState pipeline={account.pipeline} account={account} /></td>
+                      <td className="px-4 py-4"><PipelineProgress account={account} /></td>
                       <td className="px-4 py-4">{renderActions(account)}</td>
                     </tr>
-                    {expanded === account.id && (
-                      <tr>
-                        <td colSpan={7} className="bg-[var(--bg-pane)] px-4 py-4">
-                          {!detail ? (
-                            <div className="flex items-center gap-2 text-xs text-[var(--text-muted)]">
-                              <LoaderCircle className="h-4 w-4 animate-spin" /> 正在读取日志
-                            </div>
-                          ) : (
-                            <div className="grid gap-4 xl:grid-cols-[minmax(280px,0.8fr)_minmax(0,1.2fr)]">
-                              <section>
-                                <h3 className="mb-2 text-xs font-semibold text-[var(--text-primary)]">操作日志</h3>
-                                <div className="max-h-72 space-y-2 overflow-y-auto pr-2">
-                                  {(detail.events || []).length === 0 ? (
-                                    <p className="text-xs text-[var(--text-muted)]">暂无日志</p>
-                                  ) : [...(detail.events || [])].reverse().map((event, index) => (
-                                    <div key={`${event.time}-${index}`} className="flex gap-3 text-xs">
-                                      <span className="shrink-0 font-mono text-[var(--text-muted)]">
-                                        {new Date(event.time).toLocaleTimeString()}
-                                      </span>
-                                      <span className={event.level === 'error' ? 'text-red-500' : event.level === 'warning' ? 'text-amber-500' : 'text-[var(--text-secondary)]'}>
-                                        {event.message}
-                                      </span>
-                                    </div>
-                                  ))}
-                                </div>
-                              </section>
-                              <section className="min-w-0">
-                                <h3 className="mb-2 text-xs font-semibold text-[var(--text-primary)]">脱敏响应</h3>
-                                <div className="grid gap-3 lg:grid-cols-2">
-                                  <div className="min-w-0">
-                                    <div className="mb-1 text-[11px] text-[var(--text-muted)]">供应商</div>
-                                    <pre className="max-h-64 overflow-auto rounded-md bg-[var(--bg-input)] p-3 font-mono text-[11px] leading-5 text-[var(--text-secondary)]">
-                                      {JSON.stringify(detail.supplier_response || {}, null, 2)}
-                                    </pre>
-                                  </div>
-                                  <div className="min-w-0">
-                                    <div className="mb-1 text-[11px] text-[var(--text-muted)]">扫码平台</div>
-                                    <pre className="max-h-64 overflow-auto rounded-md bg-[var(--bg-input)] p-3 font-mono text-[11px] leading-5 text-[var(--text-secondary)]">
-                                      {JSON.stringify(detail.scanner_response || {}, null, 2)}
-                                    </pre>
-                                  </div>
-                                </div>
-                                {detail.payment_url && (
-                                  <div className="mt-3 flex min-w-0 items-center gap-2 text-xs">
-                                    <span className="shrink-0 text-[var(--text-muted)]">Kakao 长链</span>
-                                    <code className="min-w-0 flex-1 truncate text-[var(--text-secondary)]">{detail.payment_url}</code>
-                                    <Button variant="outline" size="sm" onClick={() => copyLink(detail.payment_url || '')}>
-                                      <Copy className="h-3.5 w-3.5" />
-                                    </Button>
-                                    <Button variant="outline" size="sm" onClick={() => window.open(detail.payment_url, '_blank', 'noopener,noreferrer')}>
-                                      <ExternalLink className="h-3.5 w-3.5" />
-                                    </Button>
-                                  </div>
-                                )}
-                              </section>
-                            </div>
-                          )}
-                        </td>
-                      </tr>
-                    )}
-                  </Fragment>
-                )
-              })}
+              ))}
             </tbody>
           </table>
         </div>
