@@ -135,6 +135,12 @@ def _task_account_keys(task_type: str, payload: dict[str, Any]) -> list[str]:
             if int(item or 0) > 0
         ]
     if task_type == TASK_TYPE_ACCOUNT_PUSH:
+        # OAuth-created pushes are only enqueued after that account's Codex
+        # credentials have been committed.  The enclosing batch task keeps
+        # every selected account key busy until the whole batch finishes, so
+        # retaining the key here would unnecessarily delay completed accounts.
+        if str(payload.get("source") or "") == "codex_oauth":
+            return []
         return [
             f"account:{int(item)}"
             for item in payload.get("account_ids", [])
@@ -148,6 +154,15 @@ def _task_scope(task_type: str, platform: str, payload: dict[str, Any]) -> str:
         account_id = int(payload.get("account_id", 0) or 0)
         if account_id > 0:
             return f"{platform}:{task_type}:codex_oauth_authorize:{account_id}"
+    if task_type == TASK_TYPE_ACCOUNT_PUSH and str(payload.get("source") or "") == "codex_oauth":
+        account_ids = [
+            int(item)
+            for item in payload.get("account_ids", [])
+            if int(item or 0) > 0
+        ]
+        if len(account_ids) == 1:
+            target_key = str(payload.get("target_key") or "default")
+            return f"{platform}:{task_type}:{target_key}:{account_ids[0]}"
     return f"{platform}:{task_type}"
 
 
