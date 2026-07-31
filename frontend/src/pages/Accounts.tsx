@@ -481,7 +481,7 @@ function RegisterModal({
           proxy: platformProxyMode === 'manual' ? platformProxyValue.trim() || null : null,
           platform_proxy_mode: platformProxyMode,
           platform_proxy_value: platformProxyValue.trim(),
-          mailbox_proxy_mode: 'follow_platform',
+          mailbox_proxy_mode: 'direct',
           mailbox_proxy_value: '',
           extra,
         }),

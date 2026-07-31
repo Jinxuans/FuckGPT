@@ -32,6 +32,10 @@ class RegisterTaskRequest(BaseModel):
 @router.post("/register")
 def create_register_task(body: RegisterTaskRequest):
     payload = body.model_dump()
+    # Mailbox and other provider APIs deliberately stay on the local network.
+    # Do not allow a browser proxy selection to leak into those integrations.
+    payload["mailbox_proxy_mode"] = "direct"
+    payload["mailbox_proxy_value"] = ""
     extra = dict(body.extra or {})
     extra["identity_provider"] = "mailbox"
     mail_provider = str(extra.get("mail_provider") or "").strip()

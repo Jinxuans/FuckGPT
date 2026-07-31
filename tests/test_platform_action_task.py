@@ -342,7 +342,7 @@ def test_register_task_cancel_stops_scheduling_new_workers(monkeypatch):
     assert logger.finished == (tasks_module.TASK_STATUS_CANCELLED, "任务已取消")
 
 
-def test_register_task_separates_platform_and_mailbox_proxies(monkeypatch):
+def test_register_task_forces_mailbox_api_direct_and_hides_proxy_log(monkeypatch):
     captured = {}
 
     class FakePlatform:
@@ -383,7 +383,7 @@ def test_register_task_separates_platform_and_mailbox_proxies(monkeypatch):
             "password": "Secret123!",
             "platform_proxy_mode": "manual",
             "platform_proxy_value": "socks5://user:pass@proxy.example:1080",
-            "mailbox_proxy_mode": "direct",
+            "mailbox_proxy_mode": "follow_platform",
             "extra": {"identity_provider": "mailbox"},
         },
         logger,
@@ -393,6 +393,11 @@ def test_register_task_separates_platform_and_mailbox_proxies(monkeypatch):
     assert captured["platform_proxy"] == "socks5://user:pass@proxy.example:1080"
     assert captured["mailbox_proxy"] is None
     assert captured["mailbox_factory_proxy"] is None
+    assert not any(
+        "邮箱 API 代理" in str(event[1])
+        for event in logger.events
+        if event[0] == "log"
+    )
 
 
 def test_register_api_preserves_protocol_outlook_pool(client, monkeypatch):
@@ -422,6 +427,8 @@ def test_register_api_preserves_protocol_outlook_pool(client, monkeypatch):
     assert captured["extra"]["mail_provider"] == "local_ms_pool"
     assert captured["extra"]["local_ms_pool_text"] == pool_text
     assert captured["extra"]["local_ms_pool_alias_count"] == 6
+    assert captured["mailbox_proxy_mode"] == "direct"
+    assert captured["mailbox_proxy_value"] == ""
 
 
 def test_register_api_allows_six_outlook_child_addresses_per_parent(client, monkeypatch):
