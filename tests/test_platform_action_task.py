@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import threading
 
+import requests
+
 from application import tasks as tasks_module
 from core.base_platform import Account
 from domain.actions import ActionExecutionResult
@@ -398,6 +400,146 @@ def test_register_task_forces_mailbox_api_direct_and_hides_proxy_log(monkeypatch
         for event in logger.events
         if event[0] == "log"
     )
+
+
+def test_register_task_gives_each_worker_an_independent_proxy(monkeypatch):
+    captured_proxies = []
+    acquired = []
+    lock = threading.Lock()
+
+    class Lease:
+        def __init__(self, url):
+            self.url = url
+
+        def report_success(self):
+            pass
+
+        def report_failure(self):
+            pass
+
+        def release(self):
+            pass
+
+    class FakePlatform:
+        def __init__(self, proxy):
+            self.proxy = proxy
+
+        def register(self, email=None, password=None):
+            return Account(
+                platform="chatgpt",
+                email=f"{self.proxy.rsplit(':', 1)[-1]}@example.com",
+                password=password or "Secret123!",
+                user_id=self.proxy,
+                extra={"access_token": "access-token"},
+            )
+
+    def fake_acquire(**_kwargs):
+        with lock:
+            index = len(acquired) + 1
+            lease = Lease(f"http://10.0.0.{index}:800{index}")
+            acquired.append(lease)
+            return lease
+
+    def fake_build_platform_instance(*args, **kwargs):
+        proxy = kwargs.get("platform_proxy")
+        with lock:
+            captured_proxies.append(proxy)
+        return FakePlatform(proxy)
+
+    monkeypatch.setattr(tasks_module, "get", lambda platform_name: object)
+    monkeypatch.setattr(tasks_module, "_build_platform_instance", fake_build_platform_instance)
+    monkeypatch.setattr(
+        tasks_module,
+        "save_account",
+        lambda account, **kwargs: type("SavedAccount", (), {"id": len(captured_proxies)})(),
+    )
+    monkeypatch.setattr("core.base_mailbox.create_mailbox", lambda *args, **kwargs: object())
+    monkeypatch.setattr("core.worker_proxy.worker_proxy_manager.acquire", fake_acquire)
+    monkeypatch.setattr("core.worker_proxy.worker_proxy_manager.clear_scope", lambda scope_id: None)
+
+    logger = _FakeLogger()
+    tasks_module._execute_register_task(
+        {
+            "count": 3,
+            "concurrency": 3,
+            "platform_proxy_mode": "proxy_service",
+            "extra": {"identity_provider": "mailbox"},
+        },
+        logger,
+    )
+
+    assert logger.finished == (tasks_module.TASK_STATUS_SUCCEEDED, "")
+    assert len(acquired) == 3
+    assert len(set(captured_proxies)) == 3
+
+
+def test_register_worker_replaces_proxy_after_network_failure(monkeypatch):
+    acquired = []
+
+    class Lease:
+        def __init__(self, url):
+            self.url = url
+            self.failed = False
+
+        def report_success(self):
+            pass
+
+        def report_failure(self):
+            self.failed = True
+
+        def release(self):
+            pass
+
+    class FakePlatform:
+        def __init__(self, proxy):
+            self.proxy = proxy
+
+        def register(self, email=None, password=None):
+            if self.proxy.endswith(":8001"):
+                raise requests.exceptions.ProxyError("Unable to connect to proxy")
+            return Account(
+                platform="chatgpt",
+                email="ok@example.com",
+                password="Secret123!",
+                user_id="acct-ok",
+                extra={"access_token": "access-token"},
+            )
+
+    def fake_acquire(**_kwargs):
+        lease = Lease(f"http://10.0.0.{len(acquired) + 1}:800{len(acquired) + 1}")
+        acquired.append(lease)
+        return lease
+
+    monkeypatch.setattr(tasks_module, "get", lambda platform_name: object)
+    monkeypatch.setattr(
+        tasks_module,
+        "_build_platform_instance",
+        lambda *args, **kwargs: FakePlatform(kwargs.get("platform_proxy")),
+    )
+    monkeypatch.setattr(
+        tasks_module,
+        "save_account",
+        lambda account, **kwargs: type("SavedAccount", (), {"id": 123})(),
+    )
+    monkeypatch.setattr("core.base_mailbox.create_mailbox", lambda *args, **kwargs: object())
+    monkeypatch.setattr("core.worker_proxy.worker_proxy_manager.acquire", fake_acquire)
+    monkeypatch.setattr("core.worker_proxy.worker_proxy_manager.clear_scope", lambda scope_id: None)
+
+    logger = _FakeLogger()
+    tasks_module._execute_register_task(
+        {
+            "count": 1,
+            "concurrency": 1,
+            "platform_proxy_mode": "proxy_service",
+            "extra": {"identity_provider": "mailbox"},
+        },
+        logger,
+    )
+
+    assert logger.finished == (tasks_module.TASK_STATUS_SUCCEEDED, "")
+    assert len(acquired) == 2
+    assert acquired[0].failed is True
+    assert any("换 IP 重试 (2/3)" in str(event[1]) for event in logger.events)
 
 
 def test_register_api_preserves_protocol_outlook_pool(client, monkeypatch):
@@ -800,3 +942,21 @@ def test_platform_runtime_resolves_action_proxy_service(monkeypatch):
     assert result.ok is True
     assert seen["proxy"] == "http://pool-proxy:8080"
     assert seen["extra"]["disable_proxy_pool"] is False
+
+
+def test_platform_runtime_proxy_service_never_silently_uses_direct(monkeypatch):
+    monkeypatch.setattr(runtime_module, "load_all", lambda: None)
+    monkeypatch.setattr(runtime_module, "get", lambda platform: object)
+    monkeypatch.setattr("core.proxy_pool.proxy_pool.get_next", lambda: None)
+
+    result = runtime_module.PlatformRuntime().execute_action(
+        ActionExecutionCommand(
+            platform="chatgpt",
+            account_id=123,
+            action_id="query_state",
+            params={"platform_proxy_mode": "proxy_service"},
+        )
+    )
+
+    assert result.ok is False
+    assert result.error == "代理服务未返回可用代理"

@@ -248,6 +248,35 @@ def test_chatgpt_check_valid_uses_proxy_pool_before_direct(monkeypatch):
     assert plugin.get_last_check_overview()["chatgpt_usage"] == {"plan_type": "free"}
 
 
+def test_chatgpt_check_valid_strict_proxy_does_not_fall_back_to_direct(monkeypatch):
+    calls: list[str | None] = []
+
+    def _fake_status(account, proxy=None):
+        calls.append(proxy)
+        raise RuntimeError("net::ERR_PROXY_CONNECTION_FAILED")
+
+    monkeypatch.setattr(subscription, "fetch_subscription_status_details", _fake_status)
+    plugin = ChatGPTPlatform.__new__(ChatGPTPlatform)
+    plugin.config = RegisterConfig(
+        proxy="http://127.0.0.1:7890",
+        extra={"strict_proxy": True},
+    )
+    plugin.mailbox = None
+    account = type(
+        "AccountStub",
+        (),
+        {
+            "token": "token",
+            "region": "",
+            "extra": {"access_token": "token", "id_token": "", "cookies": ""},
+        },
+    )()
+
+    with pytest.raises(RuntimeError, match="ERR_PROXY_CONNECTION_FAILED"):
+        plugin.check_valid(account)
+    assert calls == ["http://127.0.0.1:7890"]
+
+
 def test_chatgpt_check_valid_uses_usage_plan_and_masks_phone(monkeypatch):
     def _fake_status(account, proxy=None):
         return {

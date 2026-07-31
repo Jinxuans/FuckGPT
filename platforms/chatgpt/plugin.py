@@ -497,6 +497,7 @@ class ChatGPTPlatform(BasePlatform):
             region = str(getattr(account, "region", "") or extra.get("region", "") or "").strip()
             configured_proxy = self.config.proxy if self.config else None
             disable_proxy_pool = _truthy((self.config.extra or {}).get("disable_proxy_pool")) if self.config else False
+            strict_proxy = _truthy((self.config.extra or {}).get("strict_proxy")) if self.config else False
             proxy_candidates: list[tuple[str | None, bool]] = []
             if configured_proxy:
                 proxy_candidates.append((configured_proxy, False))
@@ -504,8 +505,10 @@ class ChatGPTPlatform(BasePlatform):
                 pooled_proxy = proxy_pool.get_next(region=region)
                 if pooled_proxy:
                     proxy_candidates.append((pooled_proxy, True))
-            proxy_candidates.append((None, False))
+            if not strict_proxy:
+                proxy_candidates.append((None, False))
 
+            last_error: Exception | None = None
             for proxy, should_report in proxy_candidates:
                 try:
                     details = fetch_subscription_status_details(a, proxy=proxy)
@@ -522,11 +525,16 @@ class ChatGPTPlatform(BasePlatform):
                     )
                     self._last_check_overview = overview
                     return valid
-                except Exception:
+                except Exception as exc:
+                    last_error = exc
                     if should_report and proxy:
                         proxy_pool.report_fail(proxy)
                     continue
+            if strict_proxy and last_error is not None:
+                raise last_error
         except Exception:
+            if self.config and _truthy((self.config.extra or {}).get("strict_proxy")):
+                raise
             return False
         return False
 

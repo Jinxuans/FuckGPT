@@ -809,6 +809,13 @@ _BUILTIN_DEFINITIONS: list[dict] = [
             {"key": "proxy_protocol", "label": "协议", "placeholder": "http / socks5"},
             {"key": "proxy_username", "label": "用户名 (可选)"},
             {"key": "proxy_password", "label": "密码 (可选)", "secret": True},
+            {"key": "proxy_acquire_max_attempts", "label": "代理提取最大尝试次数", "default_value": "8", "category": "connection"},
+            {"key": "proxy_acquire_retry_delay", "label": "代理提取重试间隔秒", "default_value": "1", "category": "connection"},
+            {"key": "proxy_replace_max_attempts", "label": "代理故障换 IP 轮次", "default_value": "3", "category": "connection", "hint": "包含首次代理；仅网络或代理异常触发换 IP。"},
+            {"key": "proxy_preflight_enabled", "label": "Worker 启动前检测代理", "type": "toggle", "default_value": "true", "category": "connection"},
+            {"key": "proxy_preflight_timeout", "label": "代理检测超时秒", "default_value": "8", "category": "connection"},
+            {"key": "proxy_preflight_max_latency_ms", "label": "最大允许延迟毫秒", "default_value": "5000", "category": "connection", "hint": "检测 HTTPS 出口耗时，超过此值自动换节点。"},
+            {"key": "proxy_preflight_url", "label": "自定义出口检测地址", "placeholder": "留空使用 Cloudflare Trace，失败回退 api64.ipify.org", "category": "advanced"},
         ],
     },
     {
@@ -823,6 +830,13 @@ _BUILTIN_DEFINITIONS: list[dict] = [
         "auth_modes": [],
         "fields": [
             {"key": "proxy_gateway_url", "label": "网关地址", "placeholder": "http://user:pass@gate.example.com:7777"},
+            {"key": "proxy_acquire_max_attempts", "label": "代理获取最大尝试次数", "default_value": "8", "category": "connection"},
+            {"key": "proxy_acquire_retry_delay", "label": "代理获取重试间隔秒", "default_value": "1", "category": "connection"},
+            {"key": "proxy_replace_max_attempts", "label": "代理故障换节点轮次", "default_value": "3", "category": "connection", "hint": "包含首次代理；仅网络或代理异常触发。"},
+            {"key": "proxy_preflight_enabled", "label": "Worker 启动前检测代理", "type": "toggle", "default_value": "true", "category": "connection"},
+            {"key": "proxy_preflight_timeout", "label": "代理检测超时秒", "default_value": "8", "category": "connection"},
+            {"key": "proxy_preflight_max_latency_ms", "label": "最大允许延迟毫秒", "default_value": "5000", "category": "connection", "hint": "检测 HTTPS 出口耗时，超过此值自动换节点。"},
+            {"key": "proxy_preflight_url", "label": "自定义出口检测地址", "placeholder": "留空使用 Cloudflare Trace，失败回退 api64.ipify.org", "category": "advanced"},
         ],
     },
     # ── temporary Kakao pipeline ────────────────────────────────────

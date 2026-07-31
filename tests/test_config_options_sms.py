@@ -59,6 +59,14 @@ def test_config_options_exposes_proxy_catalog(client):
     assert "proxy_drivers" in data
     provider_keys = {item["value"] for item in data["proxy_providers"]}
     assert {"api_extract", "rotating_gateway"}.issubset(provider_keys)
+    for provider in data["proxy_providers"]:
+        fields = {item["key"]: item for item in provider["fields"]}
+        assert fields["proxy_acquire_max_attempts"]["default_value"] == "8"
+        assert fields["proxy_acquire_retry_delay"]["default_value"] == "1"
+        assert fields["proxy_replace_max_attempts"]["default_value"] == "3"
+        assert fields["proxy_preflight_enabled"]["default_value"] == "true"
+        assert fields["proxy_preflight_timeout"]["default_value"] == "8"
+        assert fields["proxy_preflight_max_latency_ms"]["default_value"] == "5000"
 
 
 def test_sms_provider_test_fetches_balance_without_purchase(client, monkeypatch):
@@ -186,12 +194,13 @@ def test_fivesim_provider_test_uses_registry_balance(client, monkeypatch):
 def test_proxy_provider_test_masks_credentials_and_checks_origin(client, monkeypatch):
     class FakeResponse:
         status_code = 200
+        text = "fl=1\nip=203.0.113.10\nloc=JP\n"
 
         def raise_for_status(self):
             return None
 
         def json(self):
-            return {"origin": "203.0.113.10"}
+            raise ValueError
 
     calls = []
 
@@ -217,15 +226,17 @@ def test_proxy_provider_test_masks_credentials_and_checks_origin(client, monkeyp
     data = resp.json()
     assert data["ok"] is True
     assert data["origin"] == "203.0.113.10"
+    assert isinstance(data["latency_ms"], int)
+    assert data["check_endpoint"] == "https://www.cloudflare.com/cdn-cgi/trace"
     assert data["proxy"] == "socks5://***:***@gate.example.com:1080"
     assert "user:pass" not in data["message"]
     assert calls == [
         {
-            "url": "https://httpbin.org/ip",
+            "url": "https://www.cloudflare.com/cdn-cgi/trace",
             "proxies": {
                 "http": "socks5://user:pass@gate.example.com:1080",
                 "https": "socks5://user:pass@gate.example.com:1080",
             },
-            "timeout": 12,
+            "timeout": 8.0,
         }
     ]
