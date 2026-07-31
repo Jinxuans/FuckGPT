@@ -37,6 +37,7 @@ TASK_TYPE_REGISTER = "register"
 TASK_TYPE_ACCOUNT_CHECK_ALL = "account_check_all"
 TASK_TYPE_PLATFORM_ACTION = "platform_action"
 TASK_TYPE_CODEX_OAUTH_BATCH = "codex_oauth_batch"
+TASK_TYPE_ACCOUNT_PUSH = "account_push"
 
 TASK_STATUS_PENDING = "pending"
 TASK_STATUS_CLAIMED = "claimed"
@@ -128,6 +129,12 @@ def _task_account_keys(task_type: str, payload: dict[str, Any]) -> list[str]:
         if account_id > 0:
             return [f"account:{account_id}"]
     if task_type == TASK_TYPE_CODEX_OAUTH_BATCH:
+        return [
+            f"account:{int(item)}"
+            for item in payload.get("account_ids", [])
+            if int(item or 0) > 0
+        ]
+    if task_type == TASK_TYPE_ACCOUNT_PUSH:
         return [
             f"account:{int(item)}"
             for item in payload.get("account_ids", [])
@@ -281,6 +288,83 @@ def create_codex_oauth_batch_task(
         },
         progress_total=len(normalized_ids),
     )
+
+
+def create_account_push_task(
+    *,
+    platform: str,
+    account_ids: list[int],
+    target_key: str,
+    payload_format: str,
+    source: str = "manual",
+) -> dict[str, Any]:
+    normalized_ids = [int(item) for item in account_ids or [] if int(item or 0) > 0]
+    return create_task(
+        task_type=TASK_TYPE_ACCOUNT_PUSH,
+        platform=platform,
+        payload={
+            "platform": platform,
+            "account_ids": normalized_ids,
+            "target_key": str(target_key or ""),
+            "payload_format": str(payload_format or ""),
+            "source": str(source or "manual"),
+        },
+        progress_total=len(normalized_ids),
+    )
+
+
+def enqueue_nvtokens_push_after_codex_oauth(
+    account_id: int,
+    *,
+    platform: str = "chatgpt",
+) -> dict[str, Any]:
+    """Best-effort enqueue for the optional OAuth post-action.
+
+    This helper deliberately absorbs configuration and persistence failures so
+    a completed OAuth flow can never be changed into a failed authorization.
+    """
+    try:
+        from infrastructure.provider_settings_repository import ProviderSettingsRepository
+
+        normalized_account_id = int(account_id or 0)
+        if normalized_account_id <= 0:
+            return {"enqueued": False, "reason": "invalid_account"}
+
+        settings = ProviderSettingsRepository()
+        setting = settings.get_by_key("push", "nvtokens")
+        if not setting or not bool(setting.enabled):
+            return {"enqueued": False, "reason": "target_disabled"}
+
+        runtime = settings.resolve_runtime_settings("push", "nvtokens")
+        auto_push = str(runtime.get("nvtokens_auto_push_after_codex_oauth") or "").strip().lower()
+        if auto_push not in {"1", "true", "yes", "on", "是", "开启", "启用"}:
+            return {"enqueued": False, "reason": "auto_push_disabled"}
+        from providers.push.nvtokens import NVTokensPushProvider
+
+        if NVTokensPushProvider.from_config(runtime).configuration_error():
+            return {"enqueued": False, "reason": "target_not_configured"}
+
+        task = create_account_push_task(
+            platform=platform or "chatgpt",
+            account_ids=[normalized_account_id],
+            target_key="nvtokens",
+            payload_format="codex",
+            source="codex_oauth",
+        )
+        return {"enqueued": True, "task_id": task["id"]}
+    except Exception as exc:  # noqa: BLE001 - OAuth success must remain isolated.
+        return {"enqueued": False, "reason": "enqueue_failed", "error": str(exc)}
+
+
+def _log_codex_auto_push_enqueue(account_id: int, logger: "TaskLogger", *, platform: str = "chatgpt") -> None:
+    outcome = enqueue_nvtokens_push_after_codex_oauth(account_id, platform=platform)
+    if outcome.get("enqueued"):
+        logger.log(f"账号 {account_id}: 已创建 NexusVault 后台推送任务")
+    elif outcome.get("error"):
+        logger.log(
+            f"账号 {account_id}: NexusVault 自动推送任务创建失败，不影响 Codex OAuth: {outcome['error']}",
+            level="warning",
+        )
 
 
 def get_task(task_id: str) -> Optional[dict[str, Any]]:
@@ -806,6 +890,7 @@ def execute_task(task_id: str) -> None:
         TASK_TYPE_ACCOUNT_CHECK_ALL: _execute_account_check_all_task,
         TASK_TYPE_PLATFORM_ACTION: _execute_platform_action_task,
         TASK_TYPE_CODEX_OAUTH_BATCH: _execute_codex_oauth_batch_task,
+        TASK_TYPE_ACCOUNT_PUSH: _execute_account_push_task,
     }
     handler = handlers.get(task_type)
     if not handler:
@@ -1103,6 +1188,7 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
             if post_codex_oauth:
                 if post_codex_oauth.get("ok"):
                     logger.log(f"{account.email} 的 Codex OAuth 授权已完成")
+                    _log_codex_auto_push_enqueue(saved_account_id, logger, platform="chatgpt")
                 else:
                     logger.log(
                         f"{account.email} 注册成功，但 Codex OAuth 授权失败: {post_codex_oauth.get('error') or 'unknown'}",
@@ -1265,6 +1351,8 @@ def _execute_platform_action_task(payload: dict[str, Any], logger: TaskLogger) -
         logger.record_error(result.error)
         logger.finish(TASK_STATUS_FAILED, error=result.error)
         return
+    if action_id == "codex_oauth_authorize":
+        _log_codex_auto_push_enqueue(account_id, logger, platform=command_platform)
     logger.set_result_data(result.data)
     message = ""
     if isinstance(result.data, dict):
@@ -1445,6 +1533,7 @@ def _execute_codex_oauth_batch_task(payload: dict[str, Any], logger: TaskLogger)
                 completed += 1
                 if result.get("ok"):
                     success += 1
+                    _log_codex_auto_push_enqueue(int(result["account_id"]), logger, platform=platform)
                 else:
                     errors.append(str(result.get("error") or "unknown"))
                 results.append(result)
@@ -1475,6 +1564,53 @@ def _execute_codex_oauth_batch_task(payload: dict[str, Any], logger: TaskLogger)
     logger.log(f"Codex OAuth 批量授权完成: 成功 {success} 个, 失败 {len(errors)} 个", event_type="summary")
     final_status = TASK_STATUS_FAILED if errors and success == 0 else TASK_STATUS_SUCCEEDED
     logger.finish(final_status, error=errors[0] if final_status == TASK_STATUS_FAILED else "")
+
+
+def _execute_account_push_task(payload: dict[str, Any], logger: TaskLogger) -> None:
+    from application.account_pushes import AccountPushService
+    from domain.accounts import AccountExportSelection
+
+    platform = str(payload.get("platform") or "chatgpt")
+    account_ids = [
+        int(item)
+        for item in payload.get("account_ids", [])
+        if int(item or 0) > 0
+    ]
+    target_key = str(payload.get("target_key") or "")
+    payload_format = str(payload.get("payload_format") or "")
+    logger.set_progress(0, len(account_ids))
+    try:
+        result = AccountPushService().push_accounts(
+            AccountExportSelection(platform=platform, ids=account_ids),
+            target_key=target_key,
+            payload_format=payload_format,
+        )
+    except Exception as exc:  # noqa: BLE001
+        error = str(exc)
+        logger.record_error(error)
+        logger.log(f"账号后台推送失败: {error}", level="error")
+        logger.finish(TASK_STATUS_FAILED, error=error)
+        return
+
+    for item in result.get("results", []):
+        if item.get("ok"):
+            logger.record_success()
+        else:
+            logger.record_error(str(item.get("error") or "推送失败"))
+    logger.set_progress(len(result.get("results", [])), len(account_ids))
+    logger.set_result_data(result)
+    logger.log(
+        f"后台推送完成: 成功 {result.get('succeeded', 0)} 个, 失败 {result.get('failed', 0)} 个",
+        event_type="summary",
+    )
+    if result.get("ok"):
+        logger.finish(TASK_STATUS_SUCCEEDED)
+    else:
+        first_error = next(
+            (str(item.get("error") or "") for item in result.get("results", []) if not item.get("ok")),
+            "推送失败",
+        )
+        logger.finish(TASK_STATUS_FAILED, error=first_error)
 
 
 def _execute_account_check_all_task(payload: dict[str, Any], logger: TaskLogger) -> None:
