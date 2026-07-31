@@ -112,7 +112,11 @@ def test_codex_auto_push_only_enqueues_when_enabled_and_configured():
         }
     assert tasks_module._task_account_keys(
         tasks_module.TASK_TYPE_ACCOUNT_PUSH,
-        {"account_ids": [42]},
+        {"account_ids": [42], "source": "codex_oauth"},
+    ) == []
+    assert tasks_module._task_account_keys(
+        tasks_module.TASK_TYPE_ACCOUNT_PUSH,
+        {"account_ids": [42], "source": "manual"},
     ) == ["account:42"]
 
 
