@@ -540,6 +540,43 @@ def test_existing_account_otp_success_does_not_persist_rejected_password(monkeyp
     assert result["registration_auth_mode"] == "email_otp"
 
 
+def test_browser_register_isolated_serializes_config_and_callbacks(monkeypatch):
+    captured = {}
+    otp_callback = lambda: "123456"
+
+    def fake_run(call, **kwargs):
+        captured["call"] = call
+        captured["kwargs"] = kwargs
+        return {"ok": True}
+
+    monkeypatch.setattr("core.isolated_worker.run_isolated_call", fake_run)
+    worker = ChatGPTBrowserRegister(
+        headless=True,
+        proxy="http://127.0.0.1:8080",
+        otp_callback=otp_callback,
+        worker_idle_timeout=75,
+        worker_hard_timeout=700,
+    )
+
+    result = worker.run_isolated("user@example.com", "password", password_provided=False)
+
+    assert result == {"ok": True}
+    assert captured["call"].callable_path.endswith(":_run_chatgpt_browser_process")
+    child_config = captured["call"].args[0]
+    assert child_config["init"]["proxy"] == "http://127.0.0.1:8080"
+    assert child_config["callbacks"]["otp"] is True
+    assert captured["kwargs"]["callbacks"]["otp"] is otp_callback
+    assert captured["kwargs"]["idle_timeout"] == 75
+    assert captured["kwargs"]["hard_timeout"] == 700
+
+
+def test_browser_register_total_deadline_is_disabled_by_default():
+    worker = ChatGPTBrowserRegister(headless=True)
+
+    assert worker.worker_idle_timeout == 120
+    assert worker.worker_hard_timeout == 0
+
+
 def test_signup_authorize_retries_csrf_without_repeating_email_submission(monkeypatch):
     csrf_values = iter(["", "", "csrf-token"])
     calls = []

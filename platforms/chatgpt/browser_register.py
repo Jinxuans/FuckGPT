@@ -3505,6 +3505,9 @@ class ChatGPTBrowserRegister:
         keep_browser_open: bool = False,
         prefer_password_registration: bool = False,
         existing_account_callback: Optional[Callable[..., None]] = None,
+        cancel_check: Optional[Callable[[], bool]] = None,
+        worker_idle_timeout: float = 120,
+        worker_hard_timeout: float = 0,
         log_fn: Callable[[str], None] = print,
         backend_config: Optional[BrowserBackendConfig] = None,
     ):
@@ -3517,6 +3520,14 @@ class ChatGPTBrowserRegister:
         self.keep_browser_open = bool(keep_browser_open)
         self.prefer_password_registration = bool(prefer_password_registration)
         self.existing_account_callback = existing_account_callback
+        self.cancel_check = cancel_check if callable(cancel_check) else (lambda: False)
+        self.worker_idle_timeout = max(float(worker_idle_timeout or 120), 1.0)
+        configured_hard_timeout = float(worker_hard_timeout or 0)
+        self.worker_hard_timeout = (
+            max(configured_hard_timeout, self.worker_idle_timeout)
+            if configured_hard_timeout > 0
+            else 0.0
+        )
         self.log = log_fn
         # backend_config 为 None 时默认 Camoufox，跟老调用方一致。
         # BitBrowser 路径需要上层 plugin.py 显式传 backend_config。
@@ -3529,6 +3540,73 @@ class ChatGPTBrowserRegister:
                 f"(profile={self.backend_config.bit_profile_id}, "
                 f"window_mode={self.backend_config.window_mode})"
             )
+
+    def run_isolated(self, email: str, password: str, *, password_provided: bool = True) -> dict:
+        """Run the browser state machine in a watchdog-supervised process.
+
+        Playwright/Camoufox protocol calls can become permanently blocked after
+        a driver crash.  The parent cannot stop a Python thread in that state,
+        but it can terminate this disposable process and its browser children.
+        """
+        if self.keep_browser_open and not self.backend_config.is_headless:
+            self.log("完成后保留浏览器窗口与独立子进程不兼容，本次使用进程内浏览器模式")
+            return self.run(email, password, password_provided=password_provided)
+
+        from core.isolated_worker import IsolatedCall, run_isolated_call
+
+        callback_flags = {
+            "otp": callable(self.otp_callback),
+            "phone": callable(self.codex_phone_callback),
+            "existing_account": callable(self.existing_account_callback),
+        }
+        phone_attribute_values = {}
+        if callable(self.codex_phone_callback):
+            phone_attribute_values["phone_max_attempts"] = int(
+                getattr(self.codex_phone_callback, "phone_max_attempts", 3) or 3
+            )
+        config = {
+            "init": {
+                "headless": self.headless,
+                "proxy": self.proxy,
+                "post_codex_oauth": self.post_codex_oauth,
+                "codex_oauth_timeout": self.codex_oauth_timeout,
+                "keep_browser_open": False,
+                "prefer_password_registration": self.prefer_password_registration,
+            },
+            "backend_config": {
+                "backend": self.backend_config.backend,
+                "window_mode": self.backend_config.window_mode,
+                "bit_profile_id": self.backend_config.bit_profile_id,
+                "bit_api_url": self.backend_config.bit_api_url,
+                "bit_api_token": self.backend_config.bit_api_token,
+            },
+            "callbacks": callback_flags,
+            "phone_attribute_values": phone_attribute_values,
+            "run": {
+                "email": email,
+                "password": password,
+                "password_provided": bool(password_provided),
+            },
+        }
+        callbacks = {}
+        if callback_flags["otp"]:
+            callbacks["otp"] = self.otp_callback
+        if callback_flags["phone"]:
+            callbacks["phone"] = self.codex_phone_callback
+        if callback_flags["existing_account"]:
+            callbacks["existing_account"] = self.existing_account_callback
+
+        return run_isolated_call(
+            IsolatedCall(
+                callable_path="platforms.chatgpt.browser_register:_run_chatgpt_browser_process",
+                args=(config,),
+            ),
+            callbacks=callbacks,
+            log_fn=self.log,
+            cancel_check=self.cancel_check,
+            idle_timeout=self.worker_idle_timeout,
+            hard_timeout=self.worker_hard_timeout,
+        )
 
     def _open_browser(self, launch_opts: dict):
         """与业务代码代期使用的 ``with Camoufox(**launch_opts) as browser:`` 接口
@@ -3630,3 +3708,35 @@ class ChatGPTBrowserRegister:
                 self.log("浏览器窗口已保留，可手动关闭")
             else:
                 browser_context.__exit__(*sys.exc_info())
+
+
+def _run_chatgpt_browser_process(channel, config: dict) -> dict:
+    """Child-process entrypoint used by :meth:`run_isolated`."""
+    init_kwargs = dict(config.get("init") or {})
+    callback_flags = dict(config.get("callbacks") or {})
+    backend_config = BrowserBackendConfig(**dict(config.get("backend_config") or {}))
+
+    otp_callback = channel.callback("otp") if callback_flags.get("otp") else None
+    phone_callback = None
+    if callback_flags.get("phone"):
+        phone_callback = channel.callback(
+            "phone",
+            attribute_values=dict(config.get("phone_attribute_values") or {}),
+        )
+    existing_account_callback = (
+        channel.callback("existing_account")
+        if callback_flags.get("existing_account")
+        else None
+    )
+    worker = ChatGPTBrowserRegister(
+        **init_kwargs,
+        otp_callback=otp_callback,
+        codex_phone_callback=phone_callback,
+        existing_account_callback=existing_account_callback,
+        log_fn=channel.log,
+        backend_config=backend_config,
+    )
+    run_kwargs = dict(config.get("run") or {})
+    email = str(run_kwargs.pop("email", "") or "")
+    password = str(run_kwargs.pop("password", "") or "")
+    return worker.run(email, password, **run_kwargs)
