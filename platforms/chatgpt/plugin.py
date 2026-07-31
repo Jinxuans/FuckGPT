@@ -263,6 +263,7 @@ class _CodexSmsPhoneCallback:
         buy_max_attempts: int = 20,
         buy_retry_interval: float = 3,
         otp_timeout_seconds: int = 120,
+        phone_max_attempts: int = 3,
         cancel_check=None,
     ):
         self.provider = provider
@@ -272,6 +273,7 @@ class _CodexSmsPhoneCallback:
         self.buy_max_attempts = max(int(buy_max_attempts or 1), 1)
         self.buy_retry_interval = max(float(buy_retry_interval or 0), 0)
         self.otp_timeout_seconds = max(int(otp_timeout_seconds or 1), 1)
+        self.phone_max_attempts = max(int(phone_max_attempts or 1), 1)
         self.activation = None
         self.completed = False
         self.sent = False
@@ -886,6 +888,7 @@ class ChatGPTPlatform(BasePlatform):
                 otp_timeout_seconds=_int_setting(
                     getattr(client, "otp_timeout_seconds", extra.get(f"{provider_key}_otp_timeout_seconds", 120)), 120
                 ),
+                phone_max_attempts=_int_setting(extra.get(f"{provider_key}_phone_max_attempts", 3), 3),
                 cancel_check=self.is_cancel_requested,
             )
         except Exception as exc:

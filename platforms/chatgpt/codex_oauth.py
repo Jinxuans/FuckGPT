@@ -1475,15 +1475,25 @@ def _handle_add_phone_challenge(
     *,
     log: Callable[[str], None],
     resume_url: str,
-    max_phone_attempts: int = 3,
+    max_phone_attempts: int | None = None,
 ) -> None:
     if not callable(phone_callback):
         raise RuntimeError("Codex OAuth 遇到 add_phone，但未配置接码服务")
 
+    configured_attempts = (
+        max_phone_attempts
+        if max_phone_attempts is not None
+        else getattr(phone_callback, "phone_max_attempts", 3)
+    )
+    try:
+        attempt_limit = max(int(configured_attempts or 1), 1)
+    except (TypeError, ValueError):
+        attempt_limit = 3
+
     last_error: Exception | None = None
-    for attempt in range(max_phone_attempts):
+    for attempt in range(attempt_limit):
         if attempt:
-            log(f"Codex OAuth add_phone: 换号重试 {attempt + 1}/{max_phone_attempts}")
+            log(f"Codex OAuth add_phone: 换号重试 {attempt + 1}/{attempt_limit}")
             try:
                 _goto_with_retry(
                     page,
@@ -1531,6 +1541,8 @@ def _handle_add_phone_challenge(
                     pass
             if not retryable:
                 raise
+            if attempt + 1 >= attempt_limit:
+                break
             if hasattr(phone_callback, "reset"):
                 try:
                     phone_callback.reset()
