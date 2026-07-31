@@ -6,6 +6,7 @@ from sqlalchemy import func
 from sqlmodel import Session, select
 
 from core.account_display import build_account_display_summary
+from core.datetime_utils import serialize_datetime
 from core.db import AccountModel, AccountPushDeliveryModel, engine
 from core.account_graph import (
     build_account_view,
@@ -130,8 +131,8 @@ class AccountsRepository:
                     "attempt_count": delivery.attempt_count,
                     "http_status": delivery.http_status,
                     "last_error": delivery.last_error,
-                    "last_attempt_at": delivery.last_attempt_at.isoformat() if delivery.last_attempt_at else None,
-                    "pushed_at": delivery.pushed_at.isoformat() if delivery.pushed_at else None,
+                    "last_attempt_at": serialize_datetime(delivery.last_attempt_at),
+                    "pushed_at": serialize_datetime(delivery.pushed_at),
                 })
         return [
             _to_record(
