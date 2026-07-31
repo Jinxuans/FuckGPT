@@ -862,8 +862,11 @@ class ChatGPTPlatform(BasePlatform):
                 return None
             definition = ProviderDefinitionsRepository().get_by_key("sms", provider_key)
             extra = repo.resolve_runtime_settings("sms", provider_key, self.config.extra if self.config else {})
-            if proxy and not extra.get("sms_proxy"):
-                extra["proxy"] = proxy
+            # SMS provider APIs must use the local direct connection.  The
+            # browser proxy is only for ChatGPT/Codex page traffic and must
+            # never leak into number purchase or OTP polling requests.
+            extra.pop("proxy", None)
+            extra.pop("sms_proxy", None)
             extra["_log_fn"] = self.log
             load_all()
             client = create_provider("sms", (definition.driver_type if definition else "") or provider_key, extra)

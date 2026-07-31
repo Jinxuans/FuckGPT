@@ -1757,6 +1757,8 @@ def test_codex_sms_phone_callback_stops_when_cancelled(monkeypatch):
 
 
 def test_codex_phone_callback_uses_smsbower_retry_settings(monkeypatch):
+    captured = {}
+
     class Repo:
         def get_default_provider_key(self, provider_type):
             assert provider_type == "sms"
@@ -1773,6 +1775,8 @@ def test_codex_phone_callback_uses_smsbower_retry_settings(monkeypatch):
                 "smsbower_buy_retry_interval": "1.5",
                 "smsbower_otp_timeout_seconds": "180",
                 "smsbower_phone_max_attempts": "6",
+                "proxy": "http://browser-proxy.example:8080",
+                "sms_proxy": "socks5://configured-sms-proxy.example:1080",
             }
 
     class Client:
@@ -1781,15 +1785,23 @@ def test_codex_phone_callback_uses_smsbower_retry_settings(monkeypatch):
         default_country = "0"
 
     monkeypatch.setattr("infrastructure.provider_settings_repository.ProviderSettingsRepository", Repo)
-    monkeypatch.setattr("core.smsbower_sms.SMSBowerClient.from_config", classmethod(lambda cls, config: Client()))
+    def fake_from_config(cls, config):
+        captured.update(config)
+        return Client()
 
-    callback = ChatGPTPlatform(config=RegisterConfig())._build_codex_phone_callback(proxy=None)
+    monkeypatch.setattr("core.smsbower_sms.SMSBowerClient.from_config", classmethod(fake_from_config))
+
+    callback = ChatGPTPlatform(config=RegisterConfig())._build_codex_phone_callback(
+        proxy="http://browser-proxy.example:8080"
+    )
 
     assert isinstance(callback, _CodexSmsPhoneCallback)
     assert callback.buy_max_attempts == 7
     assert callback.buy_retry_interval == 1.5
     assert callback.otp_timeout_seconds == 180
     assert callback.phone_max_attempts == 6
+    assert "proxy" not in captured
+    assert "sms_proxy" not in captured
 
 
 def test_codex_phone_callback_supports_non_smsbower_provider(monkeypatch):

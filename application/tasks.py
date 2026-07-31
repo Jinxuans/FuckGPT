@@ -23,7 +23,6 @@ from core.db import AccountModel, TaskEventModel, TaskModel, engine, save_accoun
 from core.platform_accounts import build_platform_account
 from core.proxy_resolution import (
     PROXY_MODE_DIRECT,
-    PROXY_MODE_FOLLOW_PLATFORM,
     PROXY_MODE_MANUAL,
     PROXY_MODE_PROXY_SERVICE,
     mask_proxy_url,
@@ -844,16 +843,8 @@ def _registration_mailbox_proxy(
     platform_proxy: str | None,
     proxy_getter: Callable[[], str | None],
 ) -> tuple[str | None, str]:
-    legacy_explicit_proxy = str(payload.get("proxy") or "").strip() or None
-    default_mode = PROXY_MODE_FOLLOW_PLATFORM if legacy_explicit_proxy and not payload.get("mailbox_proxy_mode") else PROXY_MODE_DIRECT
-    mode = normalize_proxy_mode(str(payload.get("mailbox_proxy_mode") or "").strip(), default=default_mode)
-    proxy = resolve_proxy_by_mode(
-        mode,
-        manual_proxy=str(payload.get("mailbox_proxy_value") or "").strip(),
-        follow_proxy=platform_proxy,
-        proxy_getter=proxy_getter,
-    )
-    return proxy, mode
+    """Mailbox/provider APIs always use the local direct connection."""
+    return None, PROXY_MODE_DIRECT
 
 
 def _check_task_proxy(payload: dict[str, Any], proxy_getter: Callable[[], str | None]) -> tuple[str | None, str, bool]:
@@ -1018,10 +1009,6 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
             logger.log(
                 f"ChatGPT/Codex 代理: {mask_proxy_url(platform_proxy) if platform_proxy else '直连'}"
                 f"（{platform_proxy_mode}）"
-            )
-            logger.log(
-                f"邮箱 API 代理: {mask_proxy_url(mailbox_proxy) if mailbox_proxy else '直连'}"
-                f"（{mailbox_proxy_mode}）"
             )
             if logger.is_cancel_requested():
                 return "__cancel_requested__"
