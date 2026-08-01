@@ -625,9 +625,7 @@ def test_kakao_account_list_uses_local_accounts_without_exposing_tokens(client):
     payload = response.json()
     assert payload["total"] == 1
     assert payload["items"][0]["id"] == account_id
-    assert payload["items"][0]["phone_bound"] is False
-    assert payload["items"][0]["phone_checked"] is False
-    assert payload["items"][0]["codex_authorized"] is False
+    assert payload["items"][0]["account_view"]["security"]["phone_bound"] is False
     assert "access-token-for-kakao-test" not in response.text
 
 
@@ -664,8 +662,8 @@ def test_kakao_account_list_exposes_phone_and_codex_status_without_secrets(monke
     payload = service.list_accounts()
 
     item = payload["items"][0]
-    assert item["phone_bound"] is True
-    assert item["phone_checked"] is True
-    assert item["phone_number_masked"] == "+86****1234"
-    assert item["codex_authorized"] is True
+    assert item["account_view"]["security"] == {
+        "phone_bound": True,
+        "phone_number_masked": "+86****1234",
+    }
     assert "must-not-leak" not in str(payload)

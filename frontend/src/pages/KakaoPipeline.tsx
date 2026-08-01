@@ -83,10 +83,13 @@ type KakaoAccount = {
   plan_state: string
   validity: string
   checked_at?: string | null
-  phone_bound: boolean
-  phone_number_masked?: string
-  phone_checked: boolean
-  codex_authorized: boolean
+  account_view?: {
+    status?: { checked_at?: string | null }
+    security?: {
+      phone_bound?: boolean
+      phone_number_masked?: string
+    }
+  }
   pipeline: Pipeline
 }
 
@@ -200,15 +203,18 @@ function accountIsPlus(account: KakaoAccount) {
 }
 
 function phoneBindingBadge(account: KakaoAccount) {
-  if (account.phone_bound) {
+  const status = account.account_view?.status || {}
+  const security = account.account_view?.security || {}
+  const checked = Boolean(status.checked_at || security.phone_bound === true || security.phone_number_masked)
+  if (security.phone_bound === true) {
     return (
-      <Badge variant="success" title={account.phone_number_masked || '该账号已绑定手机'}>
+      <Badge variant="success" title={security.phone_number_masked || '该账号已绑定手机'}>
         <Smartphone className="mr-1 h-3 w-3" />
-        {account.phone_number_masked || '已绑手机'}
+        已绑手机
       </Badge>
     )
   }
-  if (account.phone_checked) {
+  if (checked) {
     return (
       <Badge variant="secondary" title="最近一次账号检测未发现绑定手机">
         <Smartphone className="mr-1 h-3 w-3" /> 未绑手机
@@ -1489,9 +1495,6 @@ export default function KakaoPipeline() {
                           <span className="font-mono">#{account.id}</span>
                           {planBadge(account)}
                           {phoneBindingBadge(account)}
-                          <Badge variant={account.codex_authorized ? 'success' : 'secondary'}>
-                            {account.codex_authorized ? 'Codex 已授权' : 'Codex 未授权'}
-                          </Badge>
                           <span>{account.validity === 'valid' ? '账号有效' : `有效性：${account.validity || '未检测'}`}</span>
                         </div>
                       </td>
