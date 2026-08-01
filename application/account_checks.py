@@ -24,10 +24,16 @@ class AccountChecksService:
     ) -> dict:
         platform = platform or "chatgpt"
         if select_all is None and ids is None and not status_filter and not search_filter and not filters:
+            from core.account_check_settings import get_account_check_settings
+
+            settings = get_account_check_settings()
             task = create_account_check_all_task(
                 platform,
+                limit=settings.batch_limit,
                 platform_proxy_mode=platform_proxy_mode,
                 platform_proxy_value=platform_proxy_value,
+                concurrency=settings.concurrency,
+                request_timeout_seconds=settings.request_timeout_seconds,
             )
             task_runtime.wake_up()
             return task

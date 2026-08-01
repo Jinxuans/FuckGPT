@@ -96,6 +96,7 @@ class AccountStatusModel(SQLModel, table=True):
     region: str = ""
     checked_at: Optional[datetime] = None
     last_error: str = ""
+    invalid_check_count: int = Field(default=0, index=True)
     created_at: datetime = Field(default_factory=_utcnow)
     updated_at: datetime = Field(default_factory=_utcnow)
 
@@ -670,6 +671,7 @@ def init_db():
 
     _ensure_column("provider_definitions", "category", "TEXT DEFAULT ''")
     _ensure_column("kakao_pipelines", "scanner_driver", "TEXT DEFAULT 'customer_api'")
+    _ensure_column("account_status", "invalid_check_count", "INTEGER DEFAULT 0")
     SQLModel.metadata.create_all(engine)
 
     with Session(engine) as session:

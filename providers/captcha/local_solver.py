@@ -8,7 +8,7 @@ class LocalSolverCaptcha(BaseCaptcha):
     """调用本地 api_solver 服务解 Turnstile（Camoufox/patchright）"""
 
     def __init__(self, solver_url: str = ""):
-        self.solver_url = solver_url.rstrip("/")
+        self.solver_url = (solver_url or "http://localhost:8889").rstrip("/")
 
     @classmethod
     def from_config(cls, config: dict) -> 'LocalSolverCaptcha':
@@ -16,6 +16,13 @@ class LocalSolverCaptcha(BaseCaptcha):
 
     def solve_turnstile(self, page_url: str, site_key: str) -> str:
         import requests, time
+        from urllib.parse import urlsplit
+
+        parsed = urlsplit(self.solver_url)
+        if parsed.hostname in {"localhost", "127.0.0.1", "::1"} and (parsed.port or 80) == 8889:
+            from services.solver_manager import start
+
+            start()
         # 提交任务
         r = requests.get(
             f"{self.solver_url}/turnstile",

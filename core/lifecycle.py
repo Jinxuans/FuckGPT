@@ -154,7 +154,7 @@ def flag_expiring_trials(
 # ChatGPT token refresh + CPA sync + liveness check
 # ---------------------------------------------------------------------------
 
-class LifecycleManager:
+class LegacyLifecycleManager:
     """Runs periodic lifecycle tasks in a background thread."""
 
     def __init__(
@@ -203,6 +203,83 @@ class LifecycleManager:
                 if not self._running:
                     break
                 time.sleep(1)
+
+
+class LifecycleManager:
+    """Schedules account checks only when the persisted switch is enabled."""
+
+    def __init__(self, *, warning_hours: int = 48):
+        self.warning_hours = warning_hours
+        self._running = False
+        self._thread: threading.Thread | None = None
+        self._next_validity_check = 0.0
+        self._last_trial_check = 0.0
+
+    def start(self) -> None:
+        if self._running:
+            return
+        self._running = True
+        self._thread = threading.Thread(target=self._loop, daemon=True, name="lifecycle-manager")
+        self._thread.start()
+        print("[LifecycleManager] started")
+
+    def stop(self) -> None:
+        self._running = False
+
+    def _loop(self) -> None:
+        while self._running:
+            try:
+                now = time.monotonic()
+                if now - self._last_trial_check >= 60:
+                    flag_expiring_trials(hours_warning=self.warning_hours)
+                    self._last_trial_check = now
+                self._schedule_validity_check(now)
+            except Exception as exc:
+                print(f"[LifecycleManager] error: {exc}")
+            # Configuration changes do not need sub-second reaction time. A
+            # short interval avoids turning an idle app into a database poller.
+            time.sleep(5)
+
+    def _schedule_validity_check(self, now: float) -> None:
+        from application.tasks import (
+            ACTIVE_TASK_STATUSES,
+            TASK_STATUS_PENDING,
+            TASK_TYPE_ACCOUNT_CHECK_ALL,
+            create_account_check_all_task,
+        )
+        from core.account_check_settings import get_account_check_settings
+        from core.db import TaskModel
+        from services.task_runtime import task_runtime
+
+        settings = get_account_check_settings()
+        if not settings.enabled:
+            self._next_validity_check = 0.0
+            return
+        if self._next_validity_check <= 0:
+            self._next_validity_check = now + settings.startup_delay_seconds
+            return
+        if now < self._next_validity_check:
+            return
+
+        with Session(engine) as session:
+            existing = session.exec(
+                select(TaskModel)
+                .where(TaskModel.type == TASK_TYPE_ACCOUNT_CHECK_ALL)
+                .where(TaskModel.status.in_([TASK_STATUS_PENDING, *ACTIVE_TASK_STATUSES]))
+            ).first()
+        if existing is None:
+            create_account_check_all_task(
+                "chatgpt",
+                limit=settings.batch_limit,
+                platform_proxy_mode=settings.proxy_mode,
+                platform_proxy_value=settings.proxy_url,
+                concurrency=settings.concurrency,
+                request_timeout_seconds=settings.request_timeout_seconds,
+                automatic=True,
+            )
+            task_runtime.wake_up()
+            print("[LifecycleManager] scheduled account validity check")
+        self._next_validity_check = now + settings.interval_minutes * 60
 
 
 lifecycle_manager = LifecycleManager()

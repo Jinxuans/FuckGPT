@@ -430,10 +430,8 @@ class BasePlatform(ABC):
         if not definition:
             return
 
-        if str(definition.driver_type or "").strip().lower() == "local_solver":
-            from services.solver_manager import start
-
-            start()
+        # Local Solver is started by the provider only when a challenge is
+        # actually submitted. Registration builds captcha providers eagerly.
 
     def solve_turnstile_with_fallback(self, page_url: str, site_key: str) -> str:
         errors: list[str] = []

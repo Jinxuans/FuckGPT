@@ -980,8 +980,12 @@ def _upsert_status(
         model.lifecycle_status = _text(summary.get("lifecycle_status")) or "registered"
     if "valid" in summary:
         model.validity_status = "valid" if bool(summary.get("valid")) else "invalid"
-        if bool(summary.get("valid")) and "last_error" not in summary and "check_error" not in summary:
-            model.last_error = ""
+        if bool(summary.get("valid")):
+            model.invalid_check_count = 0
+            if "last_error" not in summary and "check_error" not in summary:
+                model.last_error = ""
+        elif bool(summary.get("_track_invalid_attempt")):
+            model.invalid_check_count = min(max(int(model.invalid_check_count or 0), 0) + 1, 2)
     elif summary.get("validity_status") not in (None, ""):
         model.validity_status = _text(summary.get("validity_status")) or "unknown"
     elif model.lifecycle_status == "invalid":
@@ -1095,6 +1099,7 @@ def _serialize_status(model: AccountStatusModel) -> dict[str, Any]:
         "region": model.region,
         "checked_at": model.checked_at,
         "last_error": model.last_error,
+        "invalid_check_count": int(model.invalid_check_count or 0),
         "updated_at": model.updated_at,
     }
 
@@ -1242,6 +1247,7 @@ def _synthesize_overview(graph: dict[str, Any]) -> dict[str, Any]:
         "region": _text(status.get("region")),
         "checked_at": status.get("checked_at"),
         "check_error": _text(status.get("last_error")),
+        "invalid_check_count": int(status.get("invalid_check_count") or 0),
         "plan_type": _text(subscription.get("plan_type")),
         "plan": _text(subscription.get("plan_type")),
         "plan_name": _text(subscription.get("plan_type")),
