@@ -154,7 +154,9 @@ def test_register_task_honors_twenty_worker_concurrency_limit():
 def test_codex_oauth_batch_concurrency_is_capped():
     assert tasks_module._codex_oauth_batch_concurrency(1, 10) == 1
     assert tasks_module._codex_oauth_batch_concurrency(3, 10) == 3
-    assert tasks_module._codex_oauth_batch_concurrency(99, 10) == 5
+    assert tasks_module._codex_oauth_batch_concurrency(10, 30) == 10
+    assert tasks_module._codex_oauth_batch_concurrency(20, 30) == 20
+    assert tasks_module._codex_oauth_batch_concurrency(99, 30) == 20
     assert tasks_module._codex_oauth_batch_concurrency(5, 2) == 2
 
 
