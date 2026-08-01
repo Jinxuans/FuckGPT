@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import threading
 import time
+from datetime import datetime, timedelta, timezone
 
 import features.kakao_pipeline.reconciler as reconciler_module
-from sqlmodel import Session
+from sqlmodel import Session, select
 
 from core.base_platform import Account
 from core.db import KakaoPipelineModel, engine, save_account
@@ -190,32 +191,58 @@ def test_reconciler_retries_one_failure_without_stopping(monkeypatch):
     assert service.calls == 2
 
 
-def test_reconciler_caps_automatic_plus_rechecks(monkeypatch):
-    monkeypatch.setattr(reconciler_module, "_PLUS_RETRY_DELAYS_SECONDS", (0.01, 0.01))
+def test_plus_pending_is_discovered_only_when_persisted_next_check_is_due():
+    account_id = _create_account("plus-next-check@test.com")
+    with Session(engine) as session:
+        session.add(
+            KakaoPipelineModel(
+                account_id=account_id,
+                state="plus_pending",
+                plus_next_check_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+            )
+        )
+        session.commit()
 
-    class PendingPlusService:
-        def __init__(self):
-            self.calls = 0
+    service = KakaoPipelineService()
+    assert service.list_background_work() == []
 
-        def list_background_work(self, *, limit: int):
-            return [{"account_id": 9, "state": "plus_pending"}]
+    with Session(engine) as session:
+        pipeline = session.exec(
+            select(KakaoPipelineModel).where(KakaoPipelineModel.account_id == account_id)
+        ).one()
+        pipeline.plus_next_check_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+        session.add(pipeline)
+        session.commit()
 
-        def advance_background(self, account_id: int, *, expected_state: str):
-            assert account_id == 9
-            assert expected_state == "plus_pending"
-            self.calls += 1
-            return {"state": "plus_pending"}
+    assert service.list_background_work() == [{"account_id": account_id, "state": "plus_pending"}]
 
-    service = PendingPlusService()
-    reconciler = KakaoPipelineReconciler(
-        service=service,  # type: ignore[arg-type]
-        scan_interval=0.01,
-        max_workers=1,
-    )
-    reconciler.start()
-    try:
-        time.sleep(0.15)
-    finally:
-        reconciler.stop()
 
-    assert service.calls == 2
+def test_untracked_plus_is_discovered_only_when_persisted_next_check_is_due():
+    account_id = _create_account("untracked-next-check@test.com")
+    started_at = datetime.now(timezone.utc)
+    with Session(engine) as session:
+        session.add(
+            KakaoPipelineModel(
+                account_id=account_id,
+                state="scanner_accepted_untracked",
+                scanner_recovery_started_at=started_at,
+                scanner_recovery_next_check_at=started_at + timedelta(minutes=5),
+                scanner_recovery_deadline_at=started_at + timedelta(minutes=30),
+            )
+        )
+        session.commit()
+
+    service = KakaoPipelineService()
+    assert service.list_background_work() == []
+
+    with Session(engine) as session:
+        pipeline = session.exec(
+            select(KakaoPipelineModel).where(KakaoPipelineModel.account_id == account_id)
+        ).one()
+        pipeline.scanner_recovery_next_check_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+        session.add(pipeline)
+        session.commit()
+
+    assert service.list_background_work() == [
+        {"account_id": account_id, "state": "scanner_accepted_untracked"}
+    ]
