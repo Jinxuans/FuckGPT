@@ -16,7 +16,10 @@ import {
   RotateCcw,
   ScanLine,
   Search,
+  Send,
   Settings2,
+  ShieldCheck,
+  Smartphone,
   X,
 } from 'lucide-react'
 
@@ -80,7 +83,18 @@ type KakaoAccount = {
   plan_state: string
   validity: string
   checked_at?: string | null
+  phone_bound: boolean
+  phone_number_masked?: string
+  phone_checked: boolean
+  codex_authorized: boolean
   pipeline: Pipeline
+}
+
+type PushTarget = {
+  key: string
+  label: string
+  is_default: boolean
+  payload_format: string
 }
 
 type SettingDraft = {
@@ -185,11 +199,37 @@ function accountIsPlus(account: KakaoAccount) {
   return account.plan_state === 'subscribed' || ['plus', 'pro', 'team', 'business'].some(item => plan.includes(item))
 }
 
+function phoneBindingBadge(account: KakaoAccount) {
+  if (account.phone_bound) {
+    return (
+      <Badge variant="success" title={account.phone_number_masked || '该账号已绑定手机'}>
+        <Smartphone className="mr-1 h-3 w-3" />
+        {account.phone_number_masked || '已绑手机'}
+      </Badge>
+    )
+  }
+  if (account.phone_checked) {
+    return (
+      <Badge variant="secondary" title="最近一次账号检测未发现绑定手机">
+        <Smartphone className="mr-1 h-3 w-3" /> 未绑手机
+      </Badge>
+    )
+  }
+  return (
+    <Badge variant="secondary" title="尚未检测手机绑定状态">
+      <Smartphone className="mr-1 h-3 w-3" /> 手机未检测
+    </Badge>
+  )
+}
+
 function AccountMoreMenu({
   accountId,
   onCopyCredential,
   onForceReset,
   onCheckPlus,
+  onAuthorizeCodex,
+  onPush,
+  pushReady,
   actionDisabled = false,
   onShowLog,
 }: {
@@ -197,6 +237,9 @@ function AccountMoreMenu({
   onCopyCredential: (accountId: number, credentialType: 'session' | 'access') => void
   onForceReset: () => void
   onCheckPlus: () => void
+  onAuthorizeCodex: () => void
+  onPush: () => void
+  pushReady: boolean
   actionDisabled?: boolean
   onShowLog?: () => void
 }) {
@@ -204,7 +247,7 @@ function AccountMoreMenu({
   const [menuPosition, setMenuPosition] = useState({ top: 0, left: 0 })
   const triggerRef = useRef<HTMLButtonElement | null>(null)
   const menuRef = useRef<HTMLDivElement | null>(null)
-  const menuItemCount = 4 + (onShowLog ? 1 : 0)
+  const menuItemCount = 6 + (onShowLog ? 1 : 0)
 
   useEffect(() => {
     if (!open) return
@@ -212,7 +255,7 @@ function AccountMoreMenu({
     const updatePosition = () => {
       const rect = triggerRef.current?.getBoundingClientRect()
       if (!rect) return
-      const width = 136
+      const width = 176
       const height = 20 + menuItemCount * 34
       const gap = 6
       const openUp = window.innerHeight - rect.bottom < height + 16 && rect.top > height
@@ -264,9 +307,35 @@ function AccountMoreMenu({
         <div
           ref={menuRef}
           role="menu"
-          className="fixed z-[60] w-[136px] overflow-hidden rounded-lg border border-[var(--border)] bg-[var(--bg-card)] py-1 shadow-[var(--shadow-soft)]"
+          className="fixed z-[60] w-44 overflow-hidden rounded-lg border border-[var(--border)] bg-[var(--bg-card)] py-1 shadow-[var(--shadow-soft)]"
           style={{ top: menuPosition.top, left: menuPosition.left }}
         >
+          <button
+            type="button"
+            role="menuitem"
+            disabled={actionDisabled}
+            className="flex w-full items-center px-3 py-2 text-left text-xs font-medium text-violet-500 transition-colors hover:bg-violet-500/10 focus-visible:bg-violet-500/10 focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-40"
+            onClick={() => {
+              setOpen(false)
+              onAuthorizeCodex()
+            }}
+          >
+            <ShieldCheck className="mr-2 h-3.5 w-3.5" /> Codex 授权
+          </button>
+          <button
+            type="button"
+            role="menuitem"
+            disabled={actionDisabled || !pushReady}
+            title={pushReady ? '推送到默认目标' : '请先到设置中配置并启用推送目标'}
+            className="flex w-full items-center px-3 py-2 text-left text-xs font-medium text-[var(--text-primary)] transition-colors hover:bg-[var(--bg-hover)] focus-visible:bg-[var(--bg-hover)] focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-40"
+            onClick={() => {
+              setOpen(false)
+              onPush()
+            }}
+          >
+            <Send className="mr-2 h-3.5 w-3.5" /> 推送到默认目标
+          </button>
+          <div className="my-1 h-px bg-[var(--border)]" />
           <button
             type="button"
             role="menuitem"
@@ -877,6 +946,7 @@ function SettingsPanel({
 export default function KakaoPipeline() {
   const [settings, setSettings] = useState<KakaoSettings | null>(null)
   const [accounts, setAccounts] = useState<KakaoAccount[]>([])
+  const [pushTargets, setPushTargets] = useState<PushTarget[]>([])
   const [search, setSearch] = useState('')
   const [debouncedSearch, setDebouncedSearch] = useState('')
   const [page, setPage] = useState(1)
@@ -896,6 +966,11 @@ export default function KakaoPipeline() {
   const loadSettings = useCallback(async () => {
     const result = await apiFetch('/kakao-pipeline/settings')
     setSettings(result)
+  }, [])
+
+  const loadPushTargets = useCallback(async () => {
+    const result = await apiFetch('/accounts/push-targets')
+    setPushTargets(Array.isArray(result?.items) ? result.items : [])
   }, [])
 
   const loadAccounts = useCallback(async (showLoading = true) => {
@@ -945,7 +1020,10 @@ export default function KakaoPipeline() {
     loadSettings().catch(error => {
       setToast({ type: 'error', text: parseError(error) })
     })
-  }, [loadSettings])
+    loadPushTargets().catch(error => {
+      setToast({ type: 'error', text: parseError(error) })
+    })
+  }, [loadPushTargets, loadSettings])
 
   useEffect(() => {
     void loadAccounts()
@@ -1055,6 +1133,73 @@ export default function KakaoPipeline() {
     }
   }
 
+  const authorizeCodex = async (account: KakaoAccount) => {
+    if (activeRequests.current.has(account.id)) return
+    activeRequests.current.add(account.id)
+    setOperations(current => ({ ...current, [account.id]: '启动 Codex 授权' }))
+    try {
+      const result = await apiFetch('/accounts/codex-oauth/authorize', {
+        method: 'POST',
+        body: JSON.stringify({
+          platform: 'chatgpt',
+          ids: [account.id],
+          select_all: false,
+          concurrency: 1,
+          params: {
+            browser_mode: 'headless',
+            keep_browser_open: 'false',
+          },
+        }),
+      })
+      if (!result?.task_id) throw new Error('Codex 授权任务创建失败')
+      setToast({ type: 'success', text: `${account.email} 的 Codex 授权任务已启动` })
+    } catch (error) {
+      setToast({ type: 'error', text: parseError(error) })
+    } finally {
+      activeRequests.current.delete(account.id)
+      setOperations(current => {
+        const next = { ...current }
+        delete next[account.id]
+        return next
+      })
+    }
+  }
+
+  const pushAccount = async (account: KakaoAccount) => {
+    const target = pushTargets.find(item => item.is_default) || pushTargets[0]
+    if (!target) {
+      setToast({ type: 'error', text: '请先到设置中配置并启用推送目标' })
+      return
+    }
+    if (activeRequests.current.has(account.id)) return
+    activeRequests.current.add(account.id)
+    setOperations(current => ({ ...current, [account.id]: '推送中' }))
+    try {
+      const result = await apiFetch('/accounts/push', {
+        method: 'POST',
+        body: JSON.stringify({
+          platform: 'chatgpt',
+          ids: [account.id],
+          select_all: false,
+          target_key: target.key,
+        }),
+      })
+      const failed = Number(result?.failed || 0)
+      if (failed > 0) throw new Error(result?.results?.[0]?.error || '推送失败')
+      setToast({ type: 'success', text: `${account.email} 已推送到 ${result?.target_label || target.label}` })
+    } catch (error) {
+      setToast({ type: 'error', text: parseError(error) })
+    } finally {
+      activeRequests.current.delete(account.id)
+      setOperations(current => {
+        const next = { ...current }
+        delete next[account.id]
+        return next
+      })
+      await loadAccounts(false)
+    }
+  }
+
   const renderActions = (account: KakaoAccount) => {
     const pipeline = account.pipeline
     const busy = operations[account.id]
@@ -1091,6 +1236,9 @@ export default function KakaoPipeline() {
             onCopyCredential={copyAccountCredential}
             onForceReset={forceReset}
             onCheckPlus={checkPlus}
+            onAuthorizeCodex={() => void authorizeCodex(account)}
+            onPush={() => void pushAccount(account)}
+            pushReady={pushTargets.length > 0}
             actionDisabled
           />
         </div>
@@ -1180,6 +1328,9 @@ export default function KakaoPipeline() {
           onCopyCredential={copyAccountCredential}
           onForceReset={forceReset}
           onCheckPlus={checkPlus}
+          onAuthorizeCodex={() => void authorizeCodex(account)}
+          onPush={() => void pushAccount(account)}
+          pushReady={pushTargets.length > 0}
           onShowLog={pipeline.state !== 'idle' ? () => toggleDetail(account.id) : undefined}
         />
       </div>
@@ -1337,6 +1488,10 @@ export default function KakaoPipeline() {
                         <div className="mt-1.5 flex flex-wrap items-center gap-2 text-[11px] text-[var(--text-muted)]">
                           <span className="font-mono">#{account.id}</span>
                           {planBadge(account)}
+                          {phoneBindingBadge(account)}
+                          <Badge variant={account.codex_authorized ? 'success' : 'secondary'}>
+                            {account.codex_authorized ? 'Codex 已授权' : 'Codex 未授权'}
+                          </Badge>
                           <span>{account.validity === 'valid' ? '账号有效' : `有效性：${account.validity || '未检测'}`}</span>
                         </div>
                       </td>

@@ -635,6 +635,10 @@ class KakaoPipelineService:
             identity = view.get("identity") if isinstance(view.get("identity"), dict) else {}
             subscription = view.get("subscription") if isinstance(view.get("subscription"), dict) else {}
             status = view.get("status") if isinstance(view.get("status"), dict) else {}
+            security = view.get("security") if isinstance(view.get("security"), dict) else {}
+            codex = view.get("codex") if isinstance(view.get("codex"), dict) else {}
+            phone_number_masked = _text(security.get("phone_number_masked"))
+            phone_bound = bool(security.get("phone_bound"))
             items.append(
                 {
                     "id": account_id,
@@ -643,6 +647,10 @@ class KakaoPipelineService:
                     "plan_state": _text(subscription.get("state") or account.get("plan_state") or "unknown"),
                     "validity": _text(status.get("validity") or account.get("validity_status") or "unknown"),
                     "checked_at": status.get("checked_at"),
+                    "phone_bound": phone_bound,
+                    "phone_number_masked": phone_number_masked,
+                    "phone_checked": bool(status.get("checked_at") or phone_bound or phone_number_masked),
+                    "codex_authorized": bool(codex.get("authorized")),
                     "pipeline": self._serialize_pipeline(pipelines.get(account_id)),
                 }
             )
