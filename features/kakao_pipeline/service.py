@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import re
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import urlsplit
 
+from sqlalchemy import or_
 from sqlmodel import Session, select
 
 from application.accounts import AccountsService
@@ -54,19 +56,39 @@ ACTIVE_STATES = {
     "supplier_processing",
     "scanner_submitting",
     "scanner_processing",
+    "scanner_accepted_untracked",
+    "scanner_succeeded",
     "plus_checking",
+    "plus_pending",
 }
 
 BACKGROUND_POLL_STATES = {
+    "supplier_submitting",
     "supplier_processing",
+    "scanner_submitting",
     "scanner_processing",
+    "scanner_accepted_untracked",
     "scanner_succeeded",
     "plus_checking",
     "plus_pending",
 }
 
 TERMINAL_REMOTE_FAILURES = {"FAILED", "CANCELLED", "EXPIRED", "REJECTED"}
-REMOTE_SUCCESS_STATUSES = {"SUCCESS", "SUCCEEDED", "COMPLETED", "CONFIRMED", "PLUS", "ACTIVE"}
+I7_SCANNER_SUCCESS_STATUSES = {"SUCCESS", "SUCCEEDED", "COMPLETED", "CONFIRMED"}
+I7_SUBSCRIPTION_SUCCESS_STATUSES = {"VERIFIED", "PLUS"}
+WORKSTATION_PROCESSING_STATUSES = {"QUEUED", "PENDING", "PROCESSING", "ASSIGNED", "RUNNING", "CHECKING"}
+WORKSTATION_FAILURE_STATUSES = {"FAILED", "EXPIRED", "CANCELLED", "REJECTED", "ERROR", "CLOSED"}
+MAX_SCANNER_POLL_FAILURES = 6
+SUPPLIER_PROCESSING_WINDOW_SECONDS = 15 * 60
+SCANNER_PROCESSING_WINDOW_SECONDS = 30 * 60
+SUBMIT_RECOVERY_GRACE_SECONDS = 60
+UNTRACKED_PLUS_INITIAL_DELAY_SECONDS = 30
+UNTRACKED_PLUS_WINDOW_SECONDS = 30 * 60
+UNTRACKED_PLUS_INITIAL_DELAYS_SECONDS = (30, 60)
+PLUS_CONFIRM_WINDOW_SECONDS = 10 * 60
+PLUS_CONFIRM_INITIAL_DELAYS_SECONDS = (5, 10, 30, 30, 30)
+PLUS_CONFIRM_MIN_INTERVAL_SECONDS = 60
+PLUS_CONFIRM_MAX_INTERVAL_SECONDS = 120
 
 _account_locks: dict[int, threading.RLock] = {}
 _account_locks_guard = threading.Lock()
@@ -79,6 +101,49 @@ def _utcnow() -> datetime:
 
 def _utcnow_iso() -> str:
     return _utcnow().isoformat().replace("+00:00", "Z")
+
+
+def _age_seconds(value: datetime | None) -> float:
+    if value is None:
+        return float("inf")
+    return max((_utcnow() - _as_utc(value)).total_seconds(), 0.0)
+
+
+def _as_utc(value: datetime) -> datetime:
+    current = value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    return current.astimezone(timezone.utc)
+
+
+def _parse_datetime(value: Any) -> datetime | None:
+    text = _text(value)
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def _earlier_deadline(default_deadline: datetime, remote_value: Any) -> datetime:
+    remote_deadline = _parse_datetime(remote_value)
+    if remote_deadline is None:
+        return default_deadline
+    return min(_as_utc(default_deadline), _as_utc(remote_deadline))
+
+
+def _next_plus_delay_seconds(check_count: int) -> int:
+    index = max(int(check_count or 1) - 1, 0)
+    if index < len(PLUS_CONFIRM_INITIAL_DELAYS_SECONDS):
+        return PLUS_CONFIRM_INITIAL_DELAYS_SECONDS[index]
+    return random.randint(PLUS_CONFIRM_MIN_INTERVAL_SECONDS, PLUS_CONFIRM_MAX_INTERVAL_SECONDS)
+
+
+def _next_untracked_plus_delay_seconds(check_count: int) -> int:
+    index = max(int(check_count or 1) - 1, 0)
+    if index < len(UNTRACKED_PLUS_INITIAL_DELAYS_SECONDS):
+        return UNTRACKED_PLUS_INITIAL_DELAYS_SECONDS[index]
+    return random.randint(PLUS_CONFIRM_MIN_INTERVAL_SECONDS, PLUS_CONFIRM_MAX_INTERVAL_SECONDS)
 
 
 def _account_lock(account_id: int) -> threading.RLock:
@@ -254,14 +319,60 @@ def _safe_scan_url(value: str) -> str:
 def _scanner_outcome(data: dict) -> str:
     main_status = _text(data.get("status")).upper()
     subscription = data.get("subscription") if isinstance(data.get("subscription"), dict) else {}
-    subscription_status = _text(subscription.get("status") or subscription.get("plan") or subscription.get("planType")).upper()
+    subscription_status = _text(subscription.get("status")).upper()
     if main_status in TERMINAL_REMOTE_FAILURES or subscription_status in TERMINAL_REMOTE_FAILURES:
         return "failed"
-    if main_status in REMOTE_SUCCESS_STATUSES:
-        return "success"
-    if subscription_status in REMOTE_SUCCESS_STATUSES or any(token in subscription_status for token in ("PLUS", "PRO", "PAID")):
+    if main_status in I7_SCANNER_SUCCESS_STATUSES and subscription_status in I7_SUBSCRIPTION_SUCCESS_STATUSES:
         return "success"
     return "processing"
+
+
+def _workstation_outcome(status: str) -> str:
+    normalized = _text(status).upper()
+    if normalized == "COMPLETED":
+        return "success"
+    if normalized == "UNKNOWN":
+        return "missing"
+    if normalized in WORKSTATION_FAILURE_STATUSES:
+        return "failed"
+    if normalized in WORKSTATION_PROCESSING_STATUSES:
+        return "processing"
+    return "unrecognized"
+
+
+def _is_duplicate_payment_submission(exc: Exception) -> bool:
+    if not isinstance(exc, CustomerApiProblem) or int(exc.status_code or 0) != 409:
+        return False
+    compact = re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", f"{exc.code} {exc.message}".lower())
+    return (
+        any(
+            token in compact
+            for token in (
+                "支付链接已经提交",
+                "支付链接已提交",
+                "paymentlinkalreadysubmitted",
+                "duplicatepaymentlink",
+            )
+        )
+        or ("支付链接" in compact and "重复点击" in compact)
+    )
+
+
+def _is_ambiguous_submit_problem(exc: Exception) -> bool:
+    if not isinstance(exc, CustomerApiProblem):
+        return isinstance(exc, (ValueError, RuntimeError))
+    return exc.code in {"network_error", "invalid_json", "invalid_response"} or int(exc.status_code or 0) >= 500
+
+
+def _is_transient_poll_problem(exc: Exception) -> bool:
+    return isinstance(exc, CustomerApiProblem) and (
+        exc.code in {"network_error", "invalid_json", "invalid_response"}
+        or int(exc.status_code or 0) >= 500
+    )
+
+
+def _is_missing_submission_problem(exc: Exception) -> bool:
+    return isinstance(exc, CustomerApiProblem) and exc.code == "submission_missing"
 
 
 class KakaoPipelineService:
@@ -561,6 +672,16 @@ class KakaoPipelineService:
             session.expunge(model)
             return model, token, session_cookie
 
+    def _account_is_plus(self, account_id: int) -> bool:
+        account = self.accounts.get_account(int(account_id)) or {}
+        view = account.get("account_view") if isinstance(account.get("account_view"), dict) else {}
+        subscription = view.get("subscription") if isinstance(view.get("subscription"), dict) else {}
+        plan = _text(subscription.get("plan") or account.get("plan_name")).lower()
+        plan_state = _text(subscription.get("state") or account.get("plan_state")).lower()
+        return plan_state == "subscribed" or any(
+            token in plan for token in ("plus", "pro", "team", "business", "enterprise")
+        )
+
     @staticmethod
     def _serialize_pipeline(model: KakaoPipelineModel | None, *, detail: bool = False) -> dict:
         if model is None:
@@ -593,6 +714,8 @@ class KakaoPipelineService:
             "supplier_stage": int(extraction.get("stage") or 0),
             "supplier_stage_total": int(extraction.get("stageTotal") or 0),
             "supplier_stage_name": _text(extraction.get("stageName")),
+            "supplier_processing_started_at": model.supplier_processing_started_at.isoformat() if model.supplier_processing_started_at else None,
+            "supplier_deadline_at": model.supplier_deadline_at.isoformat() if model.supplier_deadline_at else None,
             "payment_url": model.payment_url,
             "scanner_driver": model.scanner_driver or "customer_api",
             "scanner_name": model.scanner_name,
@@ -601,8 +724,24 @@ class KakaoPipelineService:
             "scanner_subscription_status": _text(subscription.get("status")),
             "scan_url": model.scan_url,
             "scan_expires_at": model.scan_expires_at,
+            "scanner_submit_attempts": int(model.scanner_submit_attempts or 0),
+            "scanner_compensation_attempted": bool(model.scanner_compensation_attempted),
+            "scanner_poll_failures": int(model.scanner_poll_failures or 0),
+            "scanner_recovery_reason": model.scanner_recovery_reason,
+            "scanner_recovery_check_count": int(model.scanner_recovery_check_count or 0),
+            "scanner_recovery_started_at": model.scanner_recovery_started_at.isoformat() if model.scanner_recovery_started_at else None,
+            "scanner_recovery_next_check_at": model.scanner_recovery_next_check_at.isoformat() if model.scanner_recovery_next_check_at else None,
+            "scanner_recovery_deadline_at": model.scanner_recovery_deadline_at.isoformat() if model.scanner_recovery_deadline_at else None,
+            "scanner_processing_started_at": model.scanner_processing_started_at.isoformat() if model.scanner_processing_started_at else None,
+            "scanner_deadline_at": model.scanner_deadline_at.isoformat() if model.scanner_deadline_at else None,
             "plus_status": model.plus_status,
             "final_result": model.final_result,
+            "completion_source": model.completion_source,
+            "plus_check_count": int(model.plus_check_count or 0),
+            "plus_check_started_at": model.plus_check_started_at.isoformat() if model.plus_check_started_at else None,
+            "plus_next_check_at": model.plus_next_check_at.isoformat() if model.plus_next_check_at else None,
+            "plus_check_deadline_at": model.plus_check_deadline_at.isoformat() if model.plus_check_deadline_at else None,
+            "plus_check_paused_at": model.plus_check_paused_at.isoformat() if model.plus_check_paused_at else None,
             "last_error_code": model.last_error_code,
             "last_error_message": model.last_error_message,
             "created_at": model.created_at.isoformat() if model.created_at else None,
@@ -663,9 +802,24 @@ class KakaoPipelineService:
     def list_background_work(self, *, limit: int = 100) -> list[dict]:
         """Return persisted work that can safely resume without a browser page."""
         with Session(engine) as session:
+            now = _utcnow()
             rows = session.exec(
                 select(KakaoPipelineModel)
                 .where(KakaoPipelineModel.state.in_(BACKGROUND_POLL_STATES))
+                .where(
+                    or_(
+                        KakaoPipelineModel.state != "plus_pending",
+                        KakaoPipelineModel.plus_next_check_at.is_(None),
+                        KakaoPipelineModel.plus_next_check_at <= now,
+                    )
+                )
+                .where(
+                    or_(
+                        KakaoPipelineModel.state != "scanner_accepted_untracked",
+                        KakaoPipelineModel.scanner_recovery_next_check_at.is_(None),
+                        KakaoPipelineModel.scanner_recovery_next_check_at <= now,
+                    )
+                )
                 .order_by(KakaoPipelineModel.updated_at, KakaoPipelineModel.id)
                 .limit(min(max(int(limit), 1), 500))
             ).all()
@@ -691,12 +845,92 @@ class KakaoPipelineService:
                     return self._serialize_pipeline(pipeline)
 
             if state == "supplier_processing":
+                with Session(engine) as session:
+                    current = self._pipeline_for_account(session, account_id)
+                    assert current is not None
+                    self._ensure_supplier_processing_window(current)
+                    if self._supplier_processing_expired(current):
+                        _set_error(
+                            current,
+                            "supplier_poll_failed",
+                            "supplier_processing_timeout",
+                            "提链供应商处理超过 15 分钟，已停止自动查询",
+                        )
+                        session.add(current)
+                        session.commit()
+                        return self._serialize_pipeline(current, detail=True)
+                    session.add(current)
+                    session.commit()
                 return self.poll_supplier(account_id)
+            if state == "supplier_submitting":
+                with Session(engine) as session:
+                    current = self._pipeline_for_account(session, account_id)
+                    if current is not None and _age_seconds(current.updated_at) < SUBMIT_RECOVERY_GRACE_SECONDS:
+                        return self._serialize_pipeline(current)
+                return self._mark_interrupted_supplier_submit(account_id)
+            if state == "scanner_submitting":
+                with Session(engine) as session:
+                    current = self._pipeline_for_account(session, account_id)
+                    if current is not None and _age_seconds(current.updated_at) < SUBMIT_RECOVERY_GRACE_SECONDS:
+                        return self._serialize_pipeline(current)
+                return self._resume_scanner_submit(account_id)
             if state == "scanner_processing":
+                with Session(engine) as session:
+                    current = self._pipeline_for_account(session, account_id)
+                    assert current is not None
+                    self._ensure_scanner_processing_window(current)
+                    if self._scanner_processing_expired(current):
+                        _set_error(
+                            current,
+                            "scanner_poll_failed",
+                            "scanner_processing_timeout",
+                            "扫码订单处理超过 30 分钟，已停止自动查询，可手动继续查询原订单",
+                        )
+                        session.add(current)
+                        session.commit()
+                        return self._serialize_pipeline(current, detail=True)
+                    session.add(current)
+                    session.commit()
                 result = self.poll_scanner(account_id)
                 if result.get("state") == "scanner_succeeded":
                     return self.check_plus(account_id, advance_pipeline=True)
                 return result
+            if state == "scanner_accepted_untracked":
+                with Session(engine) as session:
+                    current = self._pipeline_for_account(session, account_id)
+                    assert current is not None
+                    self._ensure_untracked_plus_window(current)
+                    if self._untracked_plus_window_expired(current):
+                        self._pause_untracked_plus_confirmation(current)
+                        session.add(current)
+                        session.commit()
+                        return self._serialize_pipeline(current, detail=True)
+                    if current.scanner_recovery_next_check_at and (
+                        _as_utc(current.scanner_recovery_next_check_at) > _utcnow()
+                    ):
+                        session.add(current)
+                        session.commit()
+                        return self._serialize_pipeline(current)
+                    session.add(current)
+                    session.commit()
+                return self.check_untracked_plus(account_id)
+            if state in {"plus_pending", "plus_checking"}:
+                with Session(engine) as session:
+                    current = self._pipeline_for_account(session, account_id)
+                    assert current is not None
+                    self._ensure_plus_window(current)
+                    if self._plus_window_expired(current):
+                        self._pause_plus_confirmation(current)
+                        session.add(current)
+                        session.commit()
+                        return self._serialize_pipeline(current, detail=True)
+                    if current.plus_next_check_at:
+                        next_at = current.plus_next_check_at
+                        if next_at.tzinfo is None:
+                            next_at = next_at.replace(tzinfo=timezone.utc)
+                        if next_at > _utcnow():
+                            return self._serialize_pipeline(current)
+                return self.check_plus(account_id, advance_pipeline=True)
             return self.check_plus(account_id, advance_pipeline=True)
 
     def get_account_pipeline(self, account_id: int) -> dict:
@@ -708,6 +942,8 @@ class KakaoPipelineService:
 
     def start_extraction(self, account_id: int, supplier_setting_id: int | None = None, payment_method: str = "kakao_pay") -> dict:
         with _account_lock(account_id):
+            if self._account_is_plus(account_id):
+                raise ValueError("当前账号已经是 Plus，无需再次提链扫码")
             _, access_token, _ = self._account_credentials(account_id)
             if not access_token:
                 raise ValueError("提链供应商仍需要账号 access_token")
@@ -721,8 +957,8 @@ class KakaoPipelineService:
             with Session(engine) as session:
                 pipeline = self._pipeline_for_account(session, account_id, create=True)
                 assert pipeline is not None
-                if pipeline.state in {"scanner_submitting", "scanner_processing", "plus_checking"}:
-                    raise ValueError("当前账号已有扫码任务，不能重新提链")
+                if pipeline.state not in {"idle", "supplier_failed"}:
+                    raise ValueError("当前账号已有 Kakao 流程记录，请先完成或重置后再提链")
                 pipeline.state = "supplier_submitting"
                 pipeline.payment_method = method
                 pipeline.supplier_setting_id = int(setting.id or 0) if setting else None
@@ -734,6 +970,8 @@ class KakaoPipelineService:
                 pipeline.supplier_poll_url = ""
                 pipeline.supplier_status = "SUBMITTING"
                 pipeline.set_supplier_response({})
+                pipeline.supplier_processing_started_at = None
+                pipeline.supplier_deadline_at = None
                 pipeline.payment_url = ""
                 pipeline.scanner_setting_id = None
                 pipeline.scanner_driver = "customer_api"
@@ -747,8 +985,24 @@ class KakaoPipelineService:
                 pipeline.set_scanner_response({})
                 pipeline.scan_url = ""
                 pipeline.scan_expires_at = ""
+                pipeline.scanner_submit_attempts = 0
+                pipeline.scanner_compensation_attempted = False
+                pipeline.scanner_poll_failures = 0
+                pipeline.scanner_recovery_reason = ""
+                pipeline.scanner_recovery_check_count = 0
+                pipeline.scanner_recovery_started_at = None
+                pipeline.scanner_recovery_next_check_at = None
+                pipeline.scanner_recovery_deadline_at = None
+                pipeline.scanner_processing_started_at = None
+                pipeline.scanner_deadline_at = None
                 pipeline.plus_status = ""
                 pipeline.final_result = ""
+                pipeline.completion_source = ""
+                pipeline.plus_check_count = 0
+                pipeline.plus_check_started_at = None
+                pipeline.plus_next_check_at = None
+                pipeline.plus_check_deadline_at = None
+                pipeline.plus_check_paused_at = None
                 pipeline.last_error_code = ""
                 pipeline.last_error_message = ""
                 pipeline.completed_at = None
@@ -774,6 +1028,15 @@ class KakaoPipelineService:
                     pipeline.supplier_status = _text(order.get("status") or "PENDING").upper()
                     pipeline.state = "supplier_processing"
                     pipeline.set_supplier_response(payload)
+                    pipeline.supplier_processing_started_at = _utcnow()
+                    default_deadline = (
+                        _as_utc(pipeline.supplier_processing_started_at)
+                        + timedelta(seconds=SUPPLIER_PROCESSING_WINDOW_SECONDS)
+                    )
+                    pipeline.supplier_deadline_at = _earlier_deadline(
+                        default_deadline,
+                        _find_scan_value(data, {"expires_at", "expire_at", "expired_at"}),
+                    )
                     pipeline.updated_at = _utcnow()
                     _append_event(pipeline, f"供应商订单已创建: {order_id}")
                     session.add(pipeline)
@@ -784,8 +1047,17 @@ class KakaoPipelineService:
                 with Session(engine) as session:
                     pipeline = self._pipeline_for_account(session, account_id)
                     assert pipeline is not None
-                    _set_error(pipeline, "supplier_failed", code, str(exc))
-                    pipeline.supplier_status = "FAILED"
+                    if _is_ambiguous_submit_problem(exc):
+                        _set_error(
+                            pipeline,
+                            "supplier_submit_unconfirmed",
+                            code,
+                            f"提链提交结果无法确认，为避免重复订单已停止自动重试: {exc}",
+                        )
+                        pipeline.supplier_status = "UNCONFIRMED"
+                    else:
+                        _set_error(pipeline, "supplier_failed", code, str(exc))
+                        pipeline.supplier_status = "FAILED"
                     session.add(pipeline)
                     session.commit()
                 raise
@@ -796,6 +1068,20 @@ class KakaoPipelineService:
                 pipeline = self._pipeline_for_account(session, account_id)
                 if pipeline is None or not pipeline.supplier_order_id:
                     raise ValueError("当前账号没有供应商提链订单")
+                manual_recovery = pipeline.state == "supplier_poll_failed"
+                if pipeline.state not in {"supplier_processing", "supplier_poll_failed"}:
+                    return self._serialize_pipeline(pipeline, detail=True)
+                self._ensure_supplier_processing_window(pipeline)
+                if not manual_recovery and self._supplier_processing_expired(pipeline):
+                    _set_error(
+                        pipeline,
+                        "supplier_poll_failed",
+                        "supplier_processing_timeout",
+                        "提链供应商处理超过 15 分钟，已停止自动查询",
+                    )
+                    session.add(pipeline)
+                    session.commit()
+                    return self._serialize_pipeline(pipeline, detail=True)
                 client = CustomerApiClient(pipeline.supplier_base_url, pipeline.supplier_cdk_key)
                 poll_url = pipeline.supplier_poll_url
                 customer_token = pipeline.supplier_customer_token
@@ -818,9 +1104,14 @@ class KakaoPipelineService:
             with Session(engine) as session:
                 pipeline = self._pipeline_for_account(session, account_id)
                 assert pipeline is not None
+                if pipeline.state not in {"supplier_processing", "supplier_poll_failed"}:
+                    return self._serialize_pipeline(pipeline, detail=True)
                 previous = pipeline.supplier_status
                 pipeline.supplier_status = status
                 pipeline.set_supplier_response(payload)
+                remote_deadline = _find_scan_value(data, {"expires_at", "expire_at", "expired_at"})
+                if pipeline.supplier_deadline_at and remote_deadline:
+                    pipeline.supplier_deadline_at = _earlier_deadline(pipeline.supplier_deadline_at, remote_deadline)
                 pipeline.updated_at = _utcnow()
                 if previous != status:
                     _append_event(pipeline, f"供应商状态: {status}")
@@ -853,7 +1144,15 @@ class KakaoPipelineService:
                     code, message = _problem_from_payload(data, "supplier_failed", "供应商提链失败")
                     _set_error(pipeline, "supplier_failed", code, message)
                 else:
-                    pipeline.state = "supplier_processing"
+                    if self._supplier_processing_expired(pipeline):
+                        _set_error(
+                            pipeline,
+                            "supplier_poll_failed",
+                            "supplier_processing_timeout",
+                            "提链订单仍在处理中且已超过 15 分钟，可稍后手动继续查询原订单",
+                        )
+                    else:
+                        pipeline.state = "supplier_processing"
                 session.add(pipeline)
                 session.commit()
                 result = self._serialize_pipeline(pipeline, detail=True)
@@ -895,52 +1194,73 @@ class KakaoPipelineService:
                 pipeline.scanner_customer_token = ""
                 pipeline.scanner_poll_url = ""
                 pipeline.set_scanner_response({})
+                pipeline.scan_url = ""
+                pipeline.scan_expires_at = ""
+                pipeline.scanner_submit_attempts = 0
+                pipeline.scanner_compensation_attempted = False
+                pipeline.scanner_poll_failures = 0
+                pipeline.scanner_recovery_reason = ""
+                pipeline.scanner_recovery_check_count = 0
+                pipeline.scanner_recovery_started_at = None
+                pipeline.scanner_recovery_next_check_at = None
+                pipeline.scanner_recovery_deadline_at = None
+                pipeline.scanner_processing_started_at = None
+                pipeline.scanner_deadline_at = None
+                pipeline.plus_status = ""
+                pipeline.final_result = ""
+                pipeline.completion_source = ""
+                pipeline.plus_check_count = 0
+                pipeline.plus_check_started_at = None
+                pipeline.plus_next_check_at = None
+                pipeline.plus_check_deadline_at = None
+                pipeline.plus_check_paused_at = None
                 pipeline.last_error_code = ""
                 pipeline.last_error_message = ""
                 pipeline.updated_at = _utcnow()
-                _append_event(pipeline, f"已向 {config['display_name']} 上传扫码任务")
                 session.add(pipeline)
                 session.commit()
+            if config["driver_type"] == "payment_submission":
+                return self._submit_workstation_scanner(account_id, compensation=False)
+
             try:
-                if config["driver_type"] == "payment_submission":
-                    client = WorkstationScannerClient(config["base_url"], config["cdk_key"])
-                    payload = client.submit_payment(payment_url)
-                    submissions = payload.get("submissions") if isinstance(payload.get("submissions"), list) else []
-                    order = submissions[0] if submissions and isinstance(submissions[0], dict) else {}
-                    order_id = _text(order.get("id"))
-                    customer_token = ""
-                    poll_url = ""
-                    if not order_id:
-                        raise ValueError("546789 扫码接口响应缺少 submission ID")
-                    initial_status = _text(order.get("state") or "PENDING").upper()
-                    scan_url = client.qr_url(order_id)
-                else:
-                    client = CustomerApiClient(config["base_url"], config["cdk_key"])
-                    payload = client.create_scanner(
-                        access_token,
-                        payment_url,
-                        payment_method=payment_method,
-                        session_cookie=session_cookie,
-                    )
-                    data = _data(payload)
-                    order = data.get("order") if isinstance(data.get("order"), dict) else {}
-                    order_id = _text(order.get("id"))
-                    customer_token = _text(data.get("customerToken"))
-                    poll_url = _text(data.get("pollUrl"))
-                    if not order_id or not customer_token or not poll_url:
-                        raise ValueError("扫码接口响应缺少 order/customerToken/pollUrl")
-                    initial_status = _text(order.get("status") or "PENDING").upper()
-                    scan_url = ""
+                with Session(engine) as session:
+                    pipeline = self._pipeline_for_account(session, account_id)
+                    assert pipeline is not None
+                    pipeline.scanner_submit_attempts = 1
+                    _append_event(pipeline, f"已向 {config['display_name']} 上传扫码任务")
+                    session.add(pipeline)
+                    session.commit()
+                payload = CustomerApiClient(config["base_url"], config["cdk_key"]).create_scanner(
+                    access_token,
+                    payment_url,
+                    payment_method=payment_method,
+                    session_cookie=session_cookie,
+                )
+                data = _data(payload)
+                order = data.get("order") if isinstance(data.get("order"), dict) else {}
+                order_id = _text(order.get("id"))
+                customer_token = _text(data.get("customerToken"))
+                poll_url = _text(data.get("pollUrl"))
+                if not order_id or not customer_token or not poll_url:
+                    raise ValueError("扫码接口响应缺少 order/customerToken/pollUrl")
                 with Session(engine) as session:
                     pipeline = self._pipeline_for_account(session, account_id)
                     assert pipeline is not None
                     pipeline.scanner_order_id = order_id
                     pipeline.scanner_customer_token = customer_token
                     pipeline.scanner_poll_url = poll_url
-                    pipeline.scanner_status = initial_status
+                    pipeline.scanner_status = _text(order.get("status") or "PENDING").upper()
                     pipeline.state = "scanner_processing"
                     pipeline.set_scanner_response(payload)
-                    pipeline.scan_url = scan_url
+                    pipeline.scanner_processing_started_at = _utcnow()
+                    default_deadline = (
+                        _as_utc(pipeline.scanner_processing_started_at)
+                        + timedelta(seconds=SCANNER_PROCESSING_WINDOW_SECONDS)
+                    )
+                    pipeline.scanner_deadline_at = _earlier_deadline(
+                        default_deadline,
+                        _find_scan_value(data, {"expires_at", "expire_at", "expired_at"}),
+                    )
                     pipeline.updated_at = _utcnow()
                     _append_event(pipeline, f"扫码订单已创建: {order_id}")
                     session.add(pipeline)
@@ -948,7 +1268,7 @@ class KakaoPipelineService:
                     return self._serialize_pipeline(pipeline, detail=True)
             except Exception as exc:
                 code = exc.code if isinstance(exc, CustomerApiProblem) else "scanner_submit_failed"
-                depleted = _is_workstation_cdk_depleted(code, str(exc)) if kind == "scanner_546789" else _is_cdk_depleted(code, str(exc))
+                depleted = _is_cdk_depleted(code, str(exc))
                 if depleted:
                     self._remove_cdks(kind, [config["cdk_key"]])
                 with Session(engine) as session:
@@ -957,11 +1277,264 @@ class KakaoPipelineService:
                     message = str(exc)
                     if depleted:
                         message = f"{message}；已删除用完的 CDK，可使用池中下一条重新上传"
-                    _set_error(pipeline, "scanner_failed", code, message)
-                    pipeline.scanner_status = "FAILED"
+                    if _is_ambiguous_submit_problem(exc):
+                        self._start_untracked_plus_confirmation(
+                            pipeline,
+                            scanner_status="SUBMIT_UNCONFIRMED",
+                            reason=code,
+                            event_message="扫码提交结果不确定，停止重复上传并转为 30 分钟 Plus 观察",
+                        )
+                    else:
+                        _set_error(pipeline, "scanner_failed", code, message)
+                        pipeline.scanner_status = "FAILED"
                     session.add(pipeline)
                     session.commit()
+                    result = self._serialize_pipeline(pipeline, detail=True)
+                if _is_ambiguous_submit_problem(exc):
+                    return result
                 raise
+
+    def _submit_workstation_scanner(self, account_id: int, *, compensation: bool, reason: str = "") -> dict:
+        with _account_lock(account_id):
+            with Session(engine) as session:
+                pipeline = self._pipeline_for_account(session, account_id)
+                if pipeline is None or pipeline.scanner_driver != "payment_submission" or not pipeline.payment_url:
+                    raise ValueError("当前账号没有可补偿的 546789 扫码任务")
+                if compensation and pipeline.scanner_compensation_attempted:
+                    self._start_untracked_plus_confirmation(
+                        pipeline,
+                        scanner_status="SUBMIT_UNCONFIRMED",
+                        reason="compensation_already_used",
+                        event_message="扫码订单无法追踪且补偿已使用，停止提交并转为 30 分钟 Plus 观察",
+                    )
+                    session.add(pipeline)
+                    session.commit()
+                    return self._serialize_pipeline(pipeline, detail=True)
+                if compensation:
+                    pipeline.scanner_compensation_attempted = True
+                    pipeline.scanner_recovery_reason = _text(reason) or "submission_untracked"
+                    pipeline.scanner_status = "COMPENSATING"
+                    _append_event(pipeline, "扫码任务无法追踪，立即执行唯一一次补偿提交", level="warning")
+                else:
+                    pipeline.scanner_status = "SUBMITTING"
+                    _append_event(pipeline, f"已向 {pipeline.scanner_name or '546789 扫码平台'} 上传扫码任务")
+                pipeline.scanner_submit_attempts = int(pipeline.scanner_submit_attempts or 0) + 1
+                pipeline.state = "scanner_submitting"
+                pipeline.updated_at = _utcnow()
+                base_url = pipeline.scanner_base_url
+                cdk_key = pipeline.scanner_cdk_key
+                payment_url = pipeline.payment_url
+                session.add(pipeline)
+                session.commit()
+
+            try:
+                client = WorkstationScannerClient(base_url, cdk_key)
+                payload = client.submit_payment(payment_url)
+                submissions = payload.get("submissions") if isinstance(payload.get("submissions"), list) else []
+                order = submissions[0] if submissions and isinstance(submissions[0], dict) else {}
+                order_id = _text(order.get("id"))
+                if not order_id:
+                    raise CustomerApiProblem(502, "missing_submission_id", "546789 扫码接口响应缺少 submission ID")
+                with Session(engine) as session:
+                    pipeline = self._pipeline_for_account(session, account_id)
+                    assert pipeline is not None
+                    pipeline.scanner_order_id = order_id
+                    pipeline.scanner_customer_token = ""
+                    pipeline.scanner_poll_url = ""
+                    pipeline.scanner_status = _text(order.get("state") or "PENDING").upper()
+                    pipeline.state = "scanner_processing"
+                    pipeline.set_scanner_response(payload)
+                    pipeline.scan_url = client.qr_url(order_id)
+                    pipeline.scan_expires_at = ""
+                    pipeline.scanner_poll_failures = 0
+                    pipeline.scanner_processing_started_at = _utcnow()
+                    default_deadline = (
+                        _as_utc(pipeline.scanner_processing_started_at)
+                        + timedelta(seconds=SCANNER_PROCESSING_WINDOW_SECONDS)
+                    )
+                    pipeline.scanner_deadline_at = _earlier_deadline(
+                        default_deadline,
+                        _find_scan_value(order, {"expires_at", "expire_at", "expired_at"}),
+                    )
+                    pipeline.last_error_code = ""
+                    pipeline.last_error_message = ""
+                    pipeline.updated_at = _utcnow()
+                    _append_event(pipeline, f"扫码订单已创建: {order_id}")
+                    session.add(pipeline)
+                    session.commit()
+                    return self._serialize_pipeline(pipeline, detail=True)
+            except Exception as exc:
+                if compensation and _is_duplicate_payment_submission(exc):
+                    with Session(engine) as session:
+                        pipeline = self._pipeline_for_account(session, account_id)
+                        assert pipeline is not None
+                        self._start_untracked_plus_confirmation(
+                            pipeline,
+                            scanner_status="DUPLICATE_ACCEPTED",
+                            reason="duplicate_submission",
+                            event_message="补偿提交确认上游已接收支付链接，转为无单号 Plus 确认",
+                        )
+                        session.add(pipeline)
+                        session.commit()
+                        return self._serialize_pipeline(pipeline, detail=True)
+
+                code = exc.code if isinstance(exc, CustomerApiProblem) else "scanner_submit_failed"
+                if _is_workstation_cdk_depleted(code, str(exc)):
+                    self._remove_cdks("scanner_546789", [cdk_key])
+                    with Session(engine) as session:
+                        pipeline = self._pipeline_for_account(session, account_id)
+                        assert pipeline is not None
+                        _set_error(pipeline, "scanner_failed", code, f"{exc}；已删除用完的 CDK，可使用池中下一条重新上传")
+                        pipeline.scanner_status = "FAILED"
+                        session.add(pipeline)
+                        session.commit()
+                    raise
+
+                if not compensation and _is_ambiguous_submit_problem(exc):
+                    with Session(engine) as session:
+                        pipeline = self._pipeline_for_account(session, account_id)
+                        assert pipeline is not None
+                        pipeline.last_error_code = code
+                        pipeline.last_error_message = str(exc)[:1000]
+                        _append_event(pipeline, f"首次提交结果不确定: {exc}", level="warning")
+                        session.add(pipeline)
+                        session.commit()
+                    return self._submit_workstation_scanner(account_id, compensation=True, reason=code)
+
+                with Session(engine) as session:
+                    pipeline = self._pipeline_for_account(session, account_id)
+                    assert pipeline is not None
+                    if compensation:
+                        if _is_ambiguous_submit_problem(exc):
+                            self._start_untracked_plus_confirmation(
+                                pipeline,
+                                scanner_status="SUBMIT_UNCONFIRMED",
+                                reason=code,
+                                event_message="两次扫码提交结果均无法确认，停止提交并转为 30 分钟 Plus 观察",
+                            )
+                        else:
+                            _set_error(pipeline, "scanner_submit_unconfirmed", code, f"唯一一次补偿提交仍未确认: {exc}")
+                            pipeline.scanner_status = "UNCONFIRMED"
+                            pipeline.scan_url = ""
+                            pipeline.scan_expires_at = ""
+                    else:
+                        _set_error(pipeline, "scanner_failed", code, str(exc))
+                        pipeline.scanner_status = "FAILED"
+                    session.add(pipeline)
+                    session.commit()
+                    result = self._serialize_pipeline(pipeline, detail=True)
+                if not compensation:
+                    raise
+                return result
+
+    def _resume_scanner_submit(self, account_id: int) -> dict:
+        with Session(engine) as session:
+            pipeline = self._pipeline_for_account(session, account_id)
+            if pipeline is None:
+                return self._serialize_pipeline(None)
+            if pipeline.scanner_driver != "payment_submission":
+                self._start_untracked_plus_confirmation(
+                    pipeline,
+                    scanner_status="SUBMIT_UNCONFIRMED",
+                    reason="scanner_submit_interrupted",
+                    event_message="扫码提交被服务重启中断，停止重复上传并转为 30 分钟 Plus 观察",
+                )
+                session.add(pipeline)
+                session.commit()
+                return self._serialize_pipeline(pipeline, detail=True)
+            already_compensated = bool(pipeline.scanner_compensation_attempted)
+        if not already_compensated:
+            return self._submit_workstation_scanner(account_id, compensation=True, reason="process_interrupted")
+        with Session(engine) as session:
+            pipeline = self._pipeline_for_account(session, account_id)
+            assert pipeline is not None
+            self._start_untracked_plus_confirmation(
+                pipeline,
+                scanner_status="SUBMIT_UNCONFIRMED",
+                reason="compensation_interrupted",
+                event_message="补偿提交被服务重启中断，停止再次提交并转为 30 分钟 Plus 观察",
+            )
+            session.add(pipeline)
+            session.commit()
+            return self._serialize_pipeline(pipeline, detail=True)
+
+    @staticmethod
+    def _ensure_supplier_processing_window(pipeline: KakaoPipelineModel) -> None:
+        if pipeline.supplier_processing_started_at is None:
+            pipeline.supplier_processing_started_at = pipeline.updated_at or _utcnow()
+        expected_deadline = _as_utc(pipeline.supplier_processing_started_at) + timedelta(
+            seconds=SUPPLIER_PROCESSING_WINDOW_SECONDS
+        )
+        if pipeline.supplier_deadline_at is None or _as_utc(pipeline.supplier_deadline_at) > expected_deadline:
+            pipeline.supplier_deadline_at = expected_deadline
+
+    @staticmethod
+    def _supplier_processing_expired(pipeline: KakaoPipelineModel) -> bool:
+        return bool(pipeline.supplier_deadline_at and _as_utc(pipeline.supplier_deadline_at) <= _utcnow())
+
+    @staticmethod
+    def _ensure_scanner_processing_window(pipeline: KakaoPipelineModel) -> None:
+        if pipeline.scanner_processing_started_at is None:
+            pipeline.scanner_processing_started_at = pipeline.updated_at or _utcnow()
+        expected_deadline = _as_utc(pipeline.scanner_processing_started_at) + timedelta(
+            seconds=SCANNER_PROCESSING_WINDOW_SECONDS
+        )
+        if pipeline.scanner_deadline_at is None or _as_utc(pipeline.scanner_deadline_at) > expected_deadline:
+            pipeline.scanner_deadline_at = expected_deadline
+
+    @staticmethod
+    def _scanner_processing_expired(pipeline: KakaoPipelineModel) -> bool:
+        return bool(pipeline.scanner_deadline_at and _as_utc(pipeline.scanner_deadline_at) <= _utcnow())
+
+    @staticmethod
+    def _start_untracked_plus_confirmation(
+        pipeline: KakaoPipelineModel,
+        *,
+        scanner_status: str,
+        reason: str,
+        event_message: str,
+    ) -> None:
+        started_at = _utcnow()
+        deadline_at = started_at + timedelta(seconds=UNTRACKED_PLUS_WINDOW_SECONDS)
+        pipeline.state = "scanner_accepted_untracked"
+        pipeline.scanner_status = scanner_status
+        pipeline.scanner_order_id = ""
+        pipeline.scanner_customer_token = ""
+        pipeline.scanner_poll_url = ""
+        pipeline.scan_url = ""
+        pipeline.scan_expires_at = ""
+        pipeline.scanner_recovery_reason = _text(reason) or "submission_untracked"
+        pipeline.scanner_recovery_started_at = started_at
+        pipeline.scanner_recovery_check_count = 0
+        pipeline.scanner_recovery_next_check_at = min(
+            started_at + timedelta(seconds=UNTRACKED_PLUS_INITIAL_DELAY_SECONDS),
+            deadline_at,
+        )
+        pipeline.scanner_recovery_deadline_at = deadline_at
+        pipeline.scanner_processing_started_at = None
+        pipeline.scanner_deadline_at = None
+        pipeline.plus_status = "waiting"
+        pipeline.last_error_code = ""
+        pipeline.last_error_message = ""
+        pipeline.updated_at = started_at
+        _append_event(pipeline, event_message, level="warning")
+
+    def _mark_interrupted_supplier_submit(self, account_id: int) -> dict:
+        with Session(engine) as session:
+            pipeline = self._pipeline_for_account(session, account_id)
+            if pipeline is None:
+                return self._serialize_pipeline(None)
+            if pipeline.state == "supplier_submitting":
+                _set_error(
+                    pipeline,
+                    "supplier_submit_unconfirmed",
+                    "supplier_submit_interrupted",
+                    "提链提交被服务重启中断，结果无法确认；为避免重复订单已停止自动重试",
+                )
+                pipeline.supplier_status = "UNCONFIRMED"
+                session.add(pipeline)
+                session.commit()
+            return self._serialize_pipeline(pipeline, detail=True)
 
     def poll_scanner(self, account_id: int) -> dict:
         with _account_lock(account_id):
@@ -969,6 +1542,20 @@ class KakaoPipelineService:
                 pipeline = self._pipeline_for_account(session, account_id)
                 if pipeline is None or not pipeline.scanner_order_id:
                     raise ValueError("当前账号没有扫码订单")
+                manual_recovery = pipeline.state == "scanner_poll_failed"
+                if pipeline.state not in {"scanner_processing", "scanner_poll_failed"}:
+                    return self._serialize_pipeline(pipeline, detail=True)
+                self._ensure_scanner_processing_window(pipeline)
+                if not manual_recovery and self._scanner_processing_expired(pipeline):
+                    _set_error(
+                        pipeline,
+                        "scanner_poll_failed",
+                        "scanner_processing_timeout",
+                        "扫码订单处理超过 30 分钟，已停止自动查询，可手动继续查询原订单",
+                    )
+                    session.add(pipeline)
+                    session.commit()
+                    return self._serialize_pipeline(pipeline, detail=True)
                 scanner_driver = pipeline.scanner_driver or "customer_api"
                 poll_url = pipeline.scanner_poll_url
                 customer_token = pipeline.scanner_customer_token
@@ -978,21 +1565,36 @@ class KakaoPipelineService:
                 else:
                     payload = CustomerApiClient(pipeline.scanner_base_url, pipeline.scanner_cdk_key).get_order(poll_url, customer_token)
             except Exception as exc:
+                if scanner_driver == "payment_submission" and _is_missing_submission_problem(exc):
+                    return self._submit_workstation_scanner(account_id, compensation=True, reason="submission_missing")
                 with Session(engine) as session:
                     pipeline = self._pipeline_for_account(session, account_id)
                     assert pipeline is not None
+                    if pipeline.state not in {"scanner_processing", "scanner_poll_failed"}:
+                        return self._serialize_pipeline(pipeline, detail=True)
+                    pipeline.scanner_poll_failures = int(pipeline.scanner_poll_failures or 0) + 1
                     pipeline.last_error_code = exc.code if isinstance(exc, CustomerApiProblem) else "scanner_poll_failed"
                     pipeline.last_error_message = str(exc)[:1000]
                     pipeline.updated_at = _utcnow()
                     _append_event(pipeline, f"刷新扫码状态失败: {exc}", level="warning")
+                    transient = _is_transient_poll_problem(exc)
+                    if not transient or pipeline.scanner_poll_failures >= MAX_SCANNER_POLL_FAILURES:
+                        _set_error(
+                            pipeline,
+                            "scanner_poll_failed",
+                            pipeline.last_error_code,
+                            f"扫码状态连续查询失败，已停止自动轮询: {exc}" if transient else str(exc),
+                        )
                     session.add(pipeline)
                     session.commit()
+                    if pipeline.state == "scanner_poll_failed":
+                        return self._serialize_pipeline(pipeline, detail=True)
                 raise
 
             data = _data(payload)
             if scanner_driver == "payment_submission":
                 status = _text(data.get("state") or "PENDING").upper()
-                outcome = "success" if status == "COMPLETED" else ("failed" if status in {"EXPIRED", "UNKNOWN", "FAILED"} else "processing")
+                outcome = _workstation_outcome(status)
             else:
                 status = _text(data.get("status") or "PENDING").upper()
                 outcome = _scanner_outcome(data)
@@ -1003,20 +1605,31 @@ class KakaoPipelineService:
             with Session(engine) as session:
                 pipeline = self._pipeline_for_account(session, account_id)
                 assert pipeline is not None
+                if pipeline.state not in {"scanner_processing", "scanner_poll_failed"}:
+                    return self._serialize_pipeline(pipeline, detail=True)
                 previous = pipeline.scanner_status
                 pipeline.scanner_status = status
                 pipeline.set_scanner_response(payload)
                 pipeline.scan_url = scan_url or pipeline.scan_url
                 pipeline.scan_expires_at = expires_at or pipeline.scan_expires_at
+                if pipeline.scanner_deadline_at and expires_at:
+                    pipeline.scanner_deadline_at = _earlier_deadline(pipeline.scanner_deadline_at, expires_at)
                 pipeline.updated_at = _utcnow()
                 if previous != status:
                     _append_event(pipeline, f"扫码状态: {status}")
                 if outcome == "success":
+                    pipeline.scanner_poll_failures = 0
                     pipeline.state = "scanner_succeeded"
                     pipeline.last_error_code = ""
                     pipeline.last_error_message = ""
                     _append_event(pipeline, "扫码平台返回成功，等待本地 Plus 复检")
+                elif outcome == "missing":
+                    pipeline.scanner_poll_failures = 0
+                    session.add(pipeline)
+                    session.commit()
+                    return self._submit_workstation_scanner(account_id, compensation=True, reason="unknown_submission")
                 elif outcome == "failed":
+                    pipeline.scanner_poll_failures = 0
                     if scanner_driver == "payment_submission":
                         code = "payment_link_expired" if status == "EXPIRED" else "scanner_failed"
                         message = "支付链接已失效" if status == "EXPIRED" else f"546789 扫码任务失败: {status}"
@@ -1026,26 +1639,141 @@ class KakaoPipelineService:
                         self._remove_cdks("scanner", [pipeline.scanner_cdk_key])
                         message = f"{message}；已删除用完的 CDK，可使用池中下一条重新上传"
                     _set_error(pipeline, "scanner_failed", code, message)
+                elif outcome == "processing":
+                    pipeline.scanner_poll_failures = 0
+                    if self._scanner_processing_expired(pipeline):
+                        _set_error(
+                            pipeline,
+                            "scanner_poll_failed",
+                            "scanner_processing_timeout",
+                            "扫码订单仍在处理中且已超过 30 分钟，可稍后手动继续查询原订单",
+                        )
+                    else:
+                        pipeline.state = "scanner_processing"
                 else:
-                    pipeline.state = "scanner_processing"
+                    pipeline.scanner_poll_failures = int(pipeline.scanner_poll_failures or 0) + 1
+                    pipeline.last_error_code = "scanner_unknown_status"
+                    pipeline.last_error_message = f"扫码平台返回未识别状态: {status}"[:1000]
+                    _append_event(pipeline, pipeline.last_error_message, level="warning")
+                    if pipeline.scanner_poll_failures >= MAX_SCANNER_POLL_FAILURES:
+                        _set_error(pipeline, "scanner_poll_failed", "scanner_unknown_status", pipeline.last_error_message)
+                    else:
+                        pipeline.state = "scanner_processing"
                 session.add(pipeline)
                 session.commit()
                 return self._serialize_pipeline(pipeline, detail=True)
 
+    @staticmethod
+    def _ensure_plus_window(pipeline: KakaoPipelineModel) -> None:
+        if pipeline.plus_check_started_at is None:
+            pipeline.plus_check_started_at = pipeline.updated_at or _utcnow()
+        expected_deadline = _as_utc(pipeline.plus_check_started_at) + timedelta(
+            seconds=PLUS_CONFIRM_WINDOW_SECONDS
+        )
+        if (
+            pipeline.plus_check_deadline_at is None
+            or _as_utc(pipeline.plus_check_deadline_at) > expected_deadline
+        ):
+            pipeline.plus_check_deadline_at = expected_deadline
+
+    @staticmethod
+    def _plus_window_expired(pipeline: KakaoPipelineModel) -> bool:
+        if pipeline.plus_check_deadline_at is None:
+            return False
+        return _as_utc(pipeline.plus_check_deadline_at) <= _utcnow()
+
+    @staticmethod
+    def _pause_plus_confirmation(pipeline: KakaoPipelineModel, message: str = "") -> None:
+        pipeline.state = "plus_unconfirmed"
+        pipeline.plus_status = pipeline.plus_status or "unconfirmed"
+        pipeline.final_result = "not_plus"
+        pipeline.plus_next_check_at = None
+        pipeline.plus_check_paused_at = _utcnow()
+        pipeline.last_error_code = "plus_unconfirmed"
+        pipeline.last_error_message = message or "扫码平台已完成，但 10 分钟内尚未确认 Plus"
+        pipeline.updated_at = _utcnow()
+        _append_event(pipeline, pipeline.last_error_message, level="warning")
+
+    @staticmethod
+    def _ensure_untracked_plus_window(pipeline: KakaoPipelineModel) -> None:
+        if pipeline.scanner_recovery_started_at is None:
+            pipeline.scanner_recovery_started_at = pipeline.updated_at or _utcnow()
+        expected_deadline = _as_utc(pipeline.scanner_recovery_started_at) + timedelta(
+            seconds=UNTRACKED_PLUS_WINDOW_SECONDS
+        )
+        if (
+            pipeline.scanner_recovery_deadline_at is None
+            or _as_utc(pipeline.scanner_recovery_deadline_at) > expected_deadline
+        ):
+            pipeline.scanner_recovery_deadline_at = expected_deadline
+        if pipeline.scanner_recovery_next_check_at is None:
+            if int(pipeline.scanner_recovery_check_count or 0) == 0:
+                pipeline.scanner_recovery_next_check_at = min(
+                    _as_utc(pipeline.scanner_recovery_started_at)
+                    + timedelta(seconds=UNTRACKED_PLUS_INITIAL_DELAY_SECONDS),
+                    _as_utc(pipeline.scanner_recovery_deadline_at),
+                )
+            else:
+                pipeline.scanner_recovery_next_check_at = _utcnow()
+
+    @staticmethod
+    def _untracked_plus_window_expired(pipeline: KakaoPipelineModel) -> bool:
+        if pipeline.scanner_recovery_deadline_at is None:
+            return False
+        return _as_utc(pipeline.scanner_recovery_deadline_at) <= _utcnow()
+
+    @staticmethod
+    def _pause_untracked_plus_confirmation(pipeline: KakaoPipelineModel, message: str = "") -> None:
+        pipeline.state = "scanner_recovery_unconfirmed"
+        pipeline.plus_status = pipeline.plus_status or "unconfirmed"
+        pipeline.final_result = "not_plus"
+        pipeline.scanner_recovery_next_check_at = None
+        pipeline.last_error_code = "untracked_plus_unconfirmed"
+        pipeline.last_error_message = message or "上游已接收链接，但 30 分钟内尚未确认 Plus"
+        pipeline.updated_at = _utcnow()
+        _append_event(pipeline, pipeline.last_error_message, level="warning")
+
     def check_plus(self, account_id: int, *, advance_pipeline: bool = False) -> dict:
         with _account_lock(account_id):
+            check_started_at = _utcnow()
             with Session(engine) as session:
                 pipeline = self._pipeline_for_account(session, account_id, create=True)
                 assert pipeline is not None
-                pipeline.plus_status = "checking"
+                preserve_completed = pipeline.state == "completed"
+                if preserve_completed:
+                    advance_pipeline = False
+                if advance_pipeline and pipeline.state in {
+                    "scanner_accepted_untracked",
+                    "scanner_recovery_unconfirmed",
+                    "scanner_submit_unconfirmed",
+                }:
+                    return self.check_untracked_plus(account_id)
+                if advance_pipeline and pipeline.state not in {
+                    "scanner_succeeded",
+                    "plus_checking",
+                    "plus_pending",
+                    "plus_check_failed",
+                    "plus_unconfirmed",
+                }:
+                    raise ValueError("当前流水线状态不能推进 Plus 复检")
+                if not preserve_completed:
+                    pipeline.plus_status = "checking"
                 if advance_pipeline:
-                    pipeline.state = "plus_checking"
+                    manual_paused_check = pipeline.state == "plus_unconfirmed"
+                    self._ensure_plus_window(pipeline)
+                    pipeline.state = "plus_unconfirmed" if manual_paused_check else "plus_checking"
                     pipeline.last_error_code = ""
                     pipeline.last_error_message = ""
+                else:
+                    manual_paused_check = False
                 pipeline.updated_at = _utcnow()
                 _append_event(
                     pipeline,
-                    "开始流水线 Plus 复检" if advance_pipeline else "开始人工检测账号 Plus 状态",
+                    (
+                        "开始人工检测暂停任务的 Plus 状态"
+                        if manual_paused_check
+                        else ("开始流水线 Plus 复检" if advance_pipeline else "开始人工检测账号 Plus 状态")
+                    ),
                 )
                 session.add(pipeline)
                 session.commit()
@@ -1061,9 +1789,37 @@ class KakaoPipelineService:
                 with Session(engine) as session:
                     pipeline = self._pipeline_for_account(session, account_id)
                     assert pipeline is not None
+                    if preserve_completed:
+                        pipeline.updated_at = _utcnow()
+                        _append_event(pipeline, result.error or "Plus 检测失败", level="warning")
+                        session.add(pipeline)
+                        session.commit()
+                        return self._serialize_pipeline(pipeline, detail=True)
                     pipeline.plus_status = "error"
                     if advance_pipeline:
-                        _set_error(pipeline, "plus_check_failed", "plus_check_failed", result.error or "Plus 检测失败")
+                        if manual_paused_check:
+                            pipeline.state = "plus_unconfirmed"
+                            pipeline.last_error_code = "plus_check_failed"
+                            pipeline.last_error_message = (result.error or "Plus 检测失败")[:1000]
+                            pipeline.updated_at = _utcnow()
+                            _append_event(pipeline, pipeline.last_error_message, level="warning")
+                        else:
+                            self._ensure_plus_window(pipeline)
+                            pipeline.plus_check_count = int(pipeline.plus_check_count or 0) + 1
+                            if self._plus_window_expired(pipeline):
+                                self._pause_plus_confirmation(pipeline, "Plus 查询持续失败，10 分钟确认窗口已结束")
+                            else:
+                                pipeline.state = "plus_pending"
+                                pipeline.plus_next_check_at = min(
+                                    _utcnow() + timedelta(
+                                        seconds=_next_plus_delay_seconds(pipeline.plus_check_count)
+                                    ),
+                                    _as_utc(pipeline.plus_check_deadline_at),
+                                )
+                                pipeline.last_error_code = "plus_check_failed"
+                                pipeline.last_error_message = (result.error or "Plus 检测失败")[:1000]
+                                pipeline.updated_at = _utcnow()
+                                _append_event(pipeline, pipeline.last_error_message, level="warning")
                     else:
                         pipeline.updated_at = _utcnow()
                         _append_event(pipeline, result.error or "Plus 检测失败", level="error")
@@ -1074,23 +1830,211 @@ class KakaoPipelineService:
             account = self.accounts.get_account(int(account_id)) or {}
             view = account.get("account_view") if isinstance(account.get("account_view"), dict) else {}
             subscription = view.get("subscription") if isinstance(view.get("subscription"), dict) else {}
+            status_view = view.get("status") if isinstance(view.get("status"), dict) else {}
+            checked_at = _parse_datetime(status_view.get("checked_at") or account.get("checked_at"))
+            fresh_check = bool(checked_at and checked_at.astimezone(timezone.utc) >= check_started_at)
             plan = _text(subscription.get("plan") or account.get("plan_name")).lower()
             plan_state = _text(subscription.get("state") or account.get("plan_state")).lower()
-            is_plus = plan_state == "subscribed" or any(token in plan for token in ("plus", "pro", "team", "business", "enterprise"))
+            is_plus = fresh_check and (
+                plan_state == "subscribed"
+                or any(token in plan for token in ("plus", "pro", "team", "business", "enterprise"))
+            )
+            with Session(engine) as session:
+                pipeline = self._pipeline_for_account(session, account_id)
+                assert pipeline is not None
+                if preserve_completed:
+                    pipeline.updated_at = _utcnow()
+                    _append_event(
+                        pipeline,
+                        "已完成账号仍为 Plus" if is_plus else "账号状态已刷新，已完成流水线保持不变",
+                        level="info" if is_plus else "warning",
+                    )
+                    session.add(pipeline)
+                    session.commit()
+                    return self._serialize_pipeline(pipeline, detail=True)
+                pipeline.plus_status = "plus" if is_plus else (plan or plan_state or "free")
+                pipeline.final_result = "plus" if is_plus else "not_plus"
+                if advance_pipeline:
+                    if is_plus:
+                        pipeline.state = "completed"
+                        pipeline.completed_at = _utcnow()
+                        pipeline.completion_source = "normal_scanner"
+                        pipeline.plus_next_check_at = None
+                        pipeline.plus_check_paused_at = None
+                        pipeline.last_error_code = ""
+                        pipeline.last_error_message = ""
+                    elif manual_paused_check:
+                        pipeline.state = "plus_unconfirmed"
+                        pipeline.plus_next_check_at = None
+                        pipeline.last_error_code = "plus_unconfirmed"
+                        pipeline.last_error_message = (
+                            "本次检测结果缺少刷新时间，任务继续保持暂停"
+                            if not fresh_check
+                            else "本次人工检测仍未确认 Plus"
+                        )
+                    else:
+                        self._ensure_plus_window(pipeline)
+                        pipeline.plus_check_count = int(pipeline.plus_check_count or 0) + 1
+                        if self._plus_window_expired(pipeline):
+                            self._pause_plus_confirmation(pipeline)
+                        else:
+                            pipeline.state = "plus_pending"
+                            pipeline.plus_next_check_at = min(
+                                _utcnow() + timedelta(
+                                    seconds=_next_plus_delay_seconds(pipeline.plus_check_count)
+                                ),
+                                _as_utc(pipeline.plus_check_deadline_at),
+                            )
+                pipeline.updated_at = _utcnow()
+                _append_event(
+                    pipeline,
+                    (
+                        "账号已确认升级为 Plus"
+                        if is_plus
+                        else (
+                            "Plus 检测结果缺少本次刷新时间，暂不采信"
+                            if not fresh_check
+                            else f"本地复检尚未发现 Plus（{plan or plan_state or 'unknown'}）"
+                        )
+                    ),
+                    level="info" if is_plus else "warning",
+                )
+                session.add(pipeline)
+                session.commit()
+                return self._serialize_pipeline(pipeline, detail=True)
+
+    def check_untracked_plus(self, account_id: int) -> dict:
+        """Confirm Plus after 546789 accepted a duplicate link without returning an order ID."""
+        with _account_lock(account_id):
+            check_started_at = _utcnow()
+            with Session(engine) as session:
+                pipeline = self._pipeline_for_account(session, account_id)
+                if pipeline is None or pipeline.state not in {
+                    "scanner_accepted_untracked",
+                    "scanner_recovery_unconfirmed",
+                    "scanner_submit_unconfirmed",
+                }:
+                    raise ValueError("当前流水线不需要无单号 Plus 确认")
+                was_unconfirmed = pipeline.state in {
+                    "scanner_recovery_unconfirmed",
+                    "scanner_submit_unconfirmed",
+                    "scanner_poll_failed",
+                }
+                pipeline.plus_status = "checking_untracked"
+                pipeline.scanner_recovery_check_count = int(pipeline.scanner_recovery_check_count or 0) + 1
+                attempt = pipeline.scanner_recovery_check_count
+                pipeline.updated_at = _utcnow()
+                _append_event(pipeline, f"开始第 {attempt} 次无单号 Plus 确认")
+                session.add(pipeline)
+                session.commit()
+
+            result = PlatformRuntime().execute_action(
+                ActionExecutionCommand(
+                    platform="chatgpt",
+                    account_id=int(account_id),
+                    action_id="query_state",
+                    params={"platform_proxy_mode": "direct"},
+                )
+            )
+            if not result.ok:
+                with Session(engine) as session:
+                    pipeline = self._pipeline_for_account(session, account_id)
+                    assert pipeline is not None
+                    pipeline.plus_status = "check_error"
+                    pipeline.last_error_code = "untracked_plus_check_failed"
+                    pipeline.last_error_message = (result.error or "无单号 Plus 确认失败")[:1000]
+                    pipeline.updated_at = _utcnow()
+                    _append_event(pipeline, pipeline.last_error_message, level="warning")
+                    if was_unconfirmed:
+                        self._pause_untracked_plus_confirmation(
+                            pipeline,
+                            "本次人工检测失败，任务继续保持暂停",
+                        )
+                    else:
+                        self._ensure_untracked_plus_window(pipeline)
+                        if self._untracked_plus_window_expired(pipeline):
+                            self._pause_untracked_plus_confirmation(
+                                pipeline,
+                                "无单号 Plus 查询持续失败，30 分钟观察窗口已结束",
+                            )
+                        else:
+                            pipeline.state = "scanner_accepted_untracked"
+                            pipeline.scanner_recovery_next_check_at = min(
+                                _utcnow() + timedelta(
+                                    seconds=_next_untracked_plus_delay_seconds(
+                                        pipeline.scanner_recovery_check_count
+                                    )
+                                ),
+                                _as_utc(pipeline.scanner_recovery_deadline_at),
+                            )
+                    session.add(pipeline)
+                    session.commit()
+                    return self._serialize_pipeline(pipeline, detail=True)
+
+            account = self.accounts.get_account(int(account_id)) or {}
+            view = account.get("account_view") if isinstance(account.get("account_view"), dict) else {}
+            subscription = view.get("subscription") if isinstance(view.get("subscription"), dict) else {}
+            status_view = view.get("status") if isinstance(view.get("status"), dict) else {}
+            checked_at = _parse_datetime(status_view.get("checked_at") or account.get("checked_at"))
+            fresh_check = bool(checked_at and checked_at.astimezone(timezone.utc) >= check_started_at)
+            plan = _text(subscription.get("plan") or account.get("plan_name")).lower()
+            plan_state = _text(subscription.get("state") or account.get("plan_state")).lower()
+            is_plus = fresh_check and (
+                plan_state == "subscribed"
+                or any(token in plan for token in ("plus", "pro", "team", "business", "enterprise"))
+            )
             with Session(engine) as session:
                 pipeline = self._pipeline_for_account(session, account_id)
                 assert pipeline is not None
                 pipeline.plus_status = "plus" if is_plus else (plan or plan_state or "free")
                 pipeline.final_result = "plus" if is_plus else "not_plus"
-                if advance_pipeline:
-                    pipeline.state = "completed" if is_plus else "plus_pending"
-                    pipeline.completed_at = _utcnow() if is_plus else None
-                pipeline.updated_at = _utcnow()
-                _append_event(
-                    pipeline,
-                    "账号已确认升级为 Plus" if is_plus else f"本地复检尚未发现 Plus（{plan or plan_state or 'unknown'}）",
-                    level="info" if is_plus else "warning",
-                )
+                pipeline.last_error_code = ""
+                pipeline.last_error_message = ""
+                if is_plus:
+                    pipeline.state = "completed"
+                    pipeline.completed_at = _utcnow()
+                    pipeline.scanner_recovery_next_check_at = None
+                    duplicate_confirmed = pipeline.scanner_status == "DUPLICATE_ACCEPTED"
+                    pipeline.completion_source = (
+                        "duplicate_submission_untracked"
+                        if duplicate_confirmed
+                        else "untracked_scanner_confirmation"
+                    )
+                    _append_event(
+                        pipeline,
+                        "重复提交后的无单号 Plus 确认成功，账号已升级为 Plus"
+                        if duplicate_confirmed
+                        else "扫码状态不可追踪，但本地已确认账号升级为 Plus",
+                    )
+                elif was_unconfirmed:
+                    self._pause_untracked_plus_confirmation(
+                        pipeline,
+                        "本次人工检测仍未确认 Plus，任务继续保持暂停",
+                    )
+                else:
+                    self._ensure_untracked_plus_window(pipeline)
+                    if self._untracked_plus_window_expired(pipeline):
+                        self._pause_untracked_plus_confirmation(pipeline)
+                    else:
+                        pipeline.state = "scanner_accepted_untracked"
+                        pipeline.scanner_recovery_next_check_at = min(
+                            _utcnow() + timedelta(
+                                seconds=_next_untracked_plus_delay_seconds(
+                                    pipeline.scanner_recovery_check_count
+                                )
+                            ),
+                            _as_utc(pipeline.scanner_recovery_deadline_at),
+                        )
+                        pipeline.updated_at = _utcnow()
+                        _append_event(
+                            pipeline,
+                            (
+                                f"无单号确认结果缺少本次刷新时间，暂不采信 Plus 状态"
+                                if not fresh_check
+                                else f"无单号确认尚未发现 Plus（{plan or plan_state or 'unknown'}）"
+                            ),
+                            level="warning",
+                        )
                 session.add(pipeline)
                 session.commit()
                 return self._serialize_pipeline(pipeline, detail=True)

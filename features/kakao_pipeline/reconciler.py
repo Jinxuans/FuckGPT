@@ -13,7 +13,6 @@ from .service import BACKGROUND_POLL_STATES, KakaoPipelineService
 logger = logging.getLogger(__name__)
 
 _REMOTE_POLL_DELAY_SECONDS = 3.0
-_PLUS_RETRY_DELAYS_SECONDS = (3.0, 5.0, 10.0, 20.0, 30.0, 60.0, 120.0, 300.0)
 _ERROR_RETRY_DELAYS_SECONDS = (3.0, 5.0, 10.0, 20.0, 30.0, 60.0)
 
 
@@ -21,7 +20,6 @@ _ERROR_RETRY_DELAYS_SECONDS = (3.0, 5.0, 10.0, 20.0, 30.0, 60.0)
 class _Schedule:
     next_poll_at: float = 0.0
     failures: int = 0
-    plus_attempts: int = 0
 
 
 class KakaoPipelineReconciler:
@@ -162,19 +160,7 @@ class KakaoPipelineReconciler:
 
             schedule = self._schedules.setdefault(account_id, _Schedule())
             schedule.failures = 0
-            if state == "plus_pending":
-                schedule.plus_attempts += 1
-                if schedule.plus_attempts >= len(_PLUS_RETRY_DELAYS_SECONDS):
-                    schedule.next_poll_at = float("inf")
-                    logger.info("Kakao Plus 自动复检已暂停 account_id=%s，可人工继续检测", account_id)
-                    return
-                delay = _PLUS_RETRY_DELAYS_SECONDS[
-                    schedule.plus_attempts - 1
-                ]
-            else:
-                schedule.plus_attempts = 0
-                delay = _REMOTE_POLL_DELAY_SECONDS
-            schedule.next_poll_at = now + delay
+            schedule.next_poll_at = now + _REMOTE_POLL_DELAY_SECONDS
 
 
 kakao_pipeline_reconciler = KakaoPipelineReconciler()

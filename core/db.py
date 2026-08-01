@@ -507,6 +507,8 @@ class KakaoPipelineModel(SQLModel, table=True):
     supplier_poll_url: str = ""
     supplier_status: str = ""
     supplier_response_json: str = "{}"
+    supplier_processing_started_at: Optional[datetime] = None
+    supplier_deadline_at: Optional[datetime] = None
 
     payment_url: str = ""
 
@@ -522,9 +524,25 @@ class KakaoPipelineModel(SQLModel, table=True):
     scanner_response_json: str = "{}"
     scan_url: str = ""
     scan_expires_at: str = ""
+    scanner_submit_attempts: int = 0
+    scanner_compensation_attempted: bool = False
+    scanner_poll_failures: int = 0
+    scanner_recovery_reason: str = ""
+    scanner_recovery_check_count: int = 0
+    scanner_recovery_started_at: Optional[datetime] = None
+    scanner_recovery_next_check_at: Optional[datetime] = None
+    scanner_recovery_deadline_at: Optional[datetime] = None
+    scanner_processing_started_at: Optional[datetime] = None
+    scanner_deadline_at: Optional[datetime] = None
 
     plus_status: str = ""
     final_result: str = ""
+    completion_source: str = ""
+    plus_check_count: int = 0
+    plus_check_started_at: Optional[datetime] = None
+    plus_next_check_at: Optional[datetime] = None
+    plus_check_deadline_at: Optional[datetime] = None
+    plus_check_paused_at: Optional[datetime] = None
     last_error_code: str = ""
     last_error_message: str = ""
     events_json: str = "[]"
@@ -672,6 +690,24 @@ def init_db():
     _ensure_column("provider_definitions", "category", "TEXT DEFAULT ''")
     _ensure_column("kakao_pipelines", "scanner_driver", "TEXT DEFAULT 'customer_api'")
     _ensure_column("account_status", "invalid_check_count", "INTEGER DEFAULT 0")
+    _ensure_column("kakao_pipelines", "supplier_processing_started_at", "DATETIME")
+    _ensure_column("kakao_pipelines", "supplier_deadline_at", "DATETIME")
+    _ensure_column("kakao_pipelines", "scanner_submit_attempts", "INTEGER DEFAULT 0")
+    _ensure_column("kakao_pipelines", "scanner_compensation_attempted", "BOOLEAN DEFAULT 0")
+    _ensure_column("kakao_pipelines", "scanner_poll_failures", "INTEGER DEFAULT 0")
+    _ensure_column("kakao_pipelines", "scanner_recovery_reason", "TEXT DEFAULT ''")
+    _ensure_column("kakao_pipelines", "scanner_recovery_check_count", "INTEGER DEFAULT 0")
+    _ensure_column("kakao_pipelines", "scanner_recovery_started_at", "DATETIME")
+    _ensure_column("kakao_pipelines", "scanner_recovery_next_check_at", "DATETIME")
+    _ensure_column("kakao_pipelines", "scanner_recovery_deadline_at", "DATETIME")
+    _ensure_column("kakao_pipelines", "scanner_processing_started_at", "DATETIME")
+    _ensure_column("kakao_pipelines", "scanner_deadline_at", "DATETIME")
+    _ensure_column("kakao_pipelines", "completion_source", "TEXT DEFAULT ''")
+    _ensure_column("kakao_pipelines", "plus_check_count", "INTEGER DEFAULT 0")
+    _ensure_column("kakao_pipelines", "plus_check_started_at", "DATETIME")
+    _ensure_column("kakao_pipelines", "plus_next_check_at", "DATETIME")
+    _ensure_column("kakao_pipelines", "plus_check_deadline_at", "DATETIME")
+    _ensure_column("kakao_pipelines", "plus_check_paused_at", "DATETIME")
     SQLModel.metadata.create_all(engine)
 
     with Session(engine) as session:
