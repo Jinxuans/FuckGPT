@@ -12,7 +12,7 @@ import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
 import { getTaskStatusText, TASK_STATUS_VARIANTS } from '@/lib/tasks'
-import { RefreshCw, Copy, Check, KeyRound, ExternalLink, Download, Upload, Plus, X, Mail, Trash2, Zap, ShieldCheck, Send } from 'lucide-react'
+import { RefreshCw, Copy, Check, KeyRound, ExternalLink, Download, Upload, Plus, X, Mail, Trash2, Zap, ShieldCheck, Send, SlidersHorizontal, Save, RotateCcw, Search } from 'lucide-react'
 
 const STATUS_VARIANT: Record<string, any> = {
   registered: 'default', trial: 'success', subscribed: 'success',
@@ -25,6 +25,95 @@ const platformActionsPromiseCache = new Map<string, Promise<any[]>>()
 
 const ACCOUNT_TOOL_BUTTON_CLASS = 'h-8 shrink-0 whitespace-nowrap bg-transparent'
 const ACCOUNT_PAGE_SIZE = 50
+const SAVED_FILTERS_KEY = 'chatgpt-account-filter-presets-v2'
+
+type AccountFilterState = {
+  search: string
+  status: string
+  mailbox_bound: string
+  mailbox_provider: string
+  mailbox_email_match: string
+  phone_state: string
+  checked_state: string
+  mfa_state: string
+  codex_auth_state: string
+  push_status: string
+  push_target: string
+  pushed_from: string
+  pushed_to: string
+  codex_refreshed_from: string
+  codex_refreshed_to: string
+  time_field: string
+  time_from: string
+  time_to: string
+  source: string
+  import_method: string
+  region: string
+  sort_by: string
+  sort_order: string
+}
+
+type SavedFilterPreset = { name: string; filters: AccountFilterState }
+
+const EMPTY_ACCOUNT_FILTERS: AccountFilterState = {
+  search: '',
+  status: '',
+  mailbox_bound: '',
+  mailbox_provider: '',
+  mailbox_email_match: '',
+  phone_state: '',
+  checked_state: '',
+  mfa_state: '',
+  codex_auth_state: '',
+  push_status: '',
+  push_target: '',
+  pushed_from: '',
+  pushed_to: '',
+  codex_refreshed_from: '',
+  codex_refreshed_to: '',
+  time_field: '',
+  time_from: '',
+  time_to: '',
+  source: '',
+  import_method: '',
+  region: '',
+  sort_by: 'created_at',
+  sort_order: 'desc',
+}
+
+function readFiltersFromUrl(): AccountFilterState {
+  const params = new URLSearchParams(window.location.search)
+  const next = { ...EMPTY_ACCOUNT_FILTERS }
+  ;(Object.keys(next) as Array<keyof AccountFilterState>).forEach(key => {
+    const value = params.get(key)
+    if (value !== null) next[key] = value
+  })
+  return next
+}
+
+function toApiFilters(filters: AccountFilterState) {
+  const normalizeTime = (value: string) => {
+    if (!value) return ''
+    const date = new Date(value)
+    return Number.isNaN(date.getTime()) ? '' : date.toISOString()
+  }
+  return {
+    ...filters,
+    time_from: normalizeTime(filters.time_from),
+    time_to: normalizeTime(filters.time_to),
+    pushed_from: normalizeTime(filters.pushed_from),
+    pushed_to: normalizeTime(filters.pushed_to),
+    codex_refreshed_from: normalizeTime(filters.codex_refreshed_from),
+    codex_refreshed_to: normalizeTime(filters.codex_refreshed_to),
+  }
+}
+
+function getActiveFilterCount(filters: AccountFilterState) {
+  return (Object.keys(filters) as Array<keyof AccountFilterState>).filter(key => {
+    if (key === 'search' || key === 'sort_by' || key === 'sort_order') return false
+    return Boolean(filters[key])
+  }).length
+}
 
 type AccountCredential = {
   scope: string
@@ -1949,13 +2038,11 @@ function ImportModal({ onClose, onDone }: { onClose: () => void; onDone: () => v
 
 function ExportMenu({
   total,
-  statusFilter,
-  searchFilter,
+  filters,
   selectedIds,
 }: {
   total: number
-  statusFilter: string
-  searchFilter: string
+  filters: AccountFilterState
   selectedIds: number[]
 }) {
   const [open, setOpen] = useState(false)
@@ -1981,8 +2068,7 @@ function ExportMenu({
           platform: 'chatgpt',
           ids: hasSelection ? selectedIds : [],
           select_all: !hasSelection,
-          status_filter: !hasSelection ? statusFilter || null : null,
-          search_filter: !hasSelection ? searchFilter || null : null,
+          filters: hasSelection ? {} : toApiFilters(filters),
         }),
       })
       triggerBrowserDownload(blob, filename)
@@ -2037,12 +2123,16 @@ function ExportMenu({
 
 function PushMenu({
   targets,
+  total,
+  filters,
   selectedIds,
   onPush,
 }: {
   targets: PushTarget[]
+  total: number
+  filters: AccountFilterState
   selectedIds: number[]
-  onPush: (ids: number[], targetKey: string) => Promise<any>
+  onPush: (ids: number[], targetKey: string, selectAll: boolean, filters: AccountFilterState) => Promise<any>
 }) {
   const [open, setOpen] = useState(false)
   const [loading, setLoading] = useState(false)
@@ -2059,11 +2149,13 @@ function PushMenu({
   }, [open])
 
   const pushTo = async (target: PushTarget) => {
-    if (!selectedIds.length) return
-    if (!window.confirm(`将 ${selectedIds.length} 个已选账号推送到 ${target.label}？`)) return
+    if (total === 0) return
+    const selectAll = selectedIds.length === 0
+    const targetCount = selectAll ? total : selectedIds.length
+    if (!window.confirm(`将当前${selectAll ? '完整筛选结果' : '已选账号'}（${targetCount} 个）推送到 ${target.label}？`)) return
     setLoading(true)
     try {
-      await onPush(selectedIds, target.key)
+      await onPush(selectedIds, target.key, selectAll, filters)
       setOpen(false)
     } catch (error: any) {
       window.alert(error?.message || '推送失败')
@@ -2075,7 +2167,7 @@ function PushMenu({
   const title = targets.length === 0
     ? '请先到设置 → 推送目标中配置并启用目标'
     : selectedIds.length === 0
-      ? '请先勾选要推送的账号'
+      ? `推送当前完整筛选结果，共 ${total} 个账号`
       : `推送 ${selectedIds.length} 个已选账号`
 
   return (
@@ -2083,7 +2175,7 @@ function PushMenu({
       <Button
         variant="outline"
         size="sm"
-        disabled={!selectedIds.length || targets.length === 0 || loading}
+        disabled={total === 0 || targets.length === 0 || loading}
         onClick={() => {
           if (targets.length === 1 && defaultTarget) void pushTo(defaultTarget)
           else setOpen(value => !value)
@@ -2091,7 +2183,7 @@ function PushMenu({
         className={ACCOUNT_TOOL_BUTTON_CLASS}
       >
         <Send className="mr-1.5 h-3.5 w-3.5 shrink-0" />
-        {loading ? '推送中...' : selectedIds.length ? `推送已选(${selectedIds.length})` : '推送已选'}
+        {loading ? '推送中...' : selectedIds.length ? `推送已选(${selectedIds.length})` : `推送筛选(${total})`}
       </Button>
       {open && targets.length > 1 && (
         <div className="absolute right-0 top-10 z-20 min-w-[190px] rounded-lg border border-[var(--border)] bg-[var(--bg-card)] py-1 shadow-lg">
@@ -2121,9 +2213,13 @@ export default function Accounts() {
   const [total, setTotal] = useState(0)
   const [page, setPage] = useState(1)
   const [loading, setLoading] = useState(false)
-  const [search, setSearch] = useState('')
-  const [debouncedSearch, setDebouncedSearch] = useState('')
-  const [filterStatus, setFilterStatus] = useState('')
+  const [filters, setFilters] = useState<AccountFilterState>(() => readFiltersFromUrl())
+  const [searchDraft, setSearchDraft] = useState(() => readFiltersFromUrl().search)
+  const [showMoreFilters, setShowMoreFilters] = useState(false)
+  const [filterStats, setFilterStats] = useState<any>({ total: 0, mailbox_providers: [], regions: [] })
+  const [savedFilters, setSavedFilters] = useState<SavedFilterPreset[]>(() => {
+    try { return JSON.parse(localStorage.getItem(SAVED_FILTERS_KEY) || '[]') } catch { return [] }
+  })
   const [detail, setDetail] = useState<any | null>(null)
   const [showImport, setShowImport] = useState(false)
   const [showRegister, setShowRegister] = useState(false)
@@ -2140,6 +2236,7 @@ export default function Accounts() {
   const [batchCodexConcurrency, setBatchCodexConcurrency] = useState(2)
   const [pushTargets, setPushTargets] = useState<PushTarget[]>([])
   const loadRequestRef = useRef(0)
+  const filterKey = JSON.stringify(filters)
 
   useEffect(() => {
     getPlatforms().then((list: any[]) => {
@@ -2150,19 +2247,35 @@ export default function Accounts() {
     apiFetch('/accounts/push-targets')
       .then(data => setPushTargets(Array.isArray(data?.items) ? data.items : []))
       .catch(() => setPushTargets([]))
+    apiFetch(`/accounts/stats?platform=${tab}`)
+      .then(data => setFilterStats(data || {}))
+      .catch(() => {})
   }, [])
 
   useEffect(() => {
     const timer = setTimeout(() => {
       setPage(1)
-      setDebouncedSearch(search)
-    }, 400)
+      setFilters(current => current.search === searchDraft ? current : { ...current, search: searchDraft })
+    }, 350)
     return () => clearTimeout(timer)
-  }, [search])
+  }, [searchDraft])
+
+  useEffect(() => {
+    const params = new URLSearchParams()
+    ;(Object.keys(filters) as Array<keyof AccountFilterState>).forEach(key => {
+      const value = filters[key]
+      if (value && !(key === 'sort_by' && value === 'created_at') && !(key === 'sort_order' && value === 'desc')) {
+        params.set(key, value)
+      }
+    })
+    const nextUrl = `${window.location.pathname}${params.size ? `?${params}` : ''}${window.location.hash}`
+    window.history.replaceState(null, '', nextUrl)
+  }, [filterKey])
 
   useEffect(() => {
     setSelectedIds(new Set())
-  }, [tab, filterStatus, debouncedSearch])
+    setPage(1)
+  }, [tab, filterKey])
 
   const load = useCallback(async (requestedPage = page) => {
     const requestId = ++loadRequestRef.current
@@ -2173,8 +2286,8 @@ export default function Accounts() {
         page: String(requestedPage),
         page_size: String(ACCOUNT_PAGE_SIZE),
       })
-      if (debouncedSearch) params.set('email', debouncedSearch)
-      if (filterStatus) params.set('status', filterStatus)
+      const apiFilters = toApiFilters(filters)
+      Object.entries(apiFilters).forEach(([key, value]) => { if (value) params.set(key, value) })
       const data = await apiFetch(`/accounts?${params}`)
       if (requestId !== loadRequestRef.current) return
       const nextTotal = Number(data.total || 0)
@@ -2185,24 +2298,25 @@ export default function Accounts() {
     } finally {
       if (requestId === loadRequestRef.current) setLoading(false)
     }
-  }, [tab, debouncedSearch, filterStatus, page])
+  }, [tab, filterKey, page])
 
   useEffect(() => { load(page) }, [load, page])
 
-  const pushAccounts = useCallback(async (ids: number[], targetKey = '') => {
+  const pushAccounts = useCallback(async (ids: number[], targetKey = '', selectAll = false, activeFilters = filters) => {
     const target = pushTargets.find(item => item.key === targetKey)
       || pushTargets.find(item => item.is_default)
       || pushTargets[0]
     if (!target) throw new Error('未配置已启用的推送目标')
 
-    setAccounts(current => markPushPending(current, ids, target, new Date().toISOString()))
+    if (!selectAll) setAccounts(current => markPushPending(current, ids, target, new Date().toISOString()))
     try {
       const result = await apiFetch('/accounts/push', {
         method: 'POST',
         body: JSON.stringify({
           platform: tab,
           ids,
-          select_all: false,
+          select_all: selectAll,
+          filters: selectAll ? toApiFilters(activeFilters) : {},
           target_key: target.key,
         }),
       })
@@ -2214,7 +2328,7 @@ export default function Accounts() {
     } finally {
       await load()
     }
-  }, [load, pushTargets, tab])
+  }, [filterKey, load, pushTargets, tab])
 
   
   const exportCsv = () => {
@@ -2267,10 +2381,31 @@ export default function Accounts() {
 
   const currentPlatformMeta = platformsMap[tab]
   const platformLabel = currentPlatformMeta?.display_name || tab
-  const visibleTrial = accounts.filter(acc => getPlanState(acc) === 'trial').length
-  const visibleSubscribed = accounts.filter(acc => getPlanState(acc) === 'subscribed').length
-  const visibleInvalid = accounts.filter(acc => getValidityStatus(acc) === 'invalid' || getLifecycleStatus(acc) === 'invalid').length
-  const linkedCashier = accounts.filter(acc => Boolean(getCashierUrl(acc))).length
+  const activeFilterCount = getActiveFilterCount(filters)
+  const pushTargetOptions: Array<{ key: string; label: string }> = Array.from(new Map<string, { key: string; label: string }>([
+    ...pushTargets.map(item => [item.key, { key: item.key, label: item.label }] as const),
+    ...(filterStats.push_targets || []).map((item: any) => [item.key, { key: item.key, label: item.label || item.key }] as const),
+  ]).values())
+  const updateFilter = (key: keyof AccountFilterState, value: string) => {
+    setFilters(current => ({ ...current, [key]: value }))
+  }
+  const resetFilters = () => {
+    setFilters({ ...EMPTY_ACCOUNT_FILTERS })
+    setSearchDraft('')
+  }
+  const saveCurrentFilters = () => {
+    const name = window.prompt('筛选方案名称')?.trim()
+    if (!name) return
+    const next = [...savedFilters.filter(item => item.name !== name), { name, filters }]
+    setSavedFilters(next)
+    localStorage.setItem(SAVED_FILTERS_KEY, JSON.stringify(next))
+  }
+  const applyPreset = (name: string) => {
+    const preset = savedFilters.find(item => item.name === name)
+    if (!preset) return
+    setFilters({ ...EMPTY_ACCOUNT_FILTERS, ...preset.filters })
+    setSearchDraft(preset.filters.search || '')
+  }
 
   return (
     <div className="flex h-full min-h-0 flex-col gap-4 overflow-hidden">
@@ -2306,11 +2441,15 @@ export default function Accounts() {
             </h1>
             <div className="hidden h-4 w-[1px] bg-[var(--border)] sm:block"></div>
             <div className="flex min-w-0 flex-wrap items-center gap-1.5 text-xs">
-              <span className="shrink-0 text-[var(--text-muted)]">{t('accounts.count', { count: total })}</span>
-              {visibleTrial > 0 && <span className="flex items-center rounded-full bg-emerald-500/10 px-2 py-0.5 font-medium text-emerald-500 ring-1 ring-inset ring-emerald-500/20">{t('accounts.trial', { count: visibleTrial })}</span>}
-              {visibleSubscribed > 0 && <span className="flex items-center rounded-full bg-blue-500/10 px-2 py-0.5 font-medium text-blue-500 ring-1 ring-inset ring-blue-500/20">{t('accounts.subscribed', { count: visibleSubscribed })}</span>}
-              {linkedCashier > 0 && <span className="flex items-center rounded-full bg-amber-500/10 px-2 py-0.5 font-medium text-amber-500 ring-1 ring-inset ring-amber-500/20">{t('accounts.linked', { count: linkedCashier })}</span>}
-              {visibleInvalid > 0 && <span className="flex items-center rounded-full bg-red-500/10 px-2 py-0.5 font-medium text-red-500 ring-1 ring-inset ring-red-500/20">{t('accounts.invalid', { count: visibleInvalid })}</span>}
+              <button onClick={resetFilters} className="filter-stat-chip">全部 {filterStats.total || 0}</button>
+              <button onClick={() => updateFilter('status', filters.status === 'trial' ? '' : 'trial')} className={`filter-stat-chip filter-stat-success ${filters.status === 'trial' ? 'is-active' : ''}`}>试用 {filterStats.trial || 0}</button>
+              <button onClick={() => updateFilter('status', filters.status === 'subscribed' ? '' : 'subscribed')} className={`filter-stat-chip filter-stat-accent ${filters.status === 'subscribed' ? 'is-active' : ''}`}>订阅 {filterStats.subscribed || 0}</button>
+              <button onClick={() => updateFilter('mailbox_bound', filters.mailbox_bound === 'bound' ? '' : 'bound')} className={`filter-stat-chip ${filters.mailbox_bound === 'bound' ? 'is-active' : ''}`}>验证邮箱 {filterStats.mailbox_bound || 0}</button>
+              <button onClick={() => updateFilter('checked_state', filters.checked_state === 'unchecked' ? '' : 'unchecked')} className={`filter-stat-chip filter-stat-warning ${filters.checked_state === 'unchecked' ? 'is-active' : ''}`}>未检测 {filterStats.unchecked || 0}</button>
+              <button onClick={() => updateFilter('codex_auth_state', filters.codex_auth_state === 'unauthorized' ? '' : 'unauthorized')} className={`filter-stat-chip ${filters.codex_auth_state === 'unauthorized' ? 'is-active' : ''}`}>Codex 未授权 {filterStats.codex_unauthorized || 0}</button>
+              <button onClick={() => updateFilter('push_status', filters.push_status === 'not_pushed' ? '' : 'not_pushed')} className={`filter-stat-chip ${filters.push_status === 'not_pushed' ? 'is-active' : ''}`}>未推送 {filterStats.push_not_pushed || 0}</button>
+              <button onClick={() => updateFilter('push_status', filters.push_status === 'failed' ? '' : 'failed')} className={`filter-stat-chip filter-stat-danger ${filters.push_status === 'failed' ? 'is-active' : ''}`}>推送失败 {filterStats.push_failed || 0}</button>
+              <button onClick={() => updateFilter('status', filters.status === 'invalid' ? '' : 'invalid')} className={`filter-stat-chip filter-stat-danger ${filters.status === 'invalid' ? 'is-active' : ''}`}>失效 {filterStats.invalid || 0}</button>
               {selectedCount > 0 && <span className="flex items-center rounded-full bg-[var(--text-primary)]/10 px-2 py-0.5 font-medium text-[var(--text-primary)] ring-1 ring-inset ring-[var(--text-primary)]/20">{t('accounts.selected', { count: selectedCount })}</span>}
             </div>
           </div>
@@ -2327,8 +2466,7 @@ export default function Accounts() {
             {tab === 'chatgpt' ? (
               <ExportMenu
                 total={total}
-                statusFilter={filterStatus}
-                searchFilter={debouncedSearch}
+                filters={filters}
                 selectedIds={[...selectedIds]}
               />
             ) : (
@@ -2339,6 +2477,8 @@ export default function Accounts() {
             )}
             <PushMenu
               targets={pushTargets}
+              total={total}
+              filters={filters}
               selectedIds={[...selectedIds]}
               onPush={pushAccounts}
             />
@@ -2346,28 +2486,22 @@ export default function Accounts() {
         </div>
         
         {/* Search & Filter Toolbar */}
-        <div className="flex items-center justify-between gap-4 px-5 py-2.5 bg-[var(--bg-pane)]/20">
-          <div className="flex flex-1 items-center gap-3">
-            <div className="relative flex-1 max-w-sm">
-              <div className="pointer-events-none absolute inset-y-0 left-0 flex items-center pl-2.5 text-[var(--text-muted)]">
-                <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="11" cy="11" r="8"></circle><path d="m21 21-4.3-4.3"></path></svg>
-              </div>
+        <div className="flex flex-wrap items-center justify-between gap-3 bg-[var(--bg-pane)]/20 px-5 py-2.5">
+          <div className="flex min-w-0 flex-1 flex-wrap items-center gap-2">
+            <div className="relative min-w-[260px] flex-1 max-w-xl">
+              <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-[var(--text-muted)]" />
               <input
                 type="text"
-                placeholder={t('accounts.searchPlaceholder')}
-                value={search}
-                onChange={e => setSearch(e.target.value)}
-                className="w-full rounded-md border border-[var(--border)] bg-transparent py-1.5 pl-8 pr-3 text-sm text-[var(--text-primary)] transition-colors placeholder:text-[var(--text-muted)] focus:border-[var(--text-primary)] focus:outline-none focus:ring-1 focus:ring-[var(--text-primary)]"
+                placeholder="搜索 ChatGPT/Codex/验证邮箱、User ID、Account ID"
+                value={searchDraft}
+                onChange={e => setSearchDraft(e.target.value)}
+                className="filter-control w-full pl-8"
               />
             </div>
             <select
-              value={filterStatus}
-              onChange={e => {
-                setPage(1)
-                setFilterStatus(e.target.value)
-              }}
-              className="rounded-md border border-[var(--border)] bg-transparent py-1.5 pl-3 pr-8 text-sm text-[var(--text-primary)] transition-colors focus:border-[var(--text-primary)] focus:outline-none focus:ring-1 focus:ring-[var(--text-primary)] appearance-none"
-              style={{ backgroundImage: `url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='14' height='14' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E")`, backgroundPosition: 'right 8px center', backgroundRepeat: 'no-repeat' }}
+              value={filters.status}
+              onChange={e => updateFilter('status', e.target.value)}
+              className="filter-control w-auto min-w-28"
             >
               <option value="">{t('accounts.allStatuses')}</option>
               <option value="registered">{translateAccountStatus('registered', language)}</option>
@@ -2378,6 +2512,25 @@ export default function Accounts() {
               <option value="expired">{t('accounts.expired')}</option>
               <option value="invalid">{t('dashboard.invalid')}</option>
             </select>
+            <select value={filters.sort_by} onChange={e => updateFilter('sort_by', e.target.value)} className="filter-control w-auto min-w-32" title="排序字段">
+              <option value="created_at">注册时间</option>
+              <option value="checked_at">检测时间</option>
+              <option value="expires_at">到期时间</option>
+              <option value="updated_at">更新时间</option>
+            </select>
+            <button onClick={() => updateFilter('sort_order', filters.sort_order === 'desc' ? 'asc' : 'desc')} className="filter-control w-auto whitespace-nowrap">
+              {filters.sort_order === 'desc' ? '降序' : '升序'}
+            </button>
+            <button onClick={() => setShowMoreFilters(value => !value)} className={`filter-control inline-flex w-auto items-center gap-1.5 ${showMoreFilters || activeFilterCount ? 'is-active' : ''}`}>
+              <SlidersHorizontal className="h-3.5 w-3.5" />
+              更多筛选{activeFilterCount ? ` ${activeFilterCount}` : ''}
+            </button>
+            {savedFilters.length > 0 && (
+              <select defaultValue="" onChange={e => { applyPreset(e.target.value); e.currentTarget.value = '' }} className="filter-control w-auto max-w-40">
+                <option value="" disabled>常用方案</option>
+                {savedFilters.map(item => <option key={item.name} value={item.name}>{item.name}</option>)}
+              </select>
+            )}
           </div>
           
           <div className="flex items-center gap-2">
@@ -2400,7 +2553,7 @@ export default function Accounts() {
                 className="h-7 w-56 rounded-md border border-[var(--border)] bg-transparent px-2 font-mono text-xs text-[var(--text-secondary)] outline-none focus:border-[var(--text-primary)]"
               />
             ) : null}
-            {tab === 'chatgpt' && selectedCount > 0 ? (
+            {tab === 'chatgpt' && total > 0 ? (
               <>
                 <select
                   value={batchCodexConcurrency}
@@ -2422,12 +2575,19 @@ export default function Accounts() {
                     setBatchCodexAuthorizing(true)
                     try {
                       const ids = [...selectedIds]
+                      const selectAll = ids.length === 0
+                      const targetCount = selectAll ? total : ids.length
+                      if (!window.confirm(`为当前${selectAll ? '完整筛选结果' : '已选账号'}（${targetCount} 个）执行 Codex OAuth 授权？`)) {
+                        setBatchCodexAuthorizing(false)
+                        return
+                      }
                       const res = await apiFetch('/accounts/codex-oauth/authorize', {
                         method: 'POST',
                         body: JSON.stringify({
                           platform: tab,
                           ids,
-                          select_all: false,
+                          select_all: selectAll,
+                          filters: selectAll ? toApiFilters(filters) : {},
                           platform_proxy_mode: batchProxyMode,
                           platform_proxy_value: batchProxyValue.trim(),
                           concurrency: batchCodexConcurrency,
@@ -2442,7 +2602,7 @@ export default function Accounts() {
                       if (res?.task_id) {
                         setBatchTask({
                           taskId: res.task_id,
-                          title: `Codex OAuth 批量授权 (${ids.length})`,
+                          title: `Codex OAuth 批量授权 (${targetCount})`,
                         })
                         setBatchTaskStatus(null)
                       }
@@ -2453,7 +2613,7 @@ export default function Accounts() {
                   }}
                 >
                   <ShieldCheck className={`mr-1 h-3.5 w-3.5 ${batchCodexAuthorizing ? 'animate-pulse' : ''}`} />
-                  {batchCodexAuthorizing ? '授权中...' : `Codex授权(${selectedCount})`}
+                  {batchCodexAuthorizing ? '授权中...' : `Codex授权(${selectedCount || total})`}
                 </Button>
               </>
             ) : null}
@@ -2474,8 +2634,7 @@ export default function Accounts() {
                       platform: tab,
                       ids: hasSelection ? [...selectedIds] : [],
                       select_all: !hasSelection,
-                      status_filter: !hasSelection ? filterStatus || '' : '',
-                      search_filter: !hasSelection ? debouncedSearch || '' : '',
+                      filters: !hasSelection ? toApiFilters(filters) : {},
                       platform_proxy_mode: batchProxyMode,
                       platform_proxy_value: batchProxyValue.trim(),
                     }),
@@ -2525,6 +2684,38 @@ export default function Accounts() {
             )}
           </div>
         </div>
+        {showMoreFilters && (
+          <div className="border-t border-[var(--border)] bg-[var(--bg-card)] px-5 py-4">
+            <div className="account-filter-grid">
+              <label><span>验证邮箱</span><select value={filters.mailbox_bound} onChange={e => updateFilter('mailbox_bound', e.target.value)} className="filter-control"><option value="">全部</option><option value="bound">已绑定</option><option value="unbound">未绑定</option></select></label>
+              <label><span>邮箱服务商</span><select value={filters.mailbox_provider} onChange={e => updateFilter('mailbox_provider', e.target.value)} className="filter-control"><option value="">全部服务商</option>{(filterStats.mailbox_providers || []).map((value: string) => <option key={value} value={value}>{value}</option>)}</select></label>
+              <label><span>邮箱一致性</span><select value={filters.mailbox_email_match} onChange={e => updateFilter('mailbox_email_match', e.target.value)} className="filter-control"><option value="">全部</option><option value="same">验证邮箱一致</option><option value="different">验证邮箱不同</option></select></label>
+              <label><span>手机状态</span><select value={filters.phone_state} onChange={e => updateFilter('phone_state', e.target.value)} className="filter-control"><option value="">全部</option><option value="bound">已绑定</option><option value="unbound">未绑定</option><option value="unchecked">未检测</option></select></label>
+              <label><span>检测状态</span><select value={filters.checked_state} onChange={e => updateFilter('checked_state', e.target.value)} className="filter-control"><option value="">全部</option><option value="checked">已检测</option><option value="unchecked">未检测</option></select></label>
+              <label><span>MFA</span><select value={filters.mfa_state} onChange={e => updateFilter('mfa_state', e.target.value)} className="filter-control"><option value="">全部</option><option value="enabled">已启用</option><option value="disabled">未启用</option><option value="unchecked">未检测</option></select></label>
+              <label><span>Codex 授权</span><select value={filters.codex_auth_state} onChange={e => updateFilter('codex_auth_state', e.target.value)} className="filter-control"><option value="">全部</option><option value="authorized">已授权</option><option value="unauthorized">未授权</option></select></label>
+              <label><span>推送状态</span><select value={filters.push_status} onChange={e => updateFilter('push_status', e.target.value)} className="filter-control"><option value="">全部状态</option><option value="not_pushed">未推送</option><option value="success">推送成功</option><option value="failed">推送失败</option><option value="pending">推送中</option></select></label>
+              <label><span>推送目标</span><select value={filters.push_target} onChange={e => updateFilter('push_target', e.target.value)} className="filter-control"><option value="">全部目标</option>{pushTargetOptions.map(item => <option key={item.key} value={item.key}>{item.label}</option>)}</select></label>
+              <label><span>推送时间起</span><input type="datetime-local" value={filters.pushed_from} onChange={e => updateFilter('pushed_from', e.target.value)} className="filter-control" /></label>
+              <label><span>推送时间止</span><input type="datetime-local" value={filters.pushed_to} onChange={e => updateFilter('pushed_to', e.target.value)} className="filter-control" /></label>
+              <label><span>Codex 刷新起</span><input type="datetime-local" value={filters.codex_refreshed_from} onChange={e => updateFilter('codex_refreshed_from', e.target.value)} className="filter-control" /></label>
+              <label><span>Codex 刷新止</span><input type="datetime-local" value={filters.codex_refreshed_to} onChange={e => updateFilter('codex_refreshed_to', e.target.value)} className="filter-control" /></label>
+              <label><span>来源</span><select value={filters.source} onChange={e => updateFilter('source', e.target.value)} className="filter-control"><option value="">全部来源</option><option value="protocol">协议注册</option><option value="browser">浏览器注册</option><option value="import">导入</option></select></label>
+              <label><span>导入方式</span><select value={filters.import_method} onChange={e => updateFilter('import_method', e.target.value)} className="filter-control"><option value="">全部方式</option><option value="text">文本导入</option><option value="csv">CSV 导入</option></select></label>
+              <label><span>Region</span><select value={filters.region} onChange={e => updateFilter('region', e.target.value)} className="filter-control"><option value="">全部地区</option>{(filterStats.regions || []).map((value: string) => <option key={value} value={value}>{value}</option>)}</select></label>
+              <label><span>时间字段</span><select value={filters.time_field} onChange={e => updateFilter('time_field', e.target.value)} className="filter-control"><option value="">注册时间</option><option value="created_at">注册时间</option><option value="updated_at">更新时间</option><option value="checked_at">最近检测</option><option value="expires_at">到期时间</option></select></label>
+              <label><span>开始时间</span><input type="datetime-local" value={filters.time_from} onChange={e => updateFilter('time_from', e.target.value)} className="filter-control" /></label>
+              <label><span>结束时间</span><input type="datetime-local" value={filters.time_to} onChange={e => updateFilter('time_to', e.target.value)} className="filter-control" /></label>
+            </div>
+            <div className="mt-4 flex flex-wrap items-center justify-between gap-2">
+              <span className="text-xs text-[var(--text-muted)]">筛选条件已同步到 URL，刷新后自动恢复。</span>
+              <div className="flex items-center gap-2">
+                <Button size="sm" variant="outline" onClick={resetFilters} className="h-8"><RotateCcw className="mr-1.5 h-3.5 w-3.5" />清空筛选</Button>
+                <Button size="sm" onClick={saveCurrentFilters} className="h-8"><Save className="mr-1.5 h-3.5 w-3.5" />保存方案</Button>
+              </div>
+            </div>
+          </div>
+        )}
       </Card>
 
       <Card className="min-h-0 flex-1 overflow-hidden p-0 border border-[var(--border)] shadow-sm">

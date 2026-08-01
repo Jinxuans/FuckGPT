@@ -12,7 +12,7 @@ from application.accounts import AccountsService
 from application.account_pushes import AccountPushService
 from application.tasks import create_codex_oauth_batch_task
 from services.task_runtime import task_runtime
-from domain.accounts import AccountExportSelection, AccountQuery, AccountUpdateCommand
+from domain.accounts import AccountExportSelection, AccountFilters, AccountQuery, AccountUpdateCommand
 from infrastructure.accounts_repository import AccountsRepository
 
 router = APIRouter(prefix="/accounts", tags=["accounts"])
@@ -42,6 +42,35 @@ class ImportRequest(BaseModel):
     lines: list[str]
 
 
+class AccountFiltersRequest(BaseModel):
+    search: str = ""
+    status: str = ""
+    mailbox_bound: str = ""
+    mailbox_provider: str = ""
+    mailbox_email_match: str = ""
+    phone_state: str = ""
+    checked_state: str = ""
+    mfa_state: str = ""
+    codex_auth_state: str = ""
+    push_status: str = ""
+    push_target: str = ""
+    pushed_from: str = ""
+    pushed_to: str = ""
+    codex_refreshed_from: str = ""
+    codex_refreshed_to: str = ""
+    time_field: str = ""
+    time_from: str = ""
+    time_to: str = ""
+    source: str = ""
+    import_method: str = ""
+    region: str = ""
+    sort_by: str = "created_at"
+    sort_order: str = "desc"
+
+    def to_domain(self) -> AccountFilters:
+        return AccountFilters(**self.model_dump())
+
+
 class BatchExportRequest(BaseModel):
     platform: str = "chatgpt"
     ids: list[int] = Field(default_factory=list)
@@ -49,6 +78,7 @@ class BatchExportRequest(BaseModel):
     status_filter: Optional[str] = None
     email_service_filter: Optional[str] = None
     search_filter: Optional[str] = None
+    filters: AccountFiltersRequest = Field(default_factory=AccountFiltersRequest)
 
 
 class CodexOAuthBatchRequest(BatchExportRequest):
@@ -59,6 +89,17 @@ class CodexOAuthBatchRequest(BatchExportRequest):
 class AccountPushRequest(BatchExportRequest):
     target_key: str = ""
     payload_format: Literal["codex", "sub2api"] | None = None
+
+
+def _selection(body: BatchExportRequest) -> AccountExportSelection:
+    return AccountExportSelection(
+        platform=body.platform or "chatgpt",
+        ids=body.ids,
+        select_all=body.select_all,
+        status_filter=body.status_filter or "",
+        search_filter=body.search_filter or "",
+        filters=body.filters.to_domain(),
+    )
 
 
 def _stream_artifact(artifact: ExportArtifact) -> StreamingResponse:
@@ -82,13 +123,60 @@ def list_accounts(
     email: str = "",
     page: int = 1,
     page_size: int = 20,
+    search: str = "",
+    mailbox_bound: str = "",
+    mailbox_provider: str = "",
+    mailbox_email_match: str = "",
+    phone_state: str = "",
+    checked_state: str = "",
+    mfa_state: str = "",
+    codex_auth_state: str = "",
+    push_status: str = "",
+    push_target: str = "",
+    pushed_from: str = "",
+    pushed_to: str = "",
+    codex_refreshed_from: str = "",
+    codex_refreshed_to: str = "",
+    time_field: str = "",
+    time_from: str = "",
+    time_to: str = "",
+    source: str = "",
+    import_method: str = "",
+    region: str = "",
+    sort_by: str = "created_at",
+    sort_order: str = "desc",
 ):
-    return service.list_accounts(AccountQuery(platform=platform, status=status, email=email, page=page, page_size=page_size))
+    filters = AccountFilters(
+        search=search or email,
+        status=status,
+        mailbox_bound=mailbox_bound,
+        mailbox_provider=mailbox_provider,
+        mailbox_email_match=mailbox_email_match,
+        phone_state=phone_state,
+        checked_state=checked_state,
+        mfa_state=mfa_state,
+        codex_auth_state=codex_auth_state,
+        push_status=push_status,
+        push_target=push_target,
+        pushed_from=pushed_from,
+        pushed_to=pushed_to,
+        codex_refreshed_from=codex_refreshed_from,
+        codex_refreshed_to=codex_refreshed_to,
+        time_field=time_field,
+        time_from=time_from,
+        time_to=time_to,
+        source=source,
+        import_method=import_method,
+        region=region,
+        sort_by=sort_by,
+        sort_order=sort_order,
+    )
+    return service.list_accounts(AccountQuery(platform=platform, filters=filters, page=page, page_size=page_size))
 
 
 @router.get("/stats")
-def get_stats():
-    return service.get_stats()
+def get_stats(platform: str = ""):
+    return {**service.get_stats(), **service.get_filter_stats(platform)}
 
 
 @router.get("/push-targets")
@@ -100,13 +188,7 @@ def list_push_targets():
 def push_accounts(body: AccountPushRequest):
     try:
         return push_service.push_accounts(
-            AccountExportSelection(
-                platform=body.platform,
-                ids=body.ids,
-                select_all=body.select_all,
-                status_filter=body.status_filter or "",
-                search_filter=body.search_filter or "",
-            ),
+            _selection(body),
             target_key=body.target_key,
             payload_format=body.payload_format or "",
         )
@@ -118,13 +200,7 @@ def push_accounts(body: AccountPushRequest):
 def export_accounts_json(body: BatchExportRequest):
     try:
         artifact = exports_service.export_chatgpt_json(
-            AccountExportSelection(
-                platform=body.platform,
-                ids=body.ids,
-                select_all=body.select_all,
-                status_filter=body.status_filter or "",
-                search_filter=body.search_filter or "",
-            )
+            _selection(body)
         )
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
@@ -135,13 +211,7 @@ def export_accounts_json(body: BatchExportRequest):
 def export_accounts_csv(body: BatchExportRequest):
     try:
         artifact = exports_service.export_chatgpt_csv(
-            AccountExportSelection(
-                platform=body.platform,
-                ids=body.ids,
-                select_all=body.select_all,
-                status_filter=body.status_filter or "",
-                search_filter=body.search_filter or "",
-            )
+            _selection(body)
         )
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
@@ -152,13 +222,7 @@ def export_accounts_csv(body: BatchExportRequest):
 def export_accounts_sub2api(body: BatchExportRequest):
     try:
         artifact = exports_service.export_chatgpt_sub2api(
-            AccountExportSelection(
-                platform=body.platform,
-                ids=body.ids,
-                select_all=body.select_all,
-                status_filter=body.status_filter or "",
-                search_filter=body.search_filter or "",
-            )
+            _selection(body)
         )
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
@@ -169,13 +233,7 @@ def export_accounts_sub2api(body: BatchExportRequest):
 def export_accounts_cpa(body: BatchExportRequest):
     try:
         artifact = exports_service.export_chatgpt_cpa(
-            AccountExportSelection(
-                platform=body.platform,
-                ids=body.ids,
-                select_all=body.select_all,
-                status_filter=body.status_filter or "",
-                search_filter=body.search_filter or "",
-            )
+            _selection(body)
         )
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
@@ -186,13 +244,7 @@ def export_accounts_cpa(body: BatchExportRequest):
 def export_accounts_codex(body: BatchExportRequest):
     try:
         artifact = exports_service.export_chatgpt_codex(
-            AccountExportSelection(
-                platform=body.platform,
-                ids=body.ids,
-                select_all=body.select_all,
-                status_filter=body.status_filter or "",
-                search_filter=body.search_filter or "",
-            )
+            _selection(body)
         )
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
@@ -203,13 +255,7 @@ def export_accounts_codex(body: BatchExportRequest):
 def export_accounts_any2api(body: BatchExportRequest):
     try:
         artifact = exports_service.export_any2api(
-            AccountExportSelection(
-                platform=body.platform,
-                ids=body.ids,
-                select_all=body.select_all,
-                status_filter=body.status_filter or "",
-                search_filter=body.search_filter or "",
-            )
+            _selection(body)
         )
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
@@ -220,13 +266,7 @@ def export_accounts_any2api(body: BatchExportRequest):
 def authorize_codex_oauth_batch(body: CodexOAuthBatchRequest):
     try:
         records = AccountsRepository().select_for_export(
-            AccountExportSelection(
-                platform=body.platform or "chatgpt",
-                ids=body.ids,
-                select_all=body.select_all,
-                status_filter=body.status_filter or "",
-                search_filter=body.search_filter or "",
-            )
+            _selection(body)
         )
         task = create_codex_oauth_batch_task(
             platform=body.platform or "chatgpt",

@@ -2,11 +2,10 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from sqlalchemy import func
 from sqlmodel import Session, select
 
 from core.account_display import build_account_display_summary
-from core.datetime_utils import serialize_datetime
+from core.datetime_utils import ensure_utc_datetime, serialize_datetime
 from core.db import AccountModel, AccountPushDeliveryModel, engine
 from core.account_graph import (
     build_account_view,
@@ -20,6 +19,7 @@ from core.account_graph import (
 from core.platform_accounts import resolve_primary_token
 from domain.accounts import (
     AccountExportSelection,
+    AccountFilters,
     AccountImportLine,
     AccountQuery,
     AccountRecord,
@@ -102,6 +102,254 @@ def _to_record(
 
 class AccountsRepository:
     @staticmethod
+    def _effective_filters(
+        filters: AccountFilters | None,
+        *,
+        status: str = "",
+        search: str = "",
+    ) -> AccountFilters:
+        value = filters or AccountFilters()
+        return AccountFilters(
+            **{
+                **{field: getattr(value, field) for field in AccountFilters.__dataclass_fields__},
+                "status": value.status or status,
+                "search": value.search or search,
+            }
+        )
+
+    @staticmethod
+    def _record_matches(record: AccountRecord, filters: AccountFilters) -> bool:
+        view = record.account_view or {}
+        identity = view.get("identity") or {}
+        status = view.get("status") or {}
+        security = view.get("security") or {}
+        codex = view.get("codex") or {}
+        mailbox = ((view.get("verification") or {}).get("mailbox") or {})
+        deliveries = list(record.push_deliveries or [])
+
+        if filters.status and not matches_status_filter({
+            "display_status": record.display_status,
+            "lifecycle_status": record.lifecycle_status,
+            "plan_state": record.plan_state,
+            "validity_status": record.validity_status,
+        }, filters.status):
+            return False
+
+        search = filters.search.strip().casefold()
+        if search:
+            searchable = (
+                record.email,
+                record.user_id,
+                identity.get("remote_email"),
+                identity.get("account_id"),
+                identity.get("user_id"),
+                codex.get("email"),
+                codex.get("account_id"),
+                mailbox.get("email"),
+                mailbox.get("account_id"),
+            )
+            if not any(search in str(value or "").casefold() for value in searchable):
+                return False
+
+        mailbox_bound = bool(mailbox)
+        if filters.mailbox_bound == "bound" and not mailbox_bound:
+            return False
+        if filters.mailbox_bound == "unbound" and mailbox_bound:
+            return False
+        if filters.mailbox_provider and str(mailbox.get("provider") or "").casefold() != filters.mailbox_provider.casefold():
+            return False
+        if filters.mailbox_email_match:
+            same = bool(mailbox.get("email")) and str(mailbox.get("email")).casefold() == record.email.casefold()
+            if filters.mailbox_email_match == "same" and not same:
+                return False
+            if filters.mailbox_email_match == "different" and (not mailbox_bound or same):
+                return False
+
+        checked = bool(status.get("checked_at") or security.get("checked_at"))
+        phone_bound = bool(security.get("phone_bound"))
+        if filters.phone_state == "bound" and not phone_bound:
+            return False
+        if filters.phone_state == "unbound" and (phone_bound or not checked):
+            return False
+        if filters.phone_state == "unchecked" and checked:
+            return False
+        if filters.checked_state == "checked" and not checked:
+            return False
+        if filters.checked_state == "unchecked" and checked:
+            return False
+        mfa_observed = bool(security.get("observed") or checked)
+        mfa_enabled = bool(security.get("mfa_enabled"))
+        if filters.mfa_state == "enabled" and not mfa_enabled:
+            return False
+        if filters.mfa_state == "disabled" and (mfa_enabled or not mfa_observed):
+            return False
+        if filters.mfa_state == "unchecked" and mfa_observed:
+            return False
+
+        codex_authorized = bool(codex.get("authorized"))
+        if filters.codex_auth_state == "authorized" and not codex_authorized:
+            return False
+        if filters.codex_auth_state == "unauthorized" and codex_authorized:
+            return False
+
+        selected_delivery = next(
+            (
+                delivery
+                for delivery in deliveries
+                if str(delivery.get("target_key") or "") == filters.push_target
+            ),
+            None,
+        ) if filters.push_target else (deliveries[0] if deliveries else None)
+        if filters.push_target and filters.push_status == "" and selected_delivery is None:
+            return False
+        if filters.push_status == "not_pushed" and selected_delivery is not None:
+            return False
+        if filters.push_status and filters.push_status != "not_pushed":
+            if selected_delivery is None or str(selected_delivery.get("status") or "") != filters.push_status:
+                return False
+        if filters.pushed_from or filters.pushed_to:
+            pushed_at = ensure_utc_datetime(
+                (selected_delivery or {}).get("last_attempt_at")
+                or (selected_delivery or {}).get("pushed_at")
+            )
+            pushed_from = ensure_utc_datetime(filters.pushed_from)
+            pushed_to = ensure_utc_datetime(filters.pushed_to)
+            if pushed_at is None or (pushed_from and pushed_at < pushed_from) or (pushed_to and pushed_at > pushed_to):
+                return False
+
+        if filters.codex_refreshed_from or filters.codex_refreshed_to:
+            refreshed_at = ensure_utc_datetime(codex.get("last_refresh"))
+            refreshed_from = ensure_utc_datetime(filters.codex_refreshed_from)
+            refreshed_to = ensure_utc_datetime(filters.codex_refreshed_to)
+            if refreshed_at is None or (refreshed_from and refreshed_at < refreshed_from) or (refreshed_to and refreshed_at > refreshed_to):
+                return False
+
+        source = str(security.get("account_source") or "")
+        executor = str(security.get("registration_executor") or "")
+        if filters.source:
+            actual_source = source
+            if source == "registration":
+                actual_source = "protocol" if executor == "protocol" else "browser"
+            if actual_source != filters.source:
+                return False
+        if filters.import_method and str(security.get("import_method") or "") != filters.import_method:
+            return False
+        if filters.region and str(record.overview.get("region") or "").casefold() != filters.region.casefold():
+            return False
+
+        if filters.time_from or filters.time_to:
+            time_values = {
+                "created_at": record.created_at,
+                "updated_at": record.updated_at,
+                "checked_at": status.get("checked_at") or security.get("checked_at"),
+                "expires_at": codex.get("expires_at") or (
+                    datetime.fromtimestamp(record.trial_end_time, tz=timezone.utc)
+                    if record.trial_end_time
+                    else None
+                ),
+            }
+            value = ensure_utc_datetime(time_values.get(filters.time_field or "created_at"))
+            start = ensure_utc_datetime(filters.time_from)
+            end = ensure_utc_datetime(filters.time_to)
+            if value is None or (start and value < start) or (end and value > end):
+                return False
+        return True
+
+    @staticmethod
+    def _sort_records(records: list[AccountRecord], filters: AccountFilters) -> list[AccountRecord]:
+        field = filters.sort_by if filters.sort_by in {"created_at", "updated_at", "checked_at", "expires_at"} else "created_at"
+        def key(record: AccountRecord):
+            view = record.account_view or {}
+            if field == "checked_at":
+                raw = (view.get("status") or {}).get("checked_at") or (view.get("security") or {}).get("checked_at")
+            elif field == "expires_at":
+                raw = (view.get("codex") or {}).get("expires_at")
+                if not raw and record.trial_end_time:
+                    raw = datetime.fromtimestamp(record.trial_end_time, tz=timezone.utc)
+            else:
+                raw = getattr(record, field, None)
+            return (ensure_utc_datetime(raw) or datetime.min.replace(tzinfo=timezone.utc), record.id)
+        return sorted(records, key=key, reverse=filters.sort_order != "asc")
+
+    def select_filtered(self, platform: str, filters: AccountFilters | None = None) -> list[AccountRecord]:
+        effective = self._effective_filters(filters)
+        with Session(engine) as session:
+            statement = select(AccountModel)
+            if platform:
+                statement = statement.where(AccountModel.platform == platform)
+            models = session.exec(statement.order_by(AccountModel.id.desc())).all()
+            records = self._load_records(session, models)
+        matched = [record for record in records if self._record_matches(record, effective)]
+        return self._sort_records(matched, effective)
+
+    def filter_stats(self, platform: str) -> dict:
+        records = self.select_filtered(platform, AccountFilters())
+        mailbox_providers: set[str] = set()
+        regions: set[str] = set()
+        push_targets: dict[str, str] = {}
+        counts = {
+            "total": len(records),
+            "trial": 0,
+            "subscribed": 0,
+            "invalid": 0,
+            "mailbox_bound": 0,
+            "phone_bound": 0,
+            "unchecked": 0,
+            "mfa_enabled": 0,
+            "codex_authorized": 0,
+            "codex_unauthorized": 0,
+            "push_failed": 0,
+            "push_not_pushed": 0,
+        }
+        for record in records:
+            view = record.account_view or {}
+            status = view.get("status") or {}
+            security = view.get("security") or {}
+            mailbox = ((view.get("verification") or {}).get("mailbox") or {})
+            codex = view.get("codex") or {}
+            if record.plan_state == "trial":
+                counts["trial"] += 1
+            if record.plan_state == "subscribed":
+                counts["subscribed"] += 1
+            if record.validity_status == "invalid" or record.lifecycle_status == "invalid":
+                counts["invalid"] += 1
+            if mailbox:
+                counts["mailbox_bound"] += 1
+                if mailbox.get("provider"):
+                    mailbox_providers.add(str(mailbox["provider"]))
+            if security.get("phone_bound"):
+                counts["phone_bound"] += 1
+            if not (status.get("checked_at") or security.get("checked_at")):
+                counts["unchecked"] += 1
+            if security.get("mfa_enabled"):
+                counts["mfa_enabled"] += 1
+            if codex.get("authorized"):
+                counts["codex_authorized"] += 1
+            else:
+                counts["codex_unauthorized"] += 1
+            latest_delivery = record.push_deliveries[0] if record.push_deliveries else None
+            for delivery in record.push_deliveries:
+                target_key = str(delivery.get("target_key") or "").strip()
+                if target_key:
+                    push_targets[target_key] = str(delivery.get("target_label") or target_key)
+            if latest_delivery is None:
+                counts["push_not_pushed"] += 1
+            elif latest_delivery.get("status") == "failed":
+                counts["push_failed"] += 1
+            region = str(record.overview.get("region") or "").strip()
+            if region:
+                regions.add(region)
+        return {
+            **counts,
+            "mailbox_providers": sorted(mailbox_providers, key=str.casefold),
+            "regions": sorted(regions, key=str.casefold),
+            "push_targets": [
+                {"key": key, "label": push_targets[key]}
+                for key in sorted(push_targets, key=lambda value: push_targets[value].casefold())
+            ],
+        }
+
+    @staticmethod
     def _load_records(session: Session, models: list[AccountModel]) -> list[AccountRecord]:
         account_ids = [int(model.id or 0) for model in models if model.id]
         graphs = load_account_graphs(session, account_ids)
@@ -147,37 +395,8 @@ class AccountsRepository:
         page = max(query.page, 1)
         page_size = min(max(query.page_size, 1), 200)
         start = (page - 1) * page_size
-        with Session(engine) as session:
-            filters = []
-            if query.platform:
-                filters.append(AccountModel.platform == query.platform)
-            if query.email:
-                filters.append(AccountModel.email.contains(query.email))
-
-            statement = select(AccountModel)
-            if filters:
-                statement = statement.where(*filters)
-            statement = statement.order_by(AccountModel.created_at.desc(), AccountModel.id.desc())
-
-            # Status is derived from the account graph, so that filter still needs
-            # the hydrated records. The common unfiltered path can count and page
-            # in SQL, avoiding graph work for every account on every refresh.
-            if not query.status:
-                count_statement = select(func.count()).select_from(AccountModel)
-                if filters:
-                    count_statement = count_statement.where(*filters)
-                total = int(session.exec(count_statement).one())
-                models = session.exec(statement.offset(start).limit(page_size)).all()
-                return total, self._load_records(session, models)
-
-            models = session.exec(statement).all()
-            records = self._load_records(session, models)
-            records = [item for item in records if matches_status_filter({
-                "display_status": item.display_status,
-                "lifecycle_status": item.lifecycle_status,
-                "plan_state": item.plan_state,
-                "validity_status": item.validity_status,
-            }, query.status)]
+        effective = self._effective_filters(query.filters, status=query.status, search=query.email)
+        records = self.select_filtered(query.platform, effective)
         total = len(records)
         end = start + page_size
         return total, records[start:end]
@@ -193,24 +412,15 @@ class AccountsRepository:
     def select_for_export(self, selection: AccountExportSelection) -> list[AccountRecord]:
         if not selection.select_all and not selection.ids:
             return []
-        with Session(engine) as session:
-            statement = select(AccountModel)
-            if selection.platform:
-                statement = statement.where(AccountModel.platform == selection.platform)
-            if selection.search_filter:
-                statement = statement.where(AccountModel.email.contains(selection.search_filter))
-            if not selection.select_all and selection.ids:
-                statement = statement.where(AccountModel.id.in_(selection.ids))
-            statement = statement.order_by(AccountModel.created_at.desc(), AccountModel.id.desc())
-            models = session.exec(statement).all()
-            records = self._load_records(session, models)
-        if selection.status_filter:
-            records = [item for item in records if matches_status_filter({
-                "display_status": item.display_status,
-                "lifecycle_status": item.lifecycle_status,
-                "plan_state": item.plan_state,
-                "validity_status": item.validity_status,
-            }, selection.status_filter)]
+        effective = self._effective_filters(
+            selection.filters,
+            status=selection.status_filter,
+            search=selection.search_filter,
+        )
+        records = self.select_filtered(selection.platform, effective)
+        if not selection.select_all:
+            selected = set(selection.ids)
+            records = [record for record in records if record.id in selected]
         return records
 
     def update(self, account_id: int, command: AccountUpdateCommand) -> AccountRecord | None:
@@ -317,6 +527,9 @@ class AccountsRepository:
                     "security",
                     "profile",
                     "registration_auth_mode",
+                    "account_source",
+                    "import_method",
+                    "registration_executor",
                 ):
                     if key in extra and key not in summary_updates:
                         summary_updates[key] = extra[key]

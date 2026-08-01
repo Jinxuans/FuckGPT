@@ -287,7 +287,7 @@ class AccountsService:
                     email = str(row.get("email", "") or "").strip()
                     password = str(row.get("password", "") or "")
                     if email and password and "@" in email and " " not in email:
-                        extra = {}
+                        extra = {"account_source": "import", "import_method": "csv"}
                         cashier_url = str(row.get("cashier_url", "") or "").strip()
                         if cashier_url:
                             extra["cashier_url"] = cashier_url
@@ -298,17 +298,17 @@ class AccountsService:
                 continue
             email = _decode_import_token(match.group("email"))
             password = _decode_import_token(match.group("password"))
-            extra = {}
+            extra = {"account_source": "import", "import_method": "text"}
             payload = (match.group("extra") or "").strip()
             if payload:
                 try:
                     decoded = json.loads(payload)
                     if isinstance(decoded, dict):
-                        extra = decoded
+                        extra = {**decoded, "account_source": "import", "import_method": "text"}
                     elif decoded not in (None, ""):
-                        extra = {"cashier_url": str(decoded)}
+                        extra["cashier_url"] = str(decoded)
                 except Exception:
-                    extra = {"cashier_url": _decode_import_token(payload)}
+                    extra["cashier_url"] = _decode_import_token(payload)
             parsed.append(AccountImportLine(email=email, password=password, extra=extra))
         return {"created": self.repository.import_lines(platform, parsed)}
 
@@ -323,6 +323,9 @@ class AccountsService:
             "by_validity_status": stats.by_validity_status,
             "by_display_status": stats.by_display_status,
         }
+
+    def get_filter_stats(self, platform: str = "chatgpt") -> dict:
+        return self.repository.filter_stats(platform)
 
     @staticmethod
     def _serialize(item: AccountRecord) -> dict:

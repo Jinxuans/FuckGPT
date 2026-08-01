@@ -6,7 +6,7 @@ from core.base_platform import Account
 from core.db import AccountPushDeliveryModel, save_account, engine
 
 
-def _create_pushable_account(*, with_codex: bool = True):
+def _create_pushable_account(*, with_codex: bool = True, email: str = "pushable@example.com", extra_updates: dict | None = None):
     extra = {
         "access_token": "platform-access-secret",
         "refresh_token": "platform-refresh-secret",
@@ -16,9 +16,10 @@ def _create_pushable_account(*, with_codex: bool = True):
             "codex_access_token": "codex-access-secret",
             "codex_refresh_token": "codex-refresh-secret",
         })
+    extra.update(extra_updates or {})
     return save_account(Account(
         platform="chatgpt",
-        email="pushable@example.com",
+        email=email,
         password="Password123!",
         extra=extra,
     ))
@@ -159,3 +160,39 @@ def test_failed_push_records_safe_http_error(client, monkeypatch):
     status = listed["items"][0]["push_deliveries"][0]
     assert status["last_attempt_at"].endswith("Z")
     assert status["pushed_at"] is None
+
+
+def test_push_select_all_uses_complete_v2_filter_result(client, monkeypatch):
+    _configure_nvtokens(client)
+    matched = _create_pushable_account(
+        email="push-filter-match@example.com",
+        extra_updates={"region": "US", "account_source": "import", "import_method": "csv"},
+    )
+    _create_pushable_account(
+        email="push-filter-ignore@example.com",
+        extra_updates={"region": "JP", "account_source": "import", "import_method": "text"},
+    )
+    pushed_emails = []
+
+    class FakeResponse:
+        status_code = 200
+
+    def fake_post(_url, *, json, **_kwargs):
+        pushed_emails.append(json["data"]["email"])
+        return FakeResponse()
+
+    monkeypatch.setattr("providers.push.nvtokens.httpx.post", fake_post)
+
+    response = client.post(
+        "/api/accounts/push",
+        json={
+            "platform": "chatgpt",
+            "select_all": True,
+            "target_key": "nvtokens",
+            "filters": {"source": "import", "import_method": "csv", "region": "US"},
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["succeeded"] == 1
+    assert pushed_emails == [matched.email]
