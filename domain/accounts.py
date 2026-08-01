@@ -36,6 +36,7 @@ class AccountQuery:
     platform: str = ""
     status: str = ""
     email: str = ""
+    filters: "AccountFilters" = field(default_factory=lambda: AccountFilters())
     page: int = 1
     page_size: int = 20
 
@@ -82,3 +83,31 @@ class AccountExportSelection:
     select_all: bool = False
     status_filter: str = ""
     search_filter: str = ""
+    filters: "AccountFilters" = field(default_factory=lambda: AccountFilters())
+
+
+@dataclass(slots=True)
+class AccountFilters:
+    search: str = ""
+    status: str = ""
+    mailbox_bound: str = ""
+    mailbox_provider: str = ""
+    mailbox_email_match: str = ""
+    phone_state: str = ""
+    checked_state: str = ""
+    mfa_state: str = ""
+    codex_auth_state: str = ""
+    push_status: str = ""
+    push_target: str = ""
+    pushed_from: str = ""
+    pushed_to: str = ""
+    codex_refreshed_from: str = ""
+    codex_refreshed_to: str = ""
+    time_field: str = ""
+    time_from: str = ""
+    time_to: str = ""
+    source: str = ""
+    import_method: str = ""
+    region: str = ""
+    sort_by: str = "created_at"
+    sort_order: str = "desc"

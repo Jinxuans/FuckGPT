@@ -806,6 +806,9 @@ def _upsert_security(
                 "mfa_enabled",
                 "amr",
                 "registration_auth_mode",
+                "account_source",
+                "import_method",
+                "registration_executor",
             )
         )
         or bool(profile)
@@ -854,6 +857,13 @@ def _upsert_security(
         raw_payload["profile"] = merged_profile
     if summary.get("registration_auth_mode") not in (None, ""):
         raw_payload["registration_auth_mode"] = summary.get("registration_auth_mode")
+    if "mfa_enabled" in summary or isinstance(amr, list):
+        raw_payload["_mfa_observed"] = True
+    if any(key in summary for key in ("phone_bound", "phone_number_masked", "phone_number")):
+        raw_payload["_phone_observed"] = True
+    for key in ("account_source", "import_method", "registration_executor"):
+        if summary.get(key) not in (None, ""):
+            raw_payload[key] = summary.get(key)
     if raw_payload:
         model.set_raw(_sanitize_phone_data(raw_payload))
     if "checked_at" in summary:
@@ -1255,8 +1265,9 @@ def _synthesize_overview(graph: dict[str, Any]) -> dict[str, Any]:
         security_raw = _safe_dict(security.get("raw"))
         if isinstance(security_raw.get("profile"), dict):
             overview["profile"] = _sanitize_phone_data(security_raw["profile"])
-        if security_raw.get("registration_auth_mode"):
-            overview["registration_auth_mode"] = security_raw["registration_auth_mode"]
+        for key in ("registration_auth_mode", "account_source", "import_method", "registration_executor"):
+            if security_raw.get(key):
+                overview[key] = security_raw[key]
 
     if usage:
         raw = _safe_dict(usage.get("raw"))
@@ -1388,6 +1399,7 @@ def sync_platform_account_graph(session: Session, model: AccountModel, account: 
         "check_source",
         "subscription_source",
         "remote_email",
+        "region",
         "plan",
         "plan_name",
         "plan_type",
@@ -1417,7 +1429,7 @@ def sync_platform_account_graph(session: Session, model: AccountModel, account: 
         summary["cashier_url"] = extra.get("cashier_url")
     if getattr(account, "region", ""):
         summary["region"] = getattr(account, "region", "")
-    for key in ("profile", "registration_auth_mode"):
+    for key in ("profile", "registration_auth_mode", "account_source", "import_method", "registration_executor"):
         if key in extra and key not in summary:
             summary[key] = extra[key]
     profile = _safe_dict(summary.get("profile"))
@@ -1596,6 +1608,7 @@ def build_account_view(model: AccountModel, graph: dict[str, Any]) -> dict[str, 
     status = _safe_dict(graph.get("status"))
     subscription = _safe_dict(graph.get("subscription"))
     security = _safe_dict(graph.get("security"))
+    security_raw = _safe_dict(security.get("raw"))
     usage = _safe_dict(graph.get("usage"))
     codex = _safe_dict(graph.get("codex"))
     platform_credentials: list[dict[str, Any]] = []
@@ -1657,6 +1670,18 @@ def build_account_view(model: AccountModel, graph: dict[str, Any]) -> dict[str, 
             "phone_number_masked": _mask_phone_number(security.get("phone_number_masked")),
             "mfa_enabled": bool(security.get("mfa_enabled")),
             "amr": _safe_list(security.get("amr")),
+            "checked_at": serialize_datetime(security.get("checked_at")),
+            "observed": bool(
+                security.get("checked_at")
+                or security_raw.get("_mfa_observed")
+                or security_raw.get("_phone_observed")
+                or security_raw.get("profile")
+                or security.get("amr")
+                or security.get("phone_number_masked")
+            ),
+            "account_source": _text(security_raw.get("account_source")),
+            "import_method": _text(security_raw.get("import_method")),
+            "registration_executor": _text(security_raw.get("registration_executor")),
             "platform_auth": platform_auth,
         },
         "usage": {

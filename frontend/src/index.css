@@ -193,6 +193,74 @@ body {
   font-size: 0.75rem;
 }
 
+.filter-control {
+  height: 2rem;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--bg-input);
+  color: var(--text-secondary);
+  padding: 0 0.65rem;
+  font-size: 0.75rem;
+  line-height: 2rem;
+  transition: border-color 150ms, background-color 150ms, color 150ms;
+}
+
+.filter-control:hover {
+  border-color: var(--accent-edge);
+  color: var(--text-primary);
+}
+
+.filter-control.is-active {
+  border-color: var(--accent-edge);
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+}
+
+.filter-stat-chip {
+  display: inline-flex;
+  align-items: center;
+  height: 1.65rem;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--bg-card);
+  color: var(--text-secondary);
+  padding: 0 0.55rem;
+  font-size: 0.72rem;
+  font-weight: 600;
+  transition: border-color 150ms, background-color 150ms, color 150ms;
+}
+
+.filter-stat-chip:hover,
+.filter-stat-chip.is-active {
+  border-color: var(--accent-edge);
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+}
+
+.filter-stat-success { color: #34d399; }
+.filter-stat-warning { color: #fbbf24; }
+.filter-stat-danger { color: #fb7185; }
+.filter-stat-accent { color: var(--accent-strong); }
+
+.account-filter-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+  gap: 0.75rem;
+}
+
+.account-filter-grid label {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.account-filter-grid label > span {
+  color: var(--text-muted);
+  font-size: 0.72rem;
+  font-weight: 600;
+}
+
 .checkbox-accent {
   accent-color: var(--accent);
 }

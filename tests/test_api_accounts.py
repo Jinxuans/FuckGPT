@@ -17,12 +17,13 @@ from core.db import (
     AccountAuthCredentialModel,
     AccountCodexAuthModel,
     AccountModel,
+    AccountPushDeliveryModel,
     AccountStatusModel,
     TaskModel,
     engine,
     save_account,
 )
-from domain.accounts import AccountExportSelection, AccountQuery, AccountRecord
+from domain.accounts import AccountExportSelection, AccountFilters, AccountQuery, AccountRecord
 from infrastructure.accounts_repository import AccountsRepository
 
 
@@ -541,6 +542,217 @@ def test_filter_accounts_by_platform(client):
     assert data["items"][0]["platform"] == "cursor"
 
 
+def test_v2_filters_search_all_identity_fields_beyond_first_page(client):
+    for index in range(55):
+        _create_account(email=f"ordinary-{index:02d}@test.com")
+    target_id = _create_account(
+        email="primary-address@test.com",
+        user_id="user-deep-search",
+        extra={
+            "codex_email": "codex-deep-search@test.com",
+            "codex_account_id": "codex-account-deep-search",
+            "verification_mailbox": {
+                "provider": "hotmail007",
+                "email": "verify-deep-search@outlook.com",
+                "account_id": "mailbox-deep-search",
+            },
+        },
+    )
+
+    for query in (
+        "user-deep-search",
+        "codex-deep-search",
+        "codex-account-deep-search",
+        "verify-deep-search",
+        "mailbox-deep-search",
+    ):
+        response = client.get(
+            "/api/accounts",
+            params={"platform": "chatgpt", "search": query, "page_size": 50},
+        )
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["total"] == 1
+        assert payload["items"][0]["id"] == target_id
+
+
+def test_v2_filters_mailbox_security_source_region_and_sort(client):
+    protocol_id = _create_account(
+        email="protocol@test.com",
+        extra={
+            "checked_at": "2026-07-01T00:00:00Z",
+            "phone_bound": True,
+            "mfa_enabled": True,
+            "region": "US",
+            "account_source": "registration",
+            "registration_executor": "protocol",
+            "verification_mailbox": {
+                "provider": "hotmail007",
+                "email": "protocol@test.com",
+                "account_id": "mb-protocol",
+            },
+            "codex_expires_at": "2026-09-01T00:00:00Z",
+        },
+    )
+    browser_id = _create_account(
+        email="browser@test.com",
+        extra={
+            "checked_at": "2026-07-02T00:00:00Z",
+            "phone_bound": False,
+            "mfa_enabled": False,
+            "region": "JP",
+            "account_source": "registration",
+            "registration_executor": "headless",
+            "verification_mailbox": {
+                "provider": "api_mailbox",
+                "email": "verify-browser@test.com",
+                "account_id": "mb-browser",
+            },
+            "codex_expires_at": "2026-08-01T00:00:00Z",
+        },
+    )
+
+    response = client.get(
+        "/api/accounts",
+        params={
+            "platform": "chatgpt",
+            "mailbox_bound": "bound",
+            "mailbox_provider": "hotmail007",
+            "mailbox_email_match": "same",
+            "phone_state": "bound",
+            "checked_state": "checked",
+            "mfa_state": "enabled",
+            "source": "protocol",
+            "region": "US",
+        },
+    )
+    assert response.status_code == 200
+    assert [item["id"] for item in response.json()["items"]] == [protocol_id]
+
+    sorted_response = client.get(
+        "/api/accounts",
+        params={"platform": "chatgpt", "sort_by": "expires_at", "sort_order": "asc"},
+    )
+    assert sorted_response.status_code == 200
+    assert [item["id"] for item in sorted_response.json()["items"][:2]] == [browser_id, protocol_id]
+
+
+def test_v2_filters_codex_authorization_push_target_status_and_recent_times(client):
+    authorized_id = _create_account(
+        email="authorized-filter@test.com",
+        extra={
+            "codex_access_token": "authorized-secret",
+            "codex_last_refresh": "2026-07-10T12:00:00Z",
+        },
+    )
+    failed_id = _create_account(
+        email="failed-filter@test.com",
+        extra={"codex_last_refresh": "2026-07-01T12:00:00Z"},
+    )
+    untouched_id = _create_account(email="untouched-filter@test.com")
+
+    with Session(engine) as session:
+        session.add(AccountPushDeliveryModel(
+            account_id=authorized_id,
+            target_key="alpha",
+            target_label="Alpha",
+            status="success",
+            last_attempt_at=datetime(2026, 7, 20, 12, tzinfo=timezone.utc),
+            pushed_at=datetime(2026, 7, 20, 12, tzinfo=timezone.utc),
+            updated_at=datetime(2026, 7, 20, 12, tzinfo=timezone.utc),
+        ))
+        session.add(AccountPushDeliveryModel(
+            account_id=authorized_id,
+            target_key="beta",
+            target_label="Beta",
+            status="failed",
+            last_attempt_at=datetime(2026, 7, 21, 12, tzinfo=timezone.utc),
+            updated_at=datetime(2026, 7, 21, 12, tzinfo=timezone.utc),
+        ))
+        session.add(AccountPushDeliveryModel(
+            account_id=failed_id,
+            target_key="alpha",
+            target_label="Alpha",
+            status="failed",
+            last_attempt_at=datetime(2026, 7, 22, 12, tzinfo=timezone.utc),
+            updated_at=datetime(2026, 7, 22, 12, tzinfo=timezone.utc),
+        ))
+        session.commit()
+
+    def filtered_ids(**params):
+        response = client.get("/api/accounts", params={"platform": "chatgpt", **params})
+        assert response.status_code == 200
+        return {item["id"] for item in response.json()["items"]}
+
+    assert filtered_ids(codex_auth_state="authorized") == {authorized_id}
+    assert filtered_ids(codex_auth_state="unauthorized") == {failed_id, untouched_id}
+    assert filtered_ids(push_target="alpha", push_status="success") == {authorized_id}
+    assert filtered_ids(push_target="beta", push_status="failed") == {authorized_id}
+    assert filtered_ids(push_target="beta", push_status="not_pushed") == {failed_id, untouched_id}
+    assert filtered_ids(push_status="failed") == {authorized_id, failed_id}
+    assert filtered_ids(
+        pushed_from="2026-07-22T00:00:00Z",
+        pushed_to="2026-07-23T00:00:00Z",
+    ) == {failed_id}
+    assert filtered_ids(
+        codex_refreshed_from="2026-07-10T00:00:00Z",
+        codex_refreshed_to="2026-07-11T00:00:00Z",
+    ) == {authorized_id}
+
+    selected = AccountsRepository().select_for_export(AccountExportSelection(
+        platform="chatgpt",
+        select_all=True,
+        filters=AccountFilters(push_target="alpha", push_status="success"),
+    ))
+    assert [record.id for record in selected] == [authorized_id]
+
+    stats = client.get("/api/accounts/stats", params={"platform": "chatgpt"}).json()
+    assert stats["codex_authorized"] == 1
+    assert stats["codex_unauthorized"] == 2
+    assert stats["push_failed"] == 2
+    assert stats["push_not_pushed"] == 1
+    assert stats["push_targets"] == [
+        {"key": "alpha", "label": "Alpha"},
+        {"key": "beta", "label": "Beta"},
+    ]
+
+
+def test_v2_full_filter_selection_is_shared_by_export_and_batch_check(client, monkeypatch):
+    matched_id = _create_account(
+        email="matched@test.com",
+        extra={"region": "US", "account_source": "import", "import_method": "csv"},
+    )
+    _create_account(
+        email="ignored@test.com",
+        extra={"region": "JP", "account_source": "import", "import_method": "text"},
+    )
+
+    export_response = client.post(
+        "/api/accounts/export/csv",
+        json={
+            "platform": "chatgpt",
+            "select_all": True,
+            "filters": {"source": "import", "import_method": "csv", "region": "US"},
+        },
+    )
+    assert export_response.status_code == 200
+    assert "matched@test.com" in export_response.text
+    assert "ignored@test.com" not in export_response.text
+
+    check_response = client.post(
+        "/api/accounts/check-all",
+        json={
+            "platform": "chatgpt",
+            "select_all": True,
+            "filters": {"source": "import", "import_method": "csv", "region": "US"},
+        },
+    )
+    assert check_response.status_code == 200
+    with Session(engine) as session:
+        task = session.get(TaskModel, check_response.json()["task_id"])
+        assert task.get_payload()["account_ids"] == [matched_id]
+
+
 def test_account_stats(client):
     _create_account()
     resp = client.get("/api/accounts/stats")
@@ -656,6 +868,33 @@ def test_codex_oauth_batch_freezes_selected_account_ids_and_params(client):
     assert payload["action_id"] == "codex_oauth_authorize"
     assert payload["concurrency"] == 3
     assert payload["params"]["platform_proxy_mode"] == "manual"
+
+
+def test_codex_oauth_batch_freezes_complete_v2_filter_result(client):
+    matched_id = _create_account(
+        email="codex-filter-match@test.com",
+        extra={"region": "US", "account_source": "import", "import_method": "csv"},
+    )
+    _create_account(
+        email="codex-filter-ignore@test.com",
+        extra={"region": "JP", "account_source": "import", "import_method": "text"},
+    )
+
+    response = client.post(
+        "/api/accounts/codex-oauth/authorize",
+        json={
+            "platform": "chatgpt",
+            "select_all": True,
+            "filters": {"source": "import", "import_method": "csv", "region": "US"},
+            "concurrency": 2,
+            "params": {"browser_mode": "headless"},
+        },
+    )
+
+    assert response.status_code == 200
+    with Session(engine) as session:
+        task = session.get(TaskModel, response.json()["task_id"])
+        assert task.get_payload()["account_ids"] == [matched_id]
 
 
 def test_empty_export_selection_never_falls_back_to_all_accounts():

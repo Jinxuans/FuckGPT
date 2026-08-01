@@ -1217,6 +1217,11 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
             if logger.is_cancel_requested():
                 return "__cancel_requested__"
             with Session(engine) as registration_session:
+                account.extra = {
+                    **dict(account.extra or {}),
+                    "account_source": "registration",
+                    "registration_executor": str(payload.get("executor_type") or ""),
+                }
                 saved_account = save_account(account, session=registration_session, commit=False)
                 saved_account_id = int(saved_account.id)
                 if allocation_id:
