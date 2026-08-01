@@ -52,7 +52,7 @@ TASK_STATUS_CANCELLED = "cancelled"
 # backend contract; anything larger is deliberately bounded to avoid an
 # accidental unbounded thread pool.
 MAX_REGISTER_CONCURRENCY = 20
-MAX_CODEX_OAUTH_BATCH_CONCURRENCY = 5
+MAX_CODEX_OAUTH_BATCH_CONCURRENCY = 20
 
 TERMINAL_TASK_STATUSES = {
     TASK_STATUS_SUCCEEDED,

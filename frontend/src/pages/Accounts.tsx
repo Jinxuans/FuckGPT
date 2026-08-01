@@ -2408,7 +2408,7 @@ export default function Accounts() {
                   className="h-7 rounded-md border border-[var(--border)] bg-transparent px-2 text-xs text-[var(--text-secondary)] outline-none focus:border-[var(--text-primary)]"
                   title="Codex OAuth 并发数"
                 >
-                  {[1, 2, 3, 4, 5].map(value => (
+                  {[1, 2, 3, 4, 5, 10, 20].map(value => (
                     <option key={value} value={value}>并发 {value}</option>
                   ))}
                 </select>
