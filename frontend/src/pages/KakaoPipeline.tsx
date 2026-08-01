@@ -11,7 +11,6 @@ import {
   KeyRound,
   Link2,
   LoaderCircle,
-  QrCode,
   RefreshCw,
   RotateCcw,
   ScanLine,
@@ -59,6 +58,8 @@ type Pipeline = {
   supplier_stage?: number
   supplier_stage_total?: number
   supplier_stage_name?: string
+  supplier_processing_started_at?: string | null
+  supplier_deadline_at?: string | null
   payment_url?: string
   scanner_driver?: string
   scanner_name?: string
@@ -67,8 +68,24 @@ type Pipeline = {
   scanner_subscription_status?: string
   scan_url?: string
   scan_expires_at?: string
+  scanner_submit_attempts?: number
+  scanner_compensation_attempted?: boolean
+  scanner_poll_failures?: number
+  scanner_recovery_reason?: string
+  scanner_recovery_check_count?: number
+  scanner_recovery_started_at?: string | null
+  scanner_recovery_next_check_at?: string | null
+  scanner_recovery_deadline_at?: string | null
+  scanner_processing_started_at?: string | null
+  scanner_deadline_at?: string | null
   plus_status: string
   final_result: string
+  completion_source?: string
+  plus_check_count?: number
+  plus_check_started_at?: string | null
+  plus_next_check_at?: string | null
+  plus_check_deadline_at?: string | null
+  plus_check_paused_at?: string | null
   last_error_code: string
   last_error_message: string
   created_at?: string | null
@@ -134,8 +151,11 @@ const SETTING_TITLES: Record<SettingKind, string> = {
 
 const PAGE_SIZE = 20
 const ACTIVE_PIPELINE_STATES = new Set([
+  'supplier_submitting',
   'supplier_processing',
+  'scanner_submitting',
   'scanner_processing',
+  'scanner_accepted_untracked',
   'scanner_succeeded',
   'plus_checking',
   'plus_pending',
@@ -195,7 +215,7 @@ function sessionTokenFromCookies(value: string) {
 
 function planBadge(account: KakaoAccount) {
   const plan = String(account.plan || '').toLowerCase()
-  const subscribed = account.plan_state === 'subscribed' || ['plus', 'pro', 'team', 'business'].some(item => plan.includes(item))
+  const subscribed = account.plan_state === 'subscribed' || ['plus', 'pro', 'team', 'business', 'enterprise'].some(item => plan.includes(item))
   if (subscribed) return <Badge variant="success">PLUS</Badge>
   if (plan === 'free' || account.plan_state === 'free') return <Badge variant="secondary">FREE</Badge>
   return <Badge variant="secondary">{account.plan || '未检测'}</Badge>
@@ -203,7 +223,7 @@ function planBadge(account: KakaoAccount) {
 
 function accountIsPlus(account: KakaoAccount) {
   const plan = String(account.plan || '').toLowerCase()
-  return account.plan_state === 'subscribed' || ['plus', 'pro', 'team', 'business'].some(item => plan.includes(item))
+  return account.plan_state === 'subscribed' || ['plus', 'pro', 'team', 'business', 'enterprise'].some(item => plan.includes(item))
 }
 
 function phoneBindingBadge(account: KakaoAccount) {
@@ -407,7 +427,7 @@ function AccountMoreMenu({
   )
 }
 
-type StepState = 'waiting' | 'active' | 'complete' | 'error'
+type StepState = 'waiting' | 'active' | 'complete' | 'paused' | 'error'
 
 function formatLatestTime(value?: string | null) {
   if (!value) return null
@@ -457,17 +477,48 @@ function LatestEventTime({ value }: { value?: string | null }) {
   )
 }
 
+function formatNextPlusCheck(value?: string | null) {
+  if (!value) return ''
+  const normalized = /(?:Z|[+-]\d{2}:?\d{2})$/.test(value) ? value : `${value}Z`
+  const nextCheck = new Date(normalized)
+  if (Number.isNaN(nextCheck.getTime())) return ''
+  const seconds = Math.ceil((nextCheck.getTime() - Date.now()) / 1000)
+  if (seconds <= 3) return '即将再次检测'
+  if (seconds < 60) return `${seconds} 秒后再查`
+  const minutes = Math.floor(seconds / 60)
+  const remainingSeconds = seconds % 60
+  return remainingSeconds ? `${minutes} 分 ${remainingSeconds} 秒后再查` : `${minutes} 分钟后再查`
+}
+
 function PipelineProgress({ account }: { account: KakaoAccount }) {
   const pipeline = account.pipeline
   const alreadyPlus = accountIsPlus(account)
-  const scannerComplete = ['scanner_succeeded', 'plus_checking', 'plus_pending', 'plus_check_failed', 'completed'].includes(pipeline.state)
+  const scannerReached = [
+    'scanner_submitting',
+    'scanner_processing',
+    'scanner_accepted_untracked',
+    'scanner_recovery_unconfirmed',
+    'scanner_submit_unconfirmed',
+    'scanner_poll_failed',
+    'scanner_failed',
+    'scanner_succeeded',
+    'plus_checking',
+    'plus_pending',
+    'plus_unconfirmed',
+    'plus_check_failed',
+    'completed',
+  ].includes(pipeline.state)
+  const scannerComplete = ['scanner_succeeded', 'plus_checking', 'plus_pending', 'plus_unconfirmed', 'plus_check_failed', 'completed'].includes(pipeline.state)
+  const scannerUncertain = ['scanner_accepted_untracked', 'scanner_recovery_unconfirmed', 'scanner_submit_unconfirmed', 'scanner_poll_failed'].includes(pipeline.state)
   const steps: Array<{ label: string; state: StepState }> = [
     {
       label: '提链',
       state: pipeline.state === 'supplier_failed'
         ? 'error'
-        : pipeline.payment_url
+        : pipeline.payment_url || scannerReached
           ? 'complete'
+          : ['supplier_poll_failed', 'supplier_submit_unconfirmed'].includes(pipeline.state)
+            ? 'paused'
           : ['supplier_submitting', 'supplier_processing'].includes(pipeline.state)
             ? 'active'
             : 'waiting',
@@ -478,6 +529,8 @@ function PipelineProgress({ account }: { account: KakaoAccount }) {
         ? 'error'
         : scannerComplete
           ? 'complete'
+          : scannerUncertain
+            ? 'paused'
           : ['scanner_submitting', 'scanner_processing'].includes(pipeline.state)
             ? 'active'
             : 'waiting',
@@ -488,7 +541,9 @@ function PipelineProgress({ account }: { account: KakaoAccount }) {
         ? 'error'
         : pipeline.state === 'completed' || pipeline.final_result === 'plus' || alreadyPlus
           ? 'complete'
-          : pipeline.state === 'plus_checking'
+          : ['plus_unconfirmed', 'scanner_accepted_untracked', 'scanner_recovery_unconfirmed', 'scanner_submit_unconfirmed'].includes(pipeline.state)
+            ? 'paused'
+          : ['plus_checking', 'plus_pending'].includes(pipeline.state)
             ? 'active'
             : 'waiting',
     },
@@ -501,10 +556,37 @@ function PipelineProgress({ account }: { account: KakaoAccount }) {
       const stage = pipeline.supplier_stage_total ? `${pipeline.supplier_stage || 0}/${pipeline.supplier_stage_total} ` : ''
       return `${stage}${pipeline.supplier_stage_name || pipeline.supplier_status || '供应商处理中'}`
     }
+    if (pipeline.state === 'supplier_poll_failed') return pipeline.last_error_message || '提链订单查询已暂停，可继续查询原订单'
+    if (pipeline.state === 'supplier_submit_unconfirmed') return pipeline.last_error_message || '提链提交结果无法确认，请重置后重试'
     if (pipeline.state === 'scanner_processing') return `${pipeline.scanner_name || '扫码平台'}处理中`
+    if (pipeline.state === 'scanner_submitting') return `${pipeline.scanner_name || '扫码平台'}提交中`
+    if (pipeline.state === 'scanner_accepted_untracked') {
+      const count = Number(pipeline.scanner_recovery_check_count || 0)
+      const nextCheck = formatNextPlusCheck(pipeline.scanner_recovery_next_check_at)
+      return [
+        pipeline.scanner_status === 'DUPLICATE_ACCEPTED'
+          ? '上游已接收链接，正在观察 Plus'
+          : '扫码提交结果无法确认，正在观察 Plus',
+        count ? `已检测 ${count} 次` : '',
+        nextCheck,
+      ].filter(Boolean).join(' · ')
+    }
+    if (pipeline.state === 'scanner_recovery_unconfirmed') return pipeline.last_error_message || '上游已接收链接，暂未确认 Plus'
+    if (pipeline.state === 'scanner_submit_unconfirmed') return pipeline.last_error_message || '扫码提交结果无法确认，可检测 Plus 或重置'
+    if (pipeline.state === 'scanner_poll_failed') return pipeline.last_error_message || '扫码订单查询已暂停，可继续查询原订单'
     if (pipeline.state === 'link_ready') return '长链已就绪，等待上传扫码'
-    if (pipeline.state === 'scanner_succeeded' || pipeline.state === 'plus_pending') return '扫码成功，等待 Plus 同步'
-    if (pipeline.state === 'plus_checking') return '正在复检 Plus 状态'
+    if (pipeline.state === 'scanner_succeeded') return '扫码已完成，正在启动 Plus 确认'
+    if (pipeline.state === 'plus_pending') {
+      const count = Number(pipeline.plus_check_count || 0)
+      const nextCheck = formatNextPlusCheck(pipeline.plus_next_check_at)
+      return [
+        '正在确认 Plus，无需操作',
+        count ? `已检测 ${count} 次` : '',
+        nextCheck,
+      ].filter(Boolean).join(' · ')
+    }
+    if (pipeline.state === 'plus_unconfirmed') return '扫码已完成，10 分钟内未确认 Plus，可手动检测'
+    if (pipeline.state === 'plus_checking') return '正在检查 Plus，请稍候'
     if (['supplier_failed', 'scanner_failed', 'plus_check_failed'].includes(pipeline.state)) {
       return pipeline.last_error_message || '本次操作失败'
     }
@@ -526,6 +608,7 @@ function PipelineProgress({ account }: { account: KakaoAccount }) {
               'relative z-10 h-3 w-3 rounded-full ring-4 ring-[var(--bg-surface)]',
               step.state === 'complete' && 'bg-emerald-500',
               step.state === 'active' && 'bg-[var(--accent)]',
+              step.state === 'paused' && 'bg-amber-500',
               step.state === 'error' && 'bg-red-500',
               step.state === 'waiting' && 'bg-[var(--border)]',
             )} />
@@ -533,6 +616,7 @@ function PipelineProgress({ account }: { account: KakaoAccount }) {
               'text-[11px]',
               step.state === 'complete' && 'text-emerald-500',
               step.state === 'active' && 'font-medium text-[var(--accent)]',
+              step.state === 'paused' && 'font-medium text-amber-500',
               step.state === 'error' && 'font-medium text-red-500',
               step.state === 'waiting' && 'text-[var(--text-muted)]',
             )}>{step.label}</span>
@@ -540,7 +624,7 @@ function PipelineProgress({ account }: { account: KakaoAccount }) {
         ))}
       </div>
       <p className={cn(
-        'mt-2 truncate text-center text-xs',
+        'mt-2 text-center text-xs leading-5',
         ['supplier_failed', 'scanner_failed', 'plus_check_failed'].includes(pipeline.state)
           ? 'text-red-500'
           : 'text-[var(--text-secondary)]',
@@ -1317,13 +1401,13 @@ export default function KakaoPipeline() {
             <Link2 className="mr-1.5 h-3.5 w-3.5" /> 提取 Kakao 链接
           </Button>
         )}
-        {pipeline.state === 'supplier_processing' && (
+        {['supplier_processing', 'supplier_poll_failed'].includes(pipeline.state) && pipeline.supplier_order_id && (
           <Button
             variant="outline"
             size="sm"
-            onClick={() => run(account.id, '刷新提链', `/kakao-pipeline/accounts/${account.id}/supplier/poll`)}
+            onClick={() => run(account.id, '查询原提链订单', `/kakao-pipeline/accounts/${account.id}/supplier/poll`)}
           >
-            <RefreshCw className="mr-1.5 h-3.5 w-3.5" /> 刷新
+            <RefreshCw className="mr-1.5 h-3.5 w-3.5" /> 查询提链
           </Button>
         )}
         {['link_ready', 'scanner_failed'].includes(pipeline.state) && pipeline.payment_url && (
@@ -1347,27 +1431,22 @@ export default function KakaoPipeline() {
             </Button>
           </>
         )}
-        {pipeline.state === 'scanner_processing' && (
+        {['scanner_processing', 'scanner_poll_failed'].includes(pipeline.state) && pipeline.scanner_order_id && (
           <Button
             variant="outline"
             size="sm"
             onClick={() => run(
               account.id,
-              '刷新扫码',
+              '查询原扫码订单',
               `/kakao-pipeline/accounts/${account.id}/scanner/poll`,
               {},
               { checkPlusAfter: true },
             )}
           >
-            <RefreshCw className="mr-1.5 h-3.5 w-3.5" /> 刷新扫码
+            <RefreshCw className="mr-1.5 h-3.5 w-3.5" /> 查询扫码
           </Button>
         )}
-        {pipeline.scan_url && (
-          <Button variant="outline" size="sm" onClick={() => window.open(pipeline.scan_url, '_blank', 'noopener,noreferrer')}>
-            <QrCode className="mr-1.5 h-3.5 w-3.5" /> 扫码信息
-          </Button>
-        )}
-        {['scanner_succeeded', 'plus_pending', 'plus_check_failed', 'completed'].includes(pipeline.state) || accountIsPlus(account) ? (
+        {['scanner_succeeded', 'scanner_accepted_untracked', 'scanner_recovery_unconfirmed', 'scanner_submit_unconfirmed', 'plus_pending', 'plus_unconfirmed', 'plus_check_failed'].includes(pipeline.state) ? (
           <Button
             variant="outline"
             size="sm"
@@ -1379,6 +1458,11 @@ export default function KakaoPipeline() {
             )}
           >
             <Check className="mr-1.5 h-3.5 w-3.5" /> 检测 Plus
+          </Button>
+        ) : null}
+        {pipeline.state === 'completed' || accountIsPlus(account) ? (
+          <Button variant="outline" size="sm" onClick={checkPlus}>
+            <Check className="mr-1.5 h-3.5 w-3.5" /> 刷新账号状态
           </Button>
         ) : null}
         <AccountMoreMenu
@@ -1398,7 +1482,7 @@ export default function KakaoPipeline() {
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE))
   const activeCount = accounts.filter(account => ACTIVE_PIPELINE_STATES.has(account.pipeline.state)).length
   const readyCount = accounts.filter(account => account.pipeline.state === 'link_ready').length
-  const errorCount = accounts.filter(account => ['supplier_failed', 'scanner_failed', 'plus_check_failed'].includes(account.pipeline.state)).length
+  const errorCount = accounts.filter(account => ['supplier_failed', 'scanner_failed', 'scanner_recovery_unconfirmed', 'plus_check_failed'].includes(account.pipeline.state)).length
   const completedCount = accounts.filter(account => account.pipeline.state === 'completed' || accountIsPlus(account)).length
   const expandedAccount = expanded === null ? null : accounts.find(account => account.id === expanded) || null
 
