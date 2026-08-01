@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 from core.base_platform import Account
-from core.db import save_account
+from core.db import KakaoPipelineModel, save_account
 from features.kakao_pipeline.client import CustomerApiClient, CustomerApiProblem
 from features.kakao_pipeline.service import KakaoPipelineService
 from features.kakao_pipeline.workstation_client import WorkstationScannerClient
@@ -34,6 +35,28 @@ def _create_session_account(email: str = "kakao-session@test.com") -> int:
         )
     )
     return int(created.id)
+
+
+def test_pipeline_latest_event_time_is_not_the_poll_updated_time():
+    pipeline = KakaoPipelineModel(
+        account_id=123,
+        state="supplier_processing",
+        updated_at=datetime(2026, 8, 1, 12, 5, tzinfo=timezone.utc),
+    )
+    pipeline.set_events(
+        [
+            {
+                "time": "2026-08-01T12:00:00+00:00",
+                "level": "info",
+                "message": "供应商状态: PENDING",
+            }
+        ]
+    )
+
+    serialized = KakaoPipelineService._serialize_pipeline(pipeline)
+
+    assert serialized["updated_at"] == "2026-08-01T12:05:00+00:00"
+    assert serialized["latest_event_at"] == "2026-08-01T12:00:00+00:00"
 
 
 def test_customer_api_client_builds_extract_and_ready_link_requests(monkeypatch):
@@ -218,6 +241,7 @@ def test_kakao_pipeline_supplier_to_scanner_flow(monkeypatch):
 
     created = service.start_extraction(account_id)
     assert created["state"] == "supplier_processing"
+    assert created["latest_event_at"] == created["events"][-1]["time"]
     ready = service.poll_supplier(account_id)
     assert ready["state"] == "link_ready"
     assert ready["payment_url"].startswith("https://pay.nicepay.co.kr/")
@@ -626,6 +650,7 @@ def test_kakao_account_list_uses_local_accounts_without_exposing_tokens(client):
     assert payload["total"] == 1
     assert payload["items"][0]["id"] == account_id
     assert payload["items"][0]["account_view"]["security"]["phone_bound"] is False
+    assert payload["items"][0]["pipeline"]["latest_event_at"] is None
     assert "access-token-for-kakao-test" not in response.text
 
 

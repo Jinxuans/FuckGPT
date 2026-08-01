@@ -71,6 +71,10 @@ type Pipeline = {
   final_result: string
   last_error_code: string
   last_error_message: string
+  created_at?: string | null
+  updated_at?: string | null
+  latest_event_at?: string | null
+  completed_at?: string | null
   events?: Array<{ time: string; level: string; message: string }>
   supplier_response?: Record<string, unknown>
   scanner_response?: Record<string, unknown>
@@ -404,6 +408,54 @@ function AccountMoreMenu({
 }
 
 type StepState = 'waiting' | 'active' | 'complete' | 'error'
+
+function formatLatestTime(value?: string | null) {
+  if (!value) return null
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) {
+    return { primary: value, relative: '', full: value }
+  }
+
+  const now = new Date()
+  const pad = (part: number) => String(part).padStart(2, '0')
+  const time = `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`
+  const sameDay = date.getFullYear() === now.getFullYear()
+    && date.getMonth() === now.getMonth()
+    && date.getDate() === now.getDate()
+  const primary = sameDay ? time : `${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${time}`
+  const full = `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${time}`
+  const elapsedSeconds = Math.max(0, Math.floor((now.getTime() - date.getTime()) / 1000))
+  const relative = elapsedSeconds < 10
+    ? '刚刚'
+    : elapsedSeconds < 60
+      ? `${elapsedSeconds} 秒前`
+      : elapsedSeconds < 3600
+        ? `${Math.floor(elapsedSeconds / 60)} 分钟前`
+        : elapsedSeconds < 86400
+          ? `${Math.floor(elapsedSeconds / 3600)} 小时前`
+          : `${Math.floor(elapsedSeconds / 86400)} 天前`
+
+  return { primary, relative, full }
+}
+
+function LatestEventTime({ value }: { value?: string | null }) {
+  const formatted = formatLatestTime(value)
+  if (!formatted) {
+    return (
+      <div className="whitespace-nowrap">
+        <div className="font-mono text-xs text-[var(--text-muted)]">—</div>
+        <div className="mt-1 text-[11px] text-[var(--text-muted)]">暂无日志</div>
+      </div>
+    )
+  }
+
+  return (
+    <time dateTime={value || undefined} title={formatted.full} className="block whitespace-nowrap">
+      <span className="block font-mono text-xs text-[var(--text-secondary)]">{formatted.primary}</span>
+      {formatted.relative ? <span className="mt-1 block text-[11px] text-[var(--text-muted)]">{formatted.relative}</span> : null}
+    </time>
+  )
+}
 
 function PipelineProgress({ account }: { account: KakaoAccount }) {
   const pipeline = account.pipeline
@@ -1448,16 +1500,18 @@ export default function KakaoPipeline() {
 
       <div className="overflow-hidden border border-[var(--border)] bg-[var(--bg-surface)]">
         <div className="overflow-x-auto">
-          <table className="w-full min-w-[900px] table-fixed text-left" aria-busy={loading || pageLoading}>
+          <table className="w-full min-w-[1080px] table-fixed text-left" aria-busy={loading || pageLoading}>
             <colgroup>
-              <col className="w-[30%]" />
-              <col className="w-[38%]" />
-              <col className="w-[32%]" />
+              <col className="w-[25%]" />
+              <col className="w-[33%]" />
+              <col className="w-[14%]" />
+              <col className="w-[28%]" />
             </colgroup>
             <thead className="border-b border-[var(--border)] bg-[var(--bg-pane)] text-[var(--text-muted)]">
               <tr>
                 <th className="px-4 py-3">账号</th>
                 <th className="px-4 py-3 text-center">流程进度</th>
+                <th className="px-4 py-3">最新时间</th>
                 <th className="px-4 py-3 text-right">下一步</th>
               </tr>
             </thead>
@@ -1465,7 +1519,7 @@ export default function KakaoPipeline() {
               {loading ? (
                 Array.from({ length: 6 }).map((_, index) => (
                   <tr key={index}>
-                    {Array.from({ length: 3 }).map((__, cell) => (
+                    {Array.from({ length: 4 }).map((__, cell) => (
                       <td key={cell} className="px-4 py-4">
                         <div className="h-4 animate-pulse rounded bg-[var(--chip-bg)]" />
                       </td>
@@ -1474,7 +1528,7 @@ export default function KakaoPipeline() {
                 ))
               ) : accounts.length === 0 ? (
                 <tr>
-                  <td colSpan={3} className="px-4 py-14 text-center text-sm text-[var(--text-muted)]">
+                  <td colSpan={4} className="px-4 py-14 text-center text-sm text-[var(--text-muted)]">
                     没有找到本地 ChatGPT 账号。
                   </td>
                 </tr>
@@ -1499,6 +1553,7 @@ export default function KakaoPipeline() {
                         </div>
                       </td>
                       <td className="px-4 py-4"><PipelineProgress account={account} /></td>
+                      <td className="px-4 py-4"><LatestEventTime value={account.pipeline.latest_event_at} /></td>
                       <td className="px-4 py-4">{renderActions(account)}</td>
                     </tr>
               ))}

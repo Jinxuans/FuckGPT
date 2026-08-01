@@ -572,9 +572,12 @@ class KakaoPipelineService:
                 "final_result": "",
                 "last_error_code": "",
                 "last_error_message": "",
+                "latest_event_at": None,
             }
         supplier = model.get_supplier_response()
         scanner = model.get_scanner_response()
+        events = model.get_events()
+        latest_event = events[-1] if events and isinstance(events[-1], dict) else {}
         supplier_data = _data(supplier)
         scanner_data = _data(scanner)
         extraction = supplier_data.get("extraction") if isinstance(supplier_data.get("extraction"), dict) else {}
@@ -604,12 +607,13 @@ class KakaoPipelineService:
             "last_error_message": model.last_error_message,
             "created_at": model.created_at.isoformat() if model.created_at else None,
             "updated_at": model.updated_at.isoformat() if model.updated_at else None,
+            "latest_event_at": _text(latest_event.get("time")) or None,
             "completed_at": model.completed_at.isoformat() if model.completed_at else None,
         }
         if detail:
             payload.update(
                 {
-                    "events": model.get_events(),
+                    "events": events,
                     "supplier_response": sanitize_remote(supplier),
                     "scanner_response": sanitize_remote(scanner),
                 }
