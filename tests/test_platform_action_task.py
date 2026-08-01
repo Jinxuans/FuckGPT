@@ -81,6 +81,47 @@ def test_platform_action_task_passes_task_logger_to_runtime(monkeypatch):
     assert logger.finished == (tasks_module.TASK_STATUS_SUCCEEDED, "")
 
 
+def test_codex_oauth_action_refreshes_quota_after_success(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(
+        tasks_module,
+        "_execute_runtime_action_with_worker_proxy",
+        lambda **kwargs: ActionExecutionResult(ok=True, data={"message": "OAuth done"}),
+    )
+    monkeypatch.setattr(
+        tasks_module,
+        "_refresh_account_after_codex_oauth",
+        lambda account_id, logger, **kwargs: calls.append((account_id, kwargs)) or {"ok": True, "valid": True},
+    )
+    monkeypatch.setattr(tasks_module, "_log_codex_auto_push_enqueue", lambda *args, **kwargs: None)
+    logger = _FakeLogger()
+
+    tasks_module._execute_platform_action_task(
+        {
+            "platform": "chatgpt",
+            "account_id": 123,
+            "action_id": "codex_oauth_authorize",
+            "params": {"platform_proxy_mode": "manual", "platform_proxy_value": "http://proxy"},
+        },
+        logger,
+    )
+
+    assert calls == [(123, {"params": {"platform_proxy_mode": "manual", "platform_proxy_value": "http://proxy"}, "scope_id": "test-task"})]
+    assert logger.result_data["quota_refresh"] == {"ok": True, "valid": True}
+    assert logger.finished == (tasks_module.TASK_STATUS_SUCCEEDED, "")
+
+
+def test_codex_oauth_quota_refresh_failure_is_non_fatal(monkeypatch):
+    monkeypatch.setattr(tasks_module, "_run_single_account_check", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("usage unavailable")))
+    logger = _FakeLogger()
+
+    result = tasks_module._refresh_account_after_codex_oauth(123, logger)
+
+    assert result == {"ok": False, "error": "usage unavailable"}
+    assert any("OAuth 已成功，但额度刷新失败" in event[1] for event in logger.events if event[0] == "log")
+
+
 def test_chatgpt_register_task_succeeds_after_successful_registration(monkeypatch):
     class FakePlatform:
         def register(self, email=None, password=None):
