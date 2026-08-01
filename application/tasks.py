@@ -19,7 +19,7 @@ from core.account_graph import (
 )
 from core.base_platform import AccountStatus, RegisterConfig
 from core.datetime_utils import format_local_clock, serialize_datetime
-from core.db import AccountModel, TaskEventModel, TaskModel, engine, save_account
+from core.db import AccountModel, AccountStatusModel, TaskEventModel, TaskModel, engine, save_account
 from core.network_retry import is_retryable_network_error
 from core.platform_accounts import build_platform_account
 from core.proxy_resolution import (
@@ -255,6 +255,9 @@ def create_account_check_all_task(
     account_ids: list[int] | None = None,
     platform_proxy_mode: str = "",
     platform_proxy_value: str = "",
+    concurrency: int = 0,
+    request_timeout_seconds: int = 0,
+    automatic: bool = False,
 ) -> dict[str, Any]:
     normalized_ids = [int(item) for item in account_ids or [] if int(item or 0) > 0]
     payload: dict[str, Any] = {"platform": platform, "limit": int(limit or 50)}
@@ -262,6 +265,12 @@ def create_account_check_all_task(
         payload["platform_proxy_mode"] = platform_proxy_mode
     if platform_proxy_value:
         payload["platform_proxy_value"] = platform_proxy_value
+    if concurrency:
+        payload["concurrency"] = int(concurrency)
+    if request_timeout_seconds:
+        payload["request_timeout_seconds"] = int(request_timeout_seconds)
+    if automatic:
+        payload["automatic"] = True
     progress_total = max(int(limit or 50), 1)
     if account_ids is not None:
         payload["account_ids"] = normalized_ids
@@ -830,6 +839,8 @@ def _run_single_account_check(
     proxy: str | None = None,
     disable_proxy_pool: bool = False,
     strict_proxy: bool = False,
+    request_timeout_seconds: int = 20,
+    track_invalid_attempt: bool = False,
 ) -> tuple[bool, dict[str, Any]]:
     with Session(engine) as session:
         model = session.get(AccountModel, account_id)
@@ -841,6 +852,8 @@ def _run_single_account_check(
                 extra={
                     "disable_proxy_pool": bool(disable_proxy_pool),
                     "strict_proxy": bool(strict_proxy),
+                    "request_timeout_seconds": max(int(request_timeout_seconds or 20), 5),
+                    "raise_check_errors": True,
                 },
             )
         )
@@ -852,7 +865,11 @@ def _run_single_account_check(
         if model:
             model.updated_at = _utcnow()
             current_graph = load_account_graphs(session, [account_id]).get(account_id, {})
-            summary_updates = {"checked_at": _utcnow_iso(), "valid": bool(valid)}
+            summary_updates = {
+                "checked_at": _utcnow_iso(),
+                "valid": bool(valid),
+                "_track_invalid_attempt": bool(track_invalid_attempt),
+            }
             if hasattr(plugin, "get_last_check_overview"):
                 summary_updates.update(plugin.get_last_check_overview() or {})
             lifecycle_status = None
@@ -950,6 +967,127 @@ def _refresh_account_after_codex_oauth(
     return {"ok": False, "error": "额度刷新未执行"}
 
 
+def _execute_configured_account_check_task(payload: dict[str, Any], logger: TaskLogger) -> None:
+    """Run account checks with persisted defaults and bounded concurrency."""
+    from core.account_check_settings import INVALID_CHECK_LIMIT, get_account_check_settings
+    from core.worker_proxy import WorkerProxyPolicy, worker_proxy_manager
+
+    settings = get_account_check_settings()
+    platform = str(payload.get("platform") or "")
+    limit = max(int(payload.get("limit") or settings.batch_limit), 1)
+    automatic = bool(payload.get("automatic"))
+    concurrency = min(max(int(payload.get("concurrency") or settings.concurrency), 1), 20)
+    request_timeout = min(max(int(payload.get("request_timeout_seconds") or settings.request_timeout_seconds), 5), 300)
+    account_ids = [int(item) for item in payload.get("account_ids", []) if int(item or 0) > 0]
+
+    with Session(engine) as session:
+        q = select(AccountModel)
+        if account_ids:
+            q = q.where(AccountModel.id.in_(account_ids))
+        elif "account_ids" in payload:
+            q = q.where(AccountModel.id == -1)
+        if platform:
+            q = q.where(AccountModel.platform == platform)
+        if automatic:
+            q = q.join(AccountStatusModel, AccountStatusModel.account_id == AccountModel.id)
+            q = q.where(AccountStatusModel.invalid_check_count < INVALID_CHECK_LIMIT)
+            q = q.order_by(AccountStatusModel.checked_at.asc(), AccountModel.id.asc())
+        else:
+            q = q.order_by(AccountModel.created_at.desc(), AccountModel.id.desc())
+        accounts = session.exec(q if "account_ids" in payload else q.limit(limit)).all()
+
+    total = len(accounts)
+    logger.set_progress(0, total)
+    if not total:
+        logger.set_result_data({"valid": 0, "invalid": 0, "error": 0})
+        logger.finish(TASK_STATUS_SUCCEEDED)
+        return
+
+    proxy_mode = normalize_proxy_mode(
+        str(payload.get("platform_proxy_mode") or settings.proxy_mode),
+        default=PROXY_MODE_DIRECT,
+    )
+    manual_proxy = str(payload.get("platform_proxy_value") or payload.get("proxy") or settings.proxy_url or "").strip() or None
+    if proxy_mode == PROXY_MODE_MANUAL and not manual_proxy:
+        logger.finish(TASK_STATUS_FAILED, error="手动代理模式需要填写代理 URL")
+        return
+
+    task_id = str(logger.task_id or "")
+    proxy_policy = WorkerProxyPolicy.load()
+    logger.log(f"账号有效性检测: {total} 个，并发 {concurrency}，请求超时 {request_timeout}s，代理 {proxy_mode}")
+
+    def _check_one(model: AccountModel) -> dict[str, Any]:
+        email = str(model.email or "")
+        if logger.is_cancel_requested():
+            return {"cancelled": True, "email": email}
+        attempts = proxy_policy.replace_max_attempts if proxy_mode == PROXY_MODE_PROXY_SERVICE else 1
+        for attempt in range(1, attempts + 1):
+            lease = None
+            proxy = manual_proxy if proxy_mode == PROXY_MODE_MANUAL else None
+            try:
+                if proxy_mode == PROXY_MODE_PROXY_SERVICE:
+                    lease = worker_proxy_manager.acquire(scope_id=task_id, cancel_check=logger.is_cancel_requested, policy=proxy_policy)
+                    proxy = lease.url
+                valid, result = _run_single_account_check(
+                    int(model.id or 0), proxy=proxy, disable_proxy_pool=True,
+                    strict_proxy=proxy_mode != PROXY_MODE_DIRECT,
+                    request_timeout_seconds=request_timeout, track_invalid_attempt=automatic,
+                )
+                if lease is not None:
+                    lease.report_success()
+                return {"ok": True, "valid": valid, **result}
+            except Exception as exc:
+                retryable = is_retryable_network_error(exc)
+                if lease is not None and retryable:
+                    lease.report_failure()
+                if proxy_mode == PROXY_MODE_PROXY_SERVICE and attempt < attempts and retryable:
+                    continue
+                return {"ok": False, "email": email, "error": str(exc)}
+            finally:
+                if lease is not None:
+                    lease.release()
+        return {"ok": False, "email": email, "error": "账号检测未执行"}
+
+    results = {"valid": 0, "invalid": 0, "error": 0}
+    completed = 0
+    cancelled = False
+    pool = ThreadPoolExecutor(max_workers=min(concurrency, total))
+    pending = {pool.submit(_check_one, model) for model in accounts}
+    try:
+        while pending:
+            if logger.is_cancel_requested():
+                cancelled = True
+                for future in pending:
+                    future.cancel()
+                break
+            done, pending = wait(pending, timeout=0.5, return_when=FIRST_COMPLETED)
+            for future in done:
+                outcome = future.result()
+                if outcome.get("cancelled"):
+                    cancelled = True
+                    continue
+                email = str(outcome.get("email") or "")
+                if not outcome.get("ok"):
+                    results["error"] += 1
+                    error = str(outcome.get("error") or "unknown")
+                    logger.record_error(error)
+                    logger.log(f"{email}: 检测异常: {error}", level="error")
+                elif outcome.get("valid"):
+                    results["valid"] += 1
+                    logger.log(f"{email}: 有效")
+                else:
+                    results["invalid"] += 1
+                    logger.log(f"{email}: 失效", level="warning")
+                completed += 1
+                logger.set_progress(completed, total)
+    finally:
+        pool.shutdown(wait=not cancelled, cancel_futures=cancelled)
+        worker_proxy_manager.clear_scope(task_id)
+
+    logger.set_result_data(results)
+    logger.finish(TASK_STATUS_CANCELLED if cancelled else TASK_STATUS_SUCCEEDED, error="任务已取消" if cancelled else "")
+
+
 def execute_task(task_id: str) -> None:
     with Session(engine) as session:
         task = session.get(TaskModel, task_id)
@@ -970,7 +1108,7 @@ def execute_task(task_id: str) -> None:
 
     handlers: dict[str, Callable[[dict[str, Any], TaskLogger], None]] = {
         TASK_TYPE_REGISTER: _execute_register_task,
-        TASK_TYPE_ACCOUNT_CHECK_ALL: _execute_account_check_all_task,
+        TASK_TYPE_ACCOUNT_CHECK_ALL: _execute_configured_account_check_task,
         TASK_TYPE_PLATFORM_ACTION: _execute_platform_action_task,
         TASK_TYPE_CODEX_OAUTH_BATCH: _execute_codex_oauth_batch_task,
         TASK_TYPE_ACCOUNT_PUSH: _execute_account_push_task,

@@ -4,7 +4,6 @@ import sys
 import os
 import time
 import threading
-import signal
 import requests
 
 SOLVER_PORT = 8889
@@ -154,9 +153,9 @@ def start():
 
 
 def stop():
+    """Stop only the solver process spawned by this application instance."""
     global _proc
     with _lock:
-        # 1. 先终止我们自己 spawn 的子进程
         if _proc and _proc.poll() is None:
             _proc.terminate()
             try:
@@ -164,46 +163,8 @@ def stop():
             except subprocess.TimeoutExpired:
                 _proc.kill()
                 _proc.wait(timeout=3)
-            print("[Solver] 子进程已停止")
+            print("[Solver] owned process stopped")
         _proc = None
-
-        # 2. 即使 _proc 为空（Docker / 外部启动），也尝试通过端口查找残留进程并杀掉
-        if is_running():
-            _kill_by_port(SOLVER_PORT)
-            for _ in range(10):
-                time.sleep(0.5)
-                if not is_running():
-                    break
-            if is_running():
-                print("[Solver] 警告: 停止后端口仍被占用")
-            else:
-                print("[Solver] 残留进程已清理")
-
-
-def _kill_by_port(port: int):
-    """通过端口号查找并杀掉占用进程（跨平台）。"""
-    import platform
-    try:
-        if platform.system() == "Windows":
-            out = subprocess.check_output(
-                ["netstat", "-ano", "-p", "TCP"], text=True, timeout=5
-            )
-            for line in out.splitlines():
-                if f":{port}" in line and "LISTENING" in line:
-                    parts = line.split()
-                    pid = int(parts[-1])
-                    if pid > 0:
-                        os.kill(pid, signal.SIGTERM)
-        else:
-            out = subprocess.check_output(
-                ["lsof", "-ti", f":{port}"], text=True, timeout=5
-            ).strip()
-            for pid_str in out.splitlines():
-                pid = int(pid_str.strip())
-                if pid > 0 and pid != os.getpid():
-                    os.kill(pid, signal.SIGTERM)
-    except Exception:
-        pass
 
 
 def restart():

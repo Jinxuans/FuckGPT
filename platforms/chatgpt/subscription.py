@@ -84,7 +84,7 @@ def _status_from_details(me: dict | None, usage: dict | None) -> str:
     return "free"
 
 
-def _usage(account, proxy: Optional[str]) -> dict:
+def _usage(account, proxy: Optional[str], timeout: int | float = 20) -> dict:
     headers = {"Authorization": f"Bearer {account.access_token}", "User-Agent": WHAM_USAGE_USER_AGENT}
     account_id = _account_id(account)
     if account_id:
@@ -93,7 +93,7 @@ def _usage(account, proxy: Optional[str]) -> dict:
         WHAM_USAGE_URL,
         headers=headers,
         proxies=_proxies(proxy),
-        timeout=20,
+        timeout=timeout,
         impersonate="chrome124",
     )
     response.raise_for_status()
@@ -103,7 +103,11 @@ def _usage(account, proxy: Optional[str]) -> dict:
     return data
 
 
-def fetch_subscription_status_details(account, proxy: Optional[str] = None) -> dict:
+def fetch_subscription_status_details(
+    account,
+    proxy: Optional[str] = None,
+    timeout: int | float = 20,
+) -> dict:
     if not account.access_token:
         raise ValueError("account access_token is empty")
     try:
@@ -111,7 +115,7 @@ def fetch_subscription_status_details(account, proxy: Optional[str] = None) -> d
             "https://chatgpt.com/backend-api/me",
             headers={"Authorization": f"Bearer {account.access_token}", "Content-Type": "application/json"},
             proxies=_proxies(proxy),
-            timeout=20,
+            timeout=timeout,
             impersonate="chrome110",
         )
         response.raise_for_status()
@@ -119,7 +123,7 @@ def fetch_subscription_status_details(account, proxy: Optional[str] = None) -> d
         if isinstance(data, dict):
             usage = None
             try:
-                usage = _usage(account, proxy)
+                usage = _usage(account, proxy, timeout)
             except Exception as exc:
                 logger.info("usage enrichment failed: %s", exc)
             # ``wham/usage.plan_type`` is the canonical plan signal whenever
@@ -135,7 +139,7 @@ def fetch_subscription_status_details(account, proxy: Optional[str] = None) -> d
             }
     except Exception as exc:
         logger.info("subscription status fallback to usage: %s", exc)
-    usage = _usage(account, proxy)
+    usage = _usage(account, proxy, timeout)
     return {
         "status": _status_from_details(None, usage),
         "source": "backend-api/wham/usage",

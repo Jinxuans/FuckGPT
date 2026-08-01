@@ -498,6 +498,8 @@ class ChatGPTPlatform(BasePlatform):
             configured_proxy = self.config.proxy if self.config else None
             disable_proxy_pool = _truthy((self.config.extra or {}).get("disable_proxy_pool")) if self.config else False
             strict_proxy = _truthy((self.config.extra or {}).get("strict_proxy")) if self.config else False
+            raise_check_errors = _truthy((self.config.extra or {}).get("raise_check_errors")) if self.config else False
+            request_timeout = max(int((self.config.extra or {}).get("request_timeout_seconds") or 20), 5) if self.config else 20
             proxy_candidates: list[tuple[str | None, bool]] = []
             if configured_proxy:
                 proxy_candidates.append((configured_proxy, False))
@@ -511,7 +513,15 @@ class ChatGPTPlatform(BasePlatform):
             last_error: Exception | None = None
             for proxy, should_report in proxy_candidates:
                 try:
-                    details = fetch_subscription_status_details(a, proxy=proxy)
+                    try:
+                        details = fetch_subscription_status_details(a, proxy=proxy, timeout=request_timeout)
+                    except TypeError as exc:
+                        # Keep compatibility with lightweight provider stubs
+                        # used by plugins/tests that still expose the old
+                        # two-argument call shape.
+                        if "timeout" not in str(exc):
+                            raise
+                        details = fetch_subscription_status_details(a, proxy=proxy)
                     if should_report and proxy:
                         proxy_pool.report_success(proxy)
                     status = details.get("status")
@@ -529,11 +539,23 @@ class ChatGPTPlatform(BasePlatform):
                     last_error = exc
                     if should_report and proxy:
                         proxy_pool.report_fail(proxy)
+                    response = getattr(exc, "response", None)
+                    status_code = int(getattr(response, "status_code", 0) or 0)
+                    if status_code in {401, 403}:
+                        self._last_check_overview = {
+                            "valid": False,
+                            "check_error": f"HTTP {status_code}",
+                            "check_source": "authentication",
+                        }
+                        return False
                     continue
-            if strict_proxy and last_error is not None:
+            if last_error is not None and (strict_proxy or raise_check_errors):
                 raise last_error
         except Exception:
-            if self.config and _truthy((self.config.extra or {}).get("strict_proxy")):
+            if self.config and (
+                _truthy((self.config.extra or {}).get("strict_proxy"))
+                or _truthy((self.config.extra or {}).get("raise_check_errors"))
+            ):
                 raise
             return False
         return False
@@ -976,4 +998,3 @@ class ChatGPTPlatform(BasePlatform):
         data["local_app_account"] = read_current_codex_account()
         data["desktop_app_state"] = get_codex_desktop_state()
         return {"ok": True, "data": data}
-

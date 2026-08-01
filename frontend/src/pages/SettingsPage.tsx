@@ -212,6 +212,54 @@ function GeneralTab({
         </div>
       </SettingGroup>
 
+      <div className="border-t border-[var(--border)]" />
+
+      <SettingGroup
+        title={t("settings.accountValidity.title")}
+        desc={t("settings.accountValidity.desc")}
+      >
+        <div className="rounded-xl border border-[var(--border)] bg-[var(--bg-card)] divide-y divide-[var(--border)]/50">
+          <SettingRow label={t("settings.accountValidity.enabled")}>
+            <label className="flex items-center justify-end gap-2 text-sm text-[var(--text-secondary)]">
+              <input type="checkbox" checked={form.account_validity_auto_enabled === "true"}
+                onChange={(e) => setForm((f) => ({ ...f, account_validity_auto_enabled: String(e.target.checked) }))}
+                className="checkbox-accent h-4 w-4" />
+              {form.account_validity_auto_enabled === "true" ? t("common.enabled") : t("common.disabled")}
+            </label>
+          </SettingRow>
+          {[
+            ["account_validity_startup_delay_seconds", t("settings.accountValidity.startupDelay"), 0, 86400],
+            ["account_validity_interval_minutes", t("settings.accountValidity.interval"), 5, 43200],
+            ["account_validity_batch_limit", t("settings.accountValidity.batchLimit"), 1, 1000],
+            ["account_validity_concurrency", t("settings.accountValidity.concurrency"), 1, 20],
+            ["account_validity_request_timeout_seconds", t("settings.accountValidity.timeout"), 5, 300],
+          ].map(([key, label, min, max]) => (
+            <SettingRow key={String(key)} label={String(label)}>
+              <input type="number" min={Number(min)} max={Number(max)} value={form[String(key)] || ""}
+                onChange={(e) => setForm((f) => ({ ...f, [String(key)]: e.target.value }))}
+                className="control-surface w-full" />
+            </SettingRow>
+          ))}
+          <SettingRow label={t("settings.accountValidity.proxyMode")}>
+            <select value={form.account_validity_proxy_mode || "direct"}
+              onChange={(e) => setForm((f) => ({ ...f, account_validity_proxy_mode: e.target.value }))}
+              className="control-surface w-full appearance-none">
+              <option value="direct">{t("settings.accountValidity.proxyDirect")}</option>
+              <option value="manual">{t("settings.accountValidity.proxyManual")}</option>
+              <option value="proxy_service">{t("settings.accountValidity.proxyService")}</option>
+            </select>
+          </SettingRow>
+          {form.account_validity_proxy_mode === "manual" && (
+            <SettingRow label={t("settings.accountValidity.proxyUrl")}>
+              <input value={form.account_validity_proxy_url || ""}
+                onChange={(e) => setForm((f) => ({ ...f, account_validity_proxy_url: e.target.value }))}
+                placeholder="http://127.0.0.1:7890" className="control-surface w-full" />
+            </SettingRow>
+          )}
+        </div>
+        <p className="text-xs leading-5 text-[var(--text-muted)]">{t("settings.accountValidity.invalidRule")}</p>
+      </SettingGroup>
+
       <Button onClick={save} disabled={saving} className="w-full">
         <Save className="mr-2 h-4 w-4" />
         {saved

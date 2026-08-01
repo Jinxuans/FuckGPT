@@ -1,6 +1,6 @@
 import { useEffect, useState, useRef, useCallback, type ReactNode } from 'react'
 import { createPortal } from 'react-dom'
-import { getConfigOptions, getPlatforms } from '@/lib/app-data'
+import { getConfig, getConfigOptions, getPlatforms } from '@/lib/app-data'
 import type { ConfigOptionsResponse } from '@/lib/config-options'
 import { getCaptchaStrategyLabel } from '@/lib/config-options'
 import { apiDownload, apiFetch, triggerBrowserDownload } from '@/lib/utils'
@@ -2239,6 +2239,10 @@ export default function Accounts() {
   const filterKey = JSON.stringify(filters)
 
   useEffect(() => {
+    getConfig().then((config) => {
+      setBatchProxyMode(String(config.account_validity_proxy_mode || 'direct'))
+      setBatchProxyValue(String(config.account_validity_proxy_url || ''))
+    }).catch(() => {})
     getPlatforms().then((list: any[]) => {
       const map: Record<string, any> = {}
       list.forEach(p => { map[p.name] = p })

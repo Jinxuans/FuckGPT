@@ -100,8 +100,6 @@ async def lifespan(app: FastAPI):
     scheduler.start()
     from services.task_runtime import task_runtime
     task_runtime.start()
-    from services.solver_manager import start_async
-    start_async()
     from core.lifecycle import lifecycle_manager
     lifecycle_manager.start()
     yield

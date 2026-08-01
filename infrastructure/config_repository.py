@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from core.config_store import config_store
+from core.account_check_settings import DEFAULTS as ACCOUNT_CHECK_DEFAULTS, SETTING_KEYS as ACCOUNT_CHECK_SETTING_KEYS
 from infrastructure.provider_definitions_repository import ProviderDefinitionsRepository
 
 
@@ -10,7 +11,7 @@ class ConfigRepository:
         "default_identity_provider",
         "cpa_api_url", "cpa_api_key",
         "team_manager_url", "team_manager_key",
-    }
+    } | set(ACCOUNT_CHECK_SETTING_KEYS)
 
     def __init__(self, definitions: ProviderDefinitionsRepository | None = None):
         self.definitions = definitions or ProviderDefinitionsRepository()
@@ -26,7 +27,7 @@ class ConfigRepository:
         return keys
 
     def get_flat(self) -> dict[str, str]:
-        data = config_store.get_all()
+        data = {**ACCOUNT_CHECK_DEFAULTS, **config_store.get_all()}
         allowed = self.get_allowed_keys()
         return {
             key: str(value or "")
