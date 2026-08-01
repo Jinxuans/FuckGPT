@@ -882,6 +882,74 @@ def _run_single_account_check(
     return valid, result
 
 
+def _refresh_account_after_codex_oauth(
+    account_id: int,
+    logger: TaskLogger,
+    *,
+    params: dict[str, Any] | None = None,
+    scope_id: str = "",
+) -> dict[str, Any]:
+    """Refresh account usage after OAuth without changing OAuth success."""
+    from core.worker_proxy import WorkerProxyPolicy, worker_proxy_manager
+
+    if logger.is_cancel_requested():
+        return {"ok": False, "cancelled": True}
+
+    refresh_params = dict(params or {})
+    proxy_mode = normalize_proxy_mode(
+        str(refresh_params.get("platform_proxy_mode") or "").strip(),
+        default=PROXY_MODE_DIRECT,
+    )
+    manual_proxy = str(refresh_params.get("platform_proxy_value") or "").strip() or None
+    policy = WorkerProxyPolicy.load()
+    attempts = policy.replace_max_attempts if proxy_mode == PROXY_MODE_PROXY_SERVICE else 1
+
+    logger.log("Codex OAuth 授权完成，正在刷新账号额度")
+    for proxy_attempt in range(1, attempts + 1):
+        lease = None
+        account_proxy = manual_proxy if proxy_mode == PROXY_MODE_MANUAL else None
+        try:
+            if proxy_mode == PROXY_MODE_PROXY_SERVICE:
+                lease = worker_proxy_manager.acquire(
+                    scope_id=scope_id,
+                    log_fn=logger.log,
+                    cancel_check=logger.is_cancel_requested,
+                    policy=policy,
+                )
+                account_proxy = lease.url
+            valid, result = _run_single_account_check(
+                account_id,
+                proxy=account_proxy,
+                disable_proxy_pool=True,
+                strict_proxy=proxy_mode != PROXY_MODE_DIRECT,
+            )
+            if lease is not None:
+                lease.report_success()
+            logger.log(f"Codex OAuth 后额度刷新完成: {'有效' if valid else '失效'}")
+            return {"ok": True, "valid": bool(valid), **result}
+        except Exception as exc:
+            if lease is not None and is_retryable_network_error(exc):
+                lease.report_failure()
+            if (
+                proxy_mode == PROXY_MODE_PROXY_SERVICE
+                and proxy_attempt < attempts
+                and is_retryable_network_error(exc)
+            ):
+                logger.log(
+                    f"Codex OAuth 后额度刷新代理异常，换 IP 重试 "
+                    f"({proxy_attempt + 1}/{attempts}): {exc}",
+                    level="warning",
+                )
+                continue
+            logger.log(f"Codex OAuth 已成功，但额度刷新失败: {exc}", level="warning")
+            return {"ok": False, "error": str(exc)}
+        finally:
+            if lease is not None:
+                lease.release()
+
+    return {"ok": False, "error": "额度刷新未执行"}
+
+
 def execute_task(task_id: str) -> None:
     with Session(engine) as session:
         task = session.get(TaskModel, task_id)
@@ -1203,6 +1271,15 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
             if post_codex_oauth:
                 if post_codex_oauth.get("ok"):
                     logger.log(f"{account.email} 的 Codex OAuth 授权已完成")
+                    _refresh_account_after_codex_oauth(
+                        saved_account_id,
+                        logger,
+                        params={
+                            "platform_proxy_mode": PROXY_MODE_MANUAL if platform_proxy else PROXY_MODE_DIRECT,
+                            "platform_proxy_value": platform_proxy or "",
+                        },
+                        scope_id=str(getattr(logger, "task_id", "") or ""),
+                    )
                     _log_codex_auto_push_enqueue(saved_account_id, logger, platform="chatgpt")
                 else:
                     logger.log(
@@ -1366,12 +1443,24 @@ def _execute_platform_action_task(payload: dict[str, Any], logger: TaskLogger) -
         logger.record_error(result.error)
         logger.finish(TASK_STATUS_FAILED, error=result.error)
         return
+    result_data = dict(result.data) if isinstance(result.data, dict) else result.data
     if action_id == "codex_oauth_authorize":
+        quota_refresh = _refresh_account_after_codex_oauth(
+            account_id,
+            logger,
+            params=params,
+            scope_id=task_id,
+        )
+        if isinstance(result_data, dict):
+            result_data["quota_refresh"] = quota_refresh
+        from core.worker_proxy import worker_proxy_manager
+
+        worker_proxy_manager.clear_scope(task_id)
         _log_codex_auto_push_enqueue(account_id, logger, platform=command_platform)
-    logger.set_result_data(result.data)
+    logger.set_result_data(result_data)
     message = ""
-    if isinstance(result.data, dict):
-        message = str(result.data.get("message", "") or "")
+    if isinstance(result_data, dict):
+        message = str(result_data.get("message", "") or "")
     if message:
         logger.log(message, event_type="summary")
     logger.set_progress(1, 1)
@@ -1503,7 +1592,20 @@ def _execute_codex_oauth_batch_task(payload: dict[str, Any], logger: TaskLogger)
                 return {"account_id": account_id, "email": email, "ok": False, "error": error}
             logger.record_success()
             logger.log(f"{email}: Codex OAuth 授权完成")
-            return {"account_id": account_id, "email": email, "ok": True, "data": result.data}
+            quota_refresh = _refresh_account_after_codex_oauth(
+                account_id,
+                logger,
+                params=params,
+                scope_id=task_id,
+            )
+            _log_codex_auto_push_enqueue(account_id, logger, platform=platform)
+            return {
+                "account_id": account_id,
+                "email": email,
+                "ok": True,
+                "data": result.data,
+                "quota_refresh": quota_refresh,
+            }
         except Exception as exc:
             error = str(exc)
             logger.record_error(error)
@@ -1548,7 +1650,6 @@ def _execute_codex_oauth_batch_task(payload: dict[str, Any], logger: TaskLogger)
                 completed += 1
                 if result.get("ok"):
                     success += 1
-                    _log_codex_auto_push_enqueue(int(result["account_id"]), logger, platform=platform)
                 else:
                     errors.append(str(result.get("error") or "unknown"))
                 results.append(result)

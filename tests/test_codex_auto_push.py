@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import threading
+
 from sqlmodel import Session, select
 
 from application import tasks as tasks_module
@@ -172,6 +174,11 @@ def test_platform_oauth_stays_successful_when_auto_push_enqueue_fails(monkeypatc
         "create_account_push_task",
         lambda **kwargs: (_ for _ in ()).throw(RuntimeError("queue unavailable")),
     )
+    monkeypatch.setattr(
+        tasks_module,
+        "_refresh_account_after_codex_oauth",
+        lambda *args, **kwargs: {"ok": True, "valid": True},
+    )
     logger = _FakeLogger()
 
     tasks_module._execute_platform_action_task(
@@ -190,6 +197,7 @@ def test_platform_oauth_stays_successful_when_auto_push_enqueue_fails(monkeypatc
 
 def test_registration_inline_oauth_enqueues_once_after_account_save(monkeypatch):
     calls = []
+    refresh_calls = []
 
     class FakePlatform:
         def register(self, email=None, password=None):
@@ -212,6 +220,11 @@ def test_registration_inline_oauth_enqueues_once_after_account_save(monkeypatch)
         "_log_codex_auto_push_enqueue",
         lambda account_id, logger, *, platform: calls.append((account_id, platform)),
     )
+    monkeypatch.setattr(
+        tasks_module,
+        "_refresh_account_after_codex_oauth",
+        lambda account_id, logger, **kwargs: refresh_calls.append(account_id) or {"ok": True, "valid": True},
+    )
     logger = _FakeLogger()
     tasks_module._execute_register_task(
         {
@@ -230,11 +243,13 @@ def test_registration_inline_oauth_enqueues_once_after_account_save(monkeypatch)
     account_id, platform = calls[0]
     assert account_id > 0
     assert platform == "chatgpt"
+    assert refresh_calls == [account_id]
 
 
 def test_batch_oauth_enqueues_once_per_success(monkeypatch):
     account = _create_account("batch@example.com")
     calls = []
+    refresh_calls = []
     monkeypatch.setattr(
         tasks_module,
         "_execute_runtime_action_with_worker_proxy",
@@ -244,6 +259,11 @@ def test_batch_oauth_enqueues_once_per_success(monkeypatch):
         tasks_module,
         "_log_codex_auto_push_enqueue",
         lambda account_id, logger, *, platform: calls.append((account_id, platform)),
+    )
+    monkeypatch.setattr(
+        tasks_module,
+        "_refresh_account_after_codex_oauth",
+        lambda account_id, logger, **kwargs: refresh_calls.append(account_id) or {"ok": True, "valid": True},
     )
     logger = _FakeLogger()
     tasks_module._execute_codex_oauth_batch_task(
@@ -258,3 +278,58 @@ def test_batch_oauth_enqueues_once_per_success(monkeypatch):
 
     assert logger.finished == (tasks_module.TASK_STATUS_SUCCEEDED, "")
     assert calls == [(account.id, "chatgpt")]
+    assert refresh_calls == [account.id]
+
+
+def test_batch_oauth_refreshes_each_account_immediately_after_its_authorization(monkeypatch):
+    first = _create_account("first-immediate@example.com")
+    second = _create_account("second-blocked@example.com")
+    second_started = threading.Event()
+    release_second = threading.Event()
+    first_refreshed = threading.Event()
+    events = []
+
+    def execute_action(**kwargs):
+        account_id = int(kwargs["account_id"])
+        events.append(("oauth", account_id))
+        if account_id == int(second.id):
+            second_started.set()
+            release_second.wait(timeout=10)
+        return ActionExecutionResult(ok=True, data={"message": "OAuth done"})
+
+    def refresh(account_id, logger, **kwargs):
+        events.append(("refresh", int(account_id)))
+        if int(account_id) == int(first.id):
+            first_refreshed.set()
+        return {"ok": True, "valid": True}
+
+    monkeypatch.setattr(tasks_module, "_execute_runtime_action_with_worker_proxy", execute_action)
+    monkeypatch.setattr(tasks_module, "_refresh_account_after_codex_oauth", refresh)
+    monkeypatch.setattr(tasks_module, "_log_codex_auto_push_enqueue", lambda *args, **kwargs: None)
+    logger = _FakeLogger()
+    runner = threading.Thread(
+        target=tasks_module._execute_codex_oauth_batch_task,
+        args=(
+            {
+                "platform": "chatgpt",
+                "account_ids": [first.id, second.id],
+                "params": {},
+                "concurrency": 2,
+            },
+            logger,
+        ),
+    )
+
+    runner.start()
+    assert second_started.wait(timeout=3)
+    assert first_refreshed.wait(timeout=3)
+    assert runner.is_alive()
+    assert ("refresh", int(first.id)) in events
+    assert ("refresh", int(second.id)) not in events
+
+    release_second.set()
+    runner.join(timeout=5)
+
+    assert not runner.is_alive()
+    assert ("refresh", int(second.id)) in events
+    assert logger.finished == (tasks_module.TASK_STATUS_SUCCEEDED, "")
