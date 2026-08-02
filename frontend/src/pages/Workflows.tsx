@@ -70,6 +70,32 @@ const DEFAULT_REGISTER_CODEX_PUSH_INPUT = {
   },
 }
 
+const DEFAULT_REGISTER_KAKAO_CODEX_PUSH_INPUT = {
+  registration: {
+    count: 1,
+    concurrency: 1,
+    executor_type: 'headless',
+    extra: {
+      identity_provider: 'mailbox',
+    },
+  },
+  kakao: {
+    payment_method: 'kakao_pay',
+    supplier_setting_id: null,
+    scanner_setting_id: null,
+    scanner_kind: '',
+    auto_submit_scanner: true,
+  },
+  codex: {
+    browser_mode: 'headless',
+    keep_browser_open: 'false',
+  },
+  push: {
+    target_key: 'nvtokens',
+    payload_format: 'codex',
+  },
+}
+
 function formatMaybeDate(value: string | undefined, language: Language) {
   if (!value) return '-'
   const date = new Date(value)
@@ -94,7 +120,18 @@ function parseJsonObject(text: string) {
   return parsed as Record<string, unknown>
 }
 
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return Boolean(value && typeof value === 'object' && !Array.isArray(value))
+}
+
 function workflowInputForDefinition(definition?: WorkflowDefinition) {
+  const sampleInput = definition?.definition?.sample_input
+  if (isPlainObject(sampleInput)) {
+    return sampleInput
+  }
+  if (definition?.key === 'register_kakao_codex_push') {
+    return DEFAULT_REGISTER_KAKAO_CODEX_PUSH_INPUT
+  }
   if (definition?.key === 'register_codex_push') {
     return DEFAULT_REGISTER_CODEX_PUSH_INPUT
   }
