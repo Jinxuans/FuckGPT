@@ -40,6 +40,7 @@ PERSISTED_ACTION_DATA_KEYS = {
     "client_id",
     "client_secret",
     "workspace_id",
+    "cookies",
     "accessToken",
     "refreshToken",
     "sessionToken",
@@ -66,6 +67,16 @@ PERSISTED_ACTION_DATA_KEYS = {
 
 STATEFUL_ACTION_IDS = {"get_account_state", "switch_account", "query_state", "switch_desktop"}
 ACCOUNT_STATE_ACTION_IDS = {"get_account_state", "query_state"}
+RELOGIN_ACTION_IDS = {"relogin"}
+RELOGIN_CREDENTIAL_KEYS = {
+    "access_token",
+    "refresh_token",
+    "id_token",
+    "session_token",
+    "cookies",
+    "workspace_id",
+    "account_id",
+}
 CODEX_OAUTH_SECRET_RESULT_KEYS = {
     "codex_access_token",
     "codex_refresh_token",
@@ -240,6 +251,35 @@ def _utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def _deactivation_reason(error: Any = "") -> str:
+    text = str(error or "")
+    normalized = re.sub(r"\s+", " ", text).strip()
+    lowered = text.casefold()
+    japanese_match = re.search(
+        r"アカウント[はが][^。]*(?:削除|無効化|無効)[^。]*。(?:[^。]*(?:help\.openai\.com|ヘルプセンター|へルプセンタ一)[^。]*。)?",
+        normalized,
+    )
+    if japanese_match:
+        return japanese_match.group(0).strip()
+    english_match = re.search(
+        r"(?:your\s+)?account[^.\n]*(?:deleted|disabled|deactivated)[^.\n]*\.(?:[^.\n]*(?:help\.openai\.com|help center)[^.\n]*\.)?",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    if english_match:
+        return english_match.group(0).strip()
+    chinese_match = re.search(r"账号[^。]*(?:停用|禁用|封号|删除)[^。]*。?", normalized)
+    if chinese_match:
+        return chinese_match.group(0).strip()
+    if "deleted or disabled" in lowered:
+        return "OpenAI 返回账号已被删除或停用"
+    if "削除" in text or "無効" in text:
+        return "OpenAI 返回账号已被删除或停用（日文错误页）"
+    if "account_deactivated" in lowered:
+        return "OpenAI 返回 account_deactivated，账号已被停用/封号"
+    return "账号已被 OpenAI 停用/封号"
+
+
 def _build_account_overview(platform: str, data: dict[str, Any]) -> dict[str, Any] | None:
     if not isinstance(data, dict):
         return None
@@ -253,6 +293,16 @@ def _build_account_overview(platform: str, data: dict[str, Any]) -> dict[str, An
     if observed_validity is not None:
         overview["valid"] = observed_validity
         overview["chips"].append("有效" if observed_validity else "失效")
+    explicit_status = str(
+        data.get("validity_status")
+        or data.get("subscription_status")
+        or data.get("status")
+        or ""
+    ).strip().casefold()
+    if explicit_status == "deactivated":
+        overview["validity_status"] = "deactivated"
+        if "封号" not in overview["chips"]:
+            overview["chips"].append("封号")
     last_error = data.get("last_error") or data.get("check_error")
     if last_error not in (None, ""):
         overview["last_error"] = str(last_error)
@@ -493,6 +543,54 @@ def _persist_action_result(command: ActionExecutionCommand, result: dict[str, An
             error = str(result.get("error") or data.get("error") or "账号状态查询失败")
             if error != "任务已取消":
                 summary_updates = {"checked_at": _utcnow_iso(), "last_error": error}
+    elif command.action_id in RELOGIN_ACTION_IDS:
+        event_at = str(data.get("checked_at") or data.get("failed_at") or _utcnow_iso())
+        if action_ok:
+            profile = data.get("profile") if isinstance(data.get("profile"), dict) else {}
+            auth_mode = str(data.get("registration_auth_mode") or "").strip()
+            summary_updates = {
+                "checked_at": event_at,
+                "valid": True,
+                "last_error": "",
+                "remote_email": data.get("remote_email") or profile.get("email") or "",
+                "profile": profile,
+                "registration_auth_mode": auth_mode,
+                "security_raw": {
+                    "last_login_at": event_at,
+                    "last_login_status": "succeeded",
+                    "last_login_auth_mode": auth_mode,
+                    "last_login_failure_code": "",
+                    "deactivation_reason": "",
+                    "deactivation_error": "",
+                    "deactivation_detected_at": "",
+                },
+            }
+        else:
+            error = str(result.get("error") or data.get("error") or "重新登录失败")
+            failure_code = str(data.get("failure_code") or "").strip() or (
+                "account_deactivated"
+                if "account_deactivated" in error.casefold() or "deleted or disabled" in error.casefold()
+                else "unexpected"
+            )
+            summary_updates = {
+                "checked_at": event_at,
+                "last_error": error,
+                "security_raw": {
+                    "last_login_at": event_at,
+                    "last_login_status": "failed",
+                    "last_login_error": error,
+                    "last_login_failure_code": failure_code,
+                },
+            }
+            if failure_code == "account_deactivated":
+                summary_updates["validity_status"] = "deactivated"
+                summary_updates["security_raw"].update(
+                    {
+                        "deactivation_reason": _deactivation_reason(error),
+                        "deactivation_error": error,
+                        "deactivation_detected_at": event_at,
+                    }
+                )
 
     if not credential_updates and not summary_updates:
         return
@@ -516,9 +614,44 @@ def _persist_action_result(command: ActionExecutionCommand, result: dict[str, An
             lifecycle_status=lifecycle_status,
             summary_updates=summary_updates or None,
             credential_updates=credential_updates or None,
+            replace_credential_keys=(
+                set(RELOGIN_CREDENTIAL_KEYS)
+                if command.action_id in RELOGIN_ACTION_IDS and action_ok
+                else None
+            ),
         )
+        if command.action_id in RELOGIN_ACTION_IDS and action_ok:
+            remote_account_id = str(data.get("account_id") or "").strip()
+            if remote_account_id:
+                model.user_id = remote_account_id
         session.add(model)
         session.commit()
+
+
+def persist_action_failure(
+    *,
+    platform: str,
+    account_id: int,
+    action_id: str,
+    error: str,
+    data: dict[str, Any] | None = None,
+) -> None:
+    """Persist failures that happen before :class:`PlatformRuntime` executes.
+
+    Proxy acquisition and other task-owned preparation can fail before
+    ``execute_action`` gets a chance to write account-level diagnostics.
+    Keeping this small public boundary avoids duplicating graph persistence in
+    the task layer.
+    """
+    _persist_action_result(
+        ActionExecutionCommand(
+            platform=str(platform or ""),
+            account_id=int(account_id or 0),
+            action_id=str(action_id or ""),
+            params={},
+        ),
+        {"ok": False, "error": str(error or ""), "data": dict(data or {})},
+    )
 
 
 class PlatformRuntime:

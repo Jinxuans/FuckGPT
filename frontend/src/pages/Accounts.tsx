@@ -16,7 +16,7 @@ import { RefreshCw, Copy, Check, KeyRound, ExternalLink, Download, Upload, Plus,
 
 const STATUS_VARIANT: Record<string, any> = {
   registered: 'default', trial: 'success', subscribed: 'success',
-  expired: 'warning', invalid: 'danger',
+  expired: 'warning', invalid: 'danger', deactivated: 'danger',
   free: 'secondary', eligible: 'secondary', valid: 'success', unknown: 'secondary',
 }
 
@@ -203,6 +203,15 @@ function getAccountUsage(acc: any) {
 function getAccountSecurity(acc: any) {
   const security = getAccountView(acc)?.security
   return security && typeof security === 'object' ? security : {}
+}
+
+function getDeactivationInfo(acc: any) {
+  const security = getAccountSecurity(acc)
+  return {
+    reason: String(security?.deactivation_reason || ''),
+    error: String(security?.deactivation_error || ''),
+    detectedAt: String(security?.deactivation_detected_at || ''),
+  }
 }
 
 function getPhoneBindingState(acc: any) {
@@ -1100,6 +1109,89 @@ function ActionTaskModal({
   )
 }
 
+function RefreshCreditsOptionsModal({
+  targetCount,
+  scopeLabel,
+  platformLabel,
+  proxyLabel,
+  concurrency,
+  onClose,
+  onSubmit,
+}: {
+  targetCount: number
+  scopeLabel: string
+  platformLabel: string
+  proxyLabel: string
+  concurrency: number
+  onClose: () => void
+  onSubmit: (options: { reloginInvalid: boolean }) => void
+}) {
+  const [reloginInvalid, setReloginInvalid] = useState(false)
+
+  return (
+    <div className="dialog-backdrop" onClick={onClose}>
+      <div
+        className="dialog-panel dialog-panel-md"
+        onClick={e => e.stopPropagation()}
+      >
+        <div className="flex items-center justify-between border-b border-[var(--border)] px-6 py-4">
+          <div>
+            <h2 className="text-base font-semibold text-[var(--text-primary)]">刷新额度设置</h2>
+            <p className="mt-0.5 text-xs text-[var(--text-muted)]">默认只检测账号状态和额度，不会重新登录。</p>
+          </div>
+          <button onClick={onClose} className="text-[var(--text-muted)] hover:text-[var(--text-primary)]">
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+        <div className="space-y-4 px-6 py-5">
+          <div className="grid gap-3 rounded-xl border border-[var(--border)] bg-[var(--bg-hover)]/40 p-4 text-sm sm:grid-cols-2">
+            <div>
+              <div className="text-xs text-[var(--text-muted)]">范围</div>
+              <div className="mt-1 font-medium text-[var(--text-primary)]">{scopeLabel}</div>
+            </div>
+            <div>
+              <div className="text-xs text-[var(--text-muted)]">账号数</div>
+              <div className="mt-1 font-medium text-[var(--text-primary)]">{targetCount}</div>
+            </div>
+            <div>
+              <div className="text-xs text-[var(--text-muted)]">平台</div>
+              <div className="mt-1 font-medium text-[var(--text-primary)]">{platformLabel}</div>
+            </div>
+            <div>
+              <div className="text-xs text-[var(--text-muted)]">并发</div>
+              <div className="mt-1 font-medium text-[var(--text-primary)]">{concurrency}</div>
+            </div>
+            <div className="sm:col-span-2">
+              <div className="text-xs text-[var(--text-muted)]">代理</div>
+              <div className="mt-1 break-all font-medium text-[var(--text-primary)]">{proxyLabel}</div>
+            </div>
+          </div>
+          <label className="flex cursor-pointer items-start gap-3 rounded-xl border border-[var(--border)] bg-[var(--bg-card)] p-4 hover:bg-[var(--bg-hover)]/50">
+            <input
+              type="checkbox"
+              checked={reloginInvalid}
+              onChange={e => setReloginInvalid(e.target.checked)}
+              className="mt-0.5 h-4 w-4 accent-amber-500"
+            />
+            <span>
+              <span className="block text-sm font-medium text-[var(--text-primary)]">检测到失效后自动重登</span>
+              <span className="mt-1 block text-xs leading-5 text-[var(--text-muted)]">
+                只对本次刷新中检测为失效的账号触发浏览器重新登录。不开启时仅记录失效状态。
+              </span>
+            </span>
+          </label>
+        </div>
+        <div className="flex items-center justify-end gap-2 border-t border-[var(--border)] px-6 py-4">
+          <Button variant="outline" size="sm" onClick={onClose}>取消</Button>
+          <Button size="sm" onClick={() => onSubmit({ reloginInvalid })}>
+            开始刷新
+          </Button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 function ActionParamsModal({
   action,
   initialValues,
@@ -1710,6 +1802,7 @@ function DetailModal({ acc, onClose, onSave }: { acc: any; onClose: () => void; 
   const status = getAccountStatus(acc)
   const subscription = getAccountSubscription(acc)
   const security = getAccountSecurity(acc)
+  const deactivation = getDeactivationInfo(acc)
   const usage = getAccountUsage(acc)
   const codex = getCodexStatus(acc)
   const verificationMailbox = getVerificationMailbox(acc)
@@ -1900,6 +1993,15 @@ function DetailModal({ acc, onClose, onSave }: { acc: any; onClose: () => void; 
                 label="认证方式 (AMR)"
                 value={amr.length > 0 ? amr.map(String).join(' · ') : '未记录'}
               />
+              {deactivation.reason && (
+                <AccountDetailField label="封号原因" value={deactivation.reason} wide />
+              )}
+              {deactivation.detectedAt && (
+                <AccountDetailField label="封号检测时间" value={formatOptionalDateTime(deactivation.detectedAt, language)} />
+              )}
+              {deactivation.error && (
+                <AccountDetailField label="封号原始错误" value={deactivation.error} mono wide />
+              )}
             </AccountDetailSection>
 
             <AccountDetailSection title="额度">
@@ -1977,7 +2079,7 @@ function DetailModal({ acc, onClose, onSave }: { acc: any; onClose: () => void; 
                 <label className="text-xs text-[var(--text-muted)] block mb-1">生命周期状态</label>
                 <select value={form.lifecycle_status} onChange={e => setForm(f => ({ ...f, lifecycle_status: e.target.value }))}
                   className="control-surface appearance-none">
-                  {['registered','trial','subscribed','expired','invalid'].map(s => <option key={s} value={s}>{s}</option>)}
+                  {['registered','trial','subscribed','expired','invalid','deactivated'].map(s => <option key={s} value={s}>{s}</option>)}
                 </select>
               </div>
               <div>
@@ -2229,6 +2331,7 @@ export default function Accounts() {
   const [bulkDeleting, setBulkDeleting] = useState(false)
   const [batchRefreshing, setBatchRefreshing] = useState(false)
   const [batchCodexAuthorizing, setBatchCodexAuthorizing] = useState(false)
+  const [showRefreshOptions, setShowRefreshOptions] = useState(false)
   const [batchTask, setBatchTask] = useState<{ taskId: string; title: string } | null>(null)
   const [batchTaskStatus, setBatchTaskStatus] = useState<string | null>(null)
   const [batchProxyMode, setBatchProxyMode] = useState('direct')
@@ -2410,12 +2513,67 @@ export default function Accounts() {
     setFilters({ ...EMPTY_ACCOUNT_FILTERS, ...preset.filters })
     setSearchDraft(preset.filters.search || '')
   }
+  const refreshTargetCount = selectedCount || total
+  const refreshScopeLabel = selectedCount > 0 ? '已选账号' : '当前完整筛选结果'
+  const refreshProxyLabel = batchProxyMode === 'manual'
+    ? `手动代理 ${batchProxyValue.trim() || '未填写'}`
+    : (batchProxyMode === 'proxy_service' ? '代理服务' : '直连')
+  const startBatchRefresh = async ({ reloginInvalid }: { reloginInvalid: boolean }) => {
+    setShowRefreshOptions(false)
+    setBatchRefreshing(true)
+    try {
+      const hasSelection = selectedIds.size > 0
+      const targetCount = hasSelection ? selectedIds.size : total
+      const res = await apiFetch('/accounts/check-all', {
+        method: 'POST',
+        body: JSON.stringify({
+          platform: tab,
+          ids: hasSelection ? [...selectedIds] : [],
+          select_all: !hasSelection,
+          filters: !hasSelection ? toApiFilters(filters) : {},
+          platform_proxy_mode: batchProxyMode,
+          platform_proxy_value: batchProxyValue.trim(),
+          concurrency: batchCodexConcurrency,
+          relogin_invalid: reloginInvalid,
+          relogin_params: reloginInvalid ? {
+            browser_mode: 'headless',
+            keep_browser_open: 'false',
+            platform_proxy_mode: batchProxyMode,
+            platform_proxy_value: batchProxyValue.trim(),
+          } : {},
+        }),
+      })
+      if (res?.task_id) {
+        setBatchTask({
+          taskId: res.task_id,
+          title: `${t('accounts.refreshAllCreditsTask', { platform: platformLabel })}${reloginInvalid ? ' + 失效重登' : ''} (${targetCount})`,
+        })
+        setBatchTaskStatus(null)
+      } else {
+        setBatchRefreshing(false)
+      }
+    } catch (e) {
+      console.error(e)
+      setBatchRefreshing(false)
+    }
+  }
 
   return (
     <div className="flex h-full min-h-0 flex-col gap-4 overflow-hidden">
       {detail && <DetailModal acc={detail} onClose={() => setDetail(null)} onSave={() => { setDetail(null); load() }} />}
       {showImport && <ImportModal onClose={() => setShowImport(false)} onDone={() => { setShowImport(false); load() }} />}
       {showRegister && <RegisterModal platformMeta={platformsMap[tab]} onClose={() => setShowRegister(false)} onDone={() => load()} />}
+      {showRefreshOptions && (
+        <RefreshCreditsOptionsModal
+          targetCount={refreshTargetCount}
+          scopeLabel={refreshScopeLabel}
+          platformLabel={platformLabel}
+          proxyLabel={refreshProxyLabel}
+          concurrency={batchCodexConcurrency}
+          onClose={() => setShowRefreshOptions(false)}
+          onSubmit={startBatchRefresh}
+        />
+      )}
       {actionResult && <ActionResultModal title={actionResult.title} payload={actionResult.payload} onClose={() => setActionResult(null)} />}
       {batchTask && (
         <ActionTaskModal
@@ -2454,6 +2612,7 @@ export default function Accounts() {
               <button onClick={() => updateFilter('push_status', filters.push_status === 'not_pushed' ? '' : 'not_pushed')} className={`filter-stat-chip ${filters.push_status === 'not_pushed' ? 'is-active' : ''}`}>未推送 {filterStats.push_not_pushed || 0}</button>
               <button onClick={() => updateFilter('push_status', filters.push_status === 'failed' ? '' : 'failed')} className={`filter-stat-chip filter-stat-danger ${filters.push_status === 'failed' ? 'is-active' : ''}`}>推送失败 {filterStats.push_failed || 0}</button>
               <button onClick={() => updateFilter('status', filters.status === 'invalid' ? '' : 'invalid')} className={`filter-stat-chip filter-stat-danger ${filters.status === 'invalid' ? 'is-active' : ''}`}>失效 {filterStats.invalid || 0}</button>
+              <button onClick={() => updateFilter('status', filters.status === 'deactivated' ? '' : 'deactivated')} className={`filter-stat-chip filter-stat-danger ${filters.status === 'deactivated' ? 'is-active' : ''}`}>封号 {filterStats.deactivated || 0}</button>
               {selectedCount > 0 && <span className="flex items-center rounded-full bg-[var(--text-primary)]/10 px-2 py-0.5 font-medium text-[var(--text-primary)] ring-1 ring-inset ring-[var(--text-primary)]/20">{t('accounts.selected', { count: selectedCount })}</span>}
             </div>
           </div>
@@ -2515,6 +2674,7 @@ export default function Accounts() {
               <option value="eligible">{t('accounts.eligible')}</option>
               <option value="expired">{t('accounts.expired')}</option>
               <option value="invalid">{t('dashboard.invalid')}</option>
+              <option value="deactivated">{translateAccountStatus('deactivated', language)}</option>
             </select>
             <select value={filters.sort_by} onChange={e => updateFilter('sort_by', e.target.value)} className="filter-control w-auto min-w-32" title="排序字段">
               <option value="created_at">注册时间</option>
@@ -2563,7 +2723,7 @@ export default function Accounts() {
                   value={batchCodexConcurrency}
                   onChange={e => setBatchCodexConcurrency(Number(e.target.value) || 1)}
                   className="h-7 rounded-md border border-[var(--border)] bg-transparent px-2 text-xs text-[var(--text-secondary)] outline-none focus:border-[var(--text-primary)]"
-                  title="Codex OAuth 并发数"
+                  title="批量动作并发数"
                 >
                   {[1, 2, 3, 4, 5, 10, 20].map(value => (
                     <option key={value} value={value}>并发 {value}</option>
@@ -2626,35 +2786,8 @@ export default function Accounts() {
               size="sm"
               disabled={batchRefreshing || batchCodexAuthorizing || loading}
               className="h-7 px-2.5 text-[var(--text-muted)] hover:text-amber-500 hover:bg-amber-500/10"
-              title={t('accounts.refreshCreditsTitle')}
-              onClick={async () => {
-                setBatchRefreshing(true)
-                try {
-                  const hasSelection = selectedIds.size > 0
-                  const targetCount = hasSelection ? selectedIds.size : total
-                  const res = await apiFetch('/accounts/check-all', {
-                    method: 'POST',
-                    body: JSON.stringify({
-                      platform: tab,
-                      ids: hasSelection ? [...selectedIds] : [],
-                      select_all: !hasSelection,
-                      filters: !hasSelection ? toApiFilters(filters) : {},
-                      platform_proxy_mode: batchProxyMode,
-                      platform_proxy_value: batchProxyValue.trim(),
-                    }),
-                  })
-                  if (res?.task_id) {
-                    setBatchTask({
-                      taskId: res.task_id,
-                      title: `${t('accounts.refreshAllCreditsTask', { platform: platformLabel })} (${targetCount})`,
-                    })
-                    setBatchTaskStatus(null)
-                  }
-                } catch (e) {
-                  console.error(e)
-                  setBatchRefreshing(false)
-                }
-              }}
+              title="打开刷新额度设置"
+              onClick={() => setShowRefreshOptions(true)}
             >
               <Zap className={`mr-1 h-3.5 w-3.5 ${batchRefreshing ? 'animate-pulse' : ''}`} />
               {batchRefreshing ? t('accounts.refreshingCredits') : t('accounts.refreshCredits')}

@@ -292,6 +292,7 @@ class AccountsRepository:
             "trial": 0,
             "subscribed": 0,
             "invalid": 0,
+            "deactivated": 0,
             "mailbox_bound": 0,
             "phone_bound": 0,
             "unchecked": 0,
@@ -311,6 +312,12 @@ class AccountsRepository:
                 counts["trial"] += 1
             if record.plan_state == "subscribed":
                 counts["subscribed"] += 1
+            if (
+                record.validity_status == "deactivated"
+                or record.lifecycle_status == "deactivated"
+                or record.display_status == "deactivated"
+            ):
+                counts["deactivated"] += 1
             if record.validity_status == "invalid" or record.lifecycle_status == "invalid":
                 counts["invalid"] += 1
             if mailbox:

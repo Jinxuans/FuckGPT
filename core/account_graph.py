@@ -8,6 +8,7 @@ from typing import Any
 
 from sqlmodel import Session, delete, select
 
+from core.account_check_settings import INVALID_CHECK_LIMIT
 from core.datetime_utils import ensure_utc_datetime, serialize_datetime
 from core.db import (
     AccountAuthCredentialModel,
@@ -331,6 +332,8 @@ def _canonical_plan_type(platform: str, value: Any) -> str:
 
 
 def _derive_display_status(lifecycle_status: str, validity_status: str, plan_state: str) -> str:
+    if validity_status == "deactivated" or lifecycle_status == "deactivated":
+        return "deactivated"
     if validity_status == "invalid":
         return "invalid"
     if lifecycle_status == "expired" or plan_state == "expired":
@@ -350,7 +353,7 @@ def recover_lifecycle_status_for_valid_account(graph: dict[str, Any]) -> str:
     overview = _safe_dict(graph.get("overview"))
     lifecycle_status = _text(overview.get("lifecycle_status") or graph.get("lifecycle_status"))
     plan_state = _normalize_plan_state(overview.get("plan_state") or graph.get("plan_state"))
-    if lifecycle_status == "invalid":
+    if lifecycle_status in {"invalid", "deactivated"}:
         if plan_state in {"trial", "subscribed", "expired"}:
             return plan_state
         return "registered"
@@ -861,9 +864,19 @@ def _upsert_security(
         raw_payload["_mfa_observed"] = True
     if any(key in summary for key in ("phone_bound", "phone_number_masked", "phone_number")):
         raw_payload["_phone_observed"] = True
-    for key in ("account_source", "import_method", "registration_executor"):
-        if summary.get(key) not in (None, ""):
-            raw_payload[key] = summary.get(key)
+    for key in (
+        "account_source",
+        "import_method",
+        "registration_executor",
+        "deactivation_reason",
+        "deactivation_error",
+        "deactivation_detected_at",
+    ):
+        if key in summary:
+            if summary.get(key) in (None, ""):
+                raw_payload.pop(key, None)
+            else:
+                raw_payload[key] = summary.get(key)
     if raw_payload:
         model.set_raw(_sanitize_phone_data(raw_payload))
     if "checked_at" in summary:
@@ -978,7 +991,10 @@ def _upsert_status(
         model.lifecycle_status = _text(lifecycle_status) or "registered"
     elif summary.get("lifecycle_status") not in (None, ""):
         model.lifecycle_status = _text(summary.get("lifecycle_status")) or "registered"
-    if "valid" in summary:
+    explicit_validity_status = _text(summary.get("validity_status"))
+    if explicit_validity_status == "deactivated":
+        model.validity_status = "deactivated"
+    elif "valid" in summary:
         model.validity_status = "valid" if bool(summary.get("valid")) else "invalid"
         if bool(summary.get("valid")):
             model.invalid_check_count = 0
@@ -986,10 +1002,12 @@ def _upsert_status(
                 model.last_error = ""
         elif bool(summary.get("_track_invalid_attempt")):
             model.invalid_check_count = min(max(int(model.invalid_check_count or 0), 0) + 1, 2)
-    elif summary.get("validity_status") not in (None, ""):
-        model.validity_status = _text(summary.get("validity_status")) or "unknown"
-    elif model.lifecycle_status == "invalid":
-        model.validity_status = "invalid"
+    elif explicit_validity_status:
+        model.validity_status = explicit_validity_status or "unknown"
+    elif model.lifecycle_status in {"invalid", "deactivated"}:
+        model.validity_status = model.lifecycle_status
+    if model.validity_status == "deactivated":
+        model.invalid_check_count = max(int(model.invalid_check_count or 0), INVALID_CHECK_LIMIT)
     if "remote_email" in summary:
         model.remote_email = _text(summary.get("remote_email"))
     if "region" in summary:
@@ -1256,7 +1274,7 @@ def _synthesize_overview(graph: dict[str, Any]) -> dict[str, Any]:
         "trial_end_time": int(subscription.get("trial_end_time") or 0),
         "cashier_url": _text(subscription.get("cashier_url")),
     }
-    if overview["validity_status"] in {"valid", "invalid"}:
+    if overview["validity_status"] in {"valid", "invalid", "deactivated"}:
         overview["valid"] = overview["validity_status"] == "valid"
 
     if security:
@@ -1271,7 +1289,20 @@ def _synthesize_overview(graph: dict[str, Any]) -> dict[str, Any]:
         security_raw = _safe_dict(security.get("raw"))
         if isinstance(security_raw.get("profile"), dict):
             overview["profile"] = _sanitize_phone_data(security_raw["profile"])
-        for key in ("registration_auth_mode", "account_source", "import_method", "registration_executor"):
+        for key in (
+            "registration_auth_mode",
+            "account_source",
+            "import_method",
+            "registration_executor",
+            "last_login_at",
+            "last_login_status",
+            "last_login_auth_mode",
+            "last_login_error",
+            "last_login_failure_code",
+            "deactivation_reason",
+            "deactivation_error",
+            "deactivation_detected_at",
+        ):
             if security_raw.get(key):
                 overview[key] = security_raw[key]
 
@@ -1496,6 +1527,7 @@ def patch_account_graph(
     trial_end_time: int | None = None,
     summary_updates: dict[str, Any] | None = None,
     credential_updates: dict[str, Any] | None = None,
+    replace_credential_keys: set[str] | None = None,
     provider_accounts: list[dict[str, Any]] | None = None,
     provider_resources: list[dict[str, Any]] | None = None,
     replace_provider_accounts: bool = False,
@@ -1513,6 +1545,19 @@ def patch_account_graph(
         summary["trial_end_time"] = int(trial_end_time or 0)
 
     updates = _safe_dict(credential_updates)
+    if replace_credential_keys:
+        keys = {_text(key) for key in replace_credential_keys if _text(key)}
+        if keys:
+            existing_credentials = session.exec(
+                select(AccountAuthCredentialModel)
+                .where(AccountAuthCredentialModel.account_id == account_id)
+                .where(AccountAuthCredentialModel.scope == "platform")
+                .where(AccountAuthCredentialModel.key.in_(keys))
+            ).all()
+            for credential in existing_credentials:
+                session.delete(credential)
+            if existing_credentials:
+                session.flush()
     codex_updates = {key: updates[key] for key in CODEX_METADATA_KEYS if key in updates}
     rows = _credential_rows_from_extra(model.platform, updates, source="runtime.patch")
     if primary_token is not None and _text(primary_token):
@@ -1688,6 +1733,9 @@ def build_account_view(model: AccountModel, graph: dict[str, Any]) -> dict[str, 
             "account_source": _text(security_raw.get("account_source")),
             "import_method": _text(security_raw.get("import_method")),
             "registration_executor": _text(security_raw.get("registration_executor")),
+            "deactivation_reason": _text(security_raw.get("deactivation_reason")),
+            "deactivation_error": _text(security_raw.get("deactivation_error")),
+            "deactivation_detected_at": _text(security_raw.get("deactivation_detected_at")),
             "platform_auth": platform_auth,
         },
         "usage": {

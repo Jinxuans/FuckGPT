@@ -717,6 +717,44 @@ def test_v2_filters_codex_authorization_push_target_status_and_recent_times(clie
     ]
 
 
+def test_accounts_filter_and_stats_include_deactivated_status(client):
+    deactivated_id = _create_account(email="deactivated-filter@test.com")
+    invalid_id = _create_account(email="invalid-filter@test.com")
+    _create_account(email="active-filter@test.com")
+
+    with Session(engine) as session:
+        deactivated = session.get(AccountModel, deactivated_id)
+        invalid = session.get(AccountModel, invalid_id)
+        patch_account_graph(
+            session,
+            deactivated,
+            summary_updates={
+                "validity_status": "deactivated",
+                "last_error": "error_code: account_deactivated",
+                "security_raw": {
+                    "deactivation_reason": "OpenAI 返回 account_deactivated，账号已被停用/封号",
+                    "deactivation_error": "error_code: account_deactivated",
+                    "deactivation_detected_at": "2026-08-02T02:03:04Z",
+                },
+            },
+        )
+        patch_account_graph(session, invalid, summary_updates={"valid": False})
+        session.commit()
+
+    filtered = client.get("/api/accounts", params={"platform": "chatgpt", "status": "deactivated"})
+    assert filtered.status_code == 200
+    payload = filtered.json()
+    assert {item["id"] for item in payload["items"]} == {deactivated_id}
+    security = payload["items"][0]["account_view"]["security"]
+    assert security["deactivation_reason"] == "OpenAI 返回 account_deactivated，账号已被停用/封号"
+    assert security["deactivation_error"] == "error_code: account_deactivated"
+    assert security["deactivation_detected_at"] == "2026-08-02T02:03:04Z"
+
+    stats = client.get("/api/accounts/stats", params={"platform": "chatgpt"}).json()
+    assert stats["deactivated"] == 1
+    assert stats["invalid"] == 1
+
+
 def test_v2_full_filter_selection_is_shared_by_export_and_batch_check(client, monkeypatch):
     matched_id = _create_account(
         email="matched@test.com",
@@ -780,6 +818,7 @@ def test_check_all_uses_selected_account_ids(client):
         payload = task.get_payload()
     assert set(payload["account_ids"]) == {first_id, third_id}
     assert payload["platform"] == "chatgpt"
+    assert payload.get("relogin_invalid") is not True
 
 
 def test_check_all_persists_platform_proxy_strategy(client):
@@ -803,6 +842,41 @@ def test_check_all_persists_platform_proxy_strategy(client):
         payload = task.get_payload()
     assert payload["platform_proxy_mode"] == "manual"
     assert payload["platform_proxy_value"] == "socks5://user:pass@proxy.example:1080"
+
+
+def test_check_all_persists_optional_invalid_relogin_settings(client):
+    account_id = _create_account(email="invalid-relogin-check@test.com")
+
+    resp = client.post(
+        "/api/accounts/check-all",
+        json={
+            "platform": "chatgpt",
+            "ids": [account_id],
+            "select_all": False,
+            "concurrency": 3,
+            "request_timeout_seconds": 17,
+            "platform_proxy_mode": "manual",
+            "platform_proxy_value": "http://127.0.0.1:7897",
+            "relogin_invalid": True,
+            "relogin_params": {
+                "browser_mode": "headless",
+                "keep_browser_open": "false",
+                "platform_proxy_mode": "manual",
+                "platform_proxy_value": "http://127.0.0.1:7897",
+            },
+        },
+    )
+
+    assert resp.status_code == 200
+    with Session(engine) as session:
+        task = session.get(TaskModel, resp.json()["task_id"])
+        payload = task.get_payload()
+    assert payload["account_ids"] == [account_id]
+    assert payload["concurrency"] == 3
+    assert payload["request_timeout_seconds"] == 17
+    assert payload["relogin_invalid"] is True
+    assert payload["relogin_params"]["browser_mode"] == "headless"
+    assert payload["relogin_params"]["platform_proxy_value"] == "http://127.0.0.1:7897"
 
 
 def test_check_all_freezes_filtered_account_ids(client):
@@ -882,6 +956,66 @@ def test_codex_oauth_batch_freezes_complete_v2_filter_result(client):
 
     response = client.post(
         "/api/accounts/codex-oauth/authorize",
+        json={
+            "platform": "chatgpt",
+            "select_all": True,
+            "filters": {"source": "import", "import_method": "csv", "region": "US"},
+            "concurrency": 2,
+            "params": {"browser_mode": "headless"},
+        },
+    )
+
+    assert response.status_code == 200
+    with Session(engine) as session:
+        task = session.get(TaskModel, response.json()["task_id"])
+        assert task.get_payload()["account_ids"] == [matched_id]
+
+
+def test_relogin_batch_freezes_selected_account_ids_and_params(client):
+    first_id = _create_account(email="first-relogin-batch@test.com")
+    _create_account(email="second-relogin-batch@test.com")
+    third_id = _create_account(email="third-relogin-batch@test.com")
+
+    resp = client.post(
+        "/api/accounts/relogin/batch",
+        json={
+            "platform": "chatgpt",
+            "ids": [first_id, third_id],
+            "select_all": False,
+            "concurrency": 4,
+            "params": {
+                "browser_mode": "headless",
+                "keep_browser_open": "false",
+                "platform_proxy_mode": "manual",
+                "platform_proxy_value": "http://127.0.0.1:7897",
+            },
+        },
+    )
+
+    assert resp.status_code == 200
+    task_id = resp.json()["task_id"]
+    with Session(engine) as session:
+        task = session.get(TaskModel, task_id)
+        payload = task.get_payload()
+    assert task.type == "relogin_batch"
+    assert set(payload["account_ids"]) == {first_id, third_id}
+    assert payload["action_id"] == "relogin"
+    assert payload["concurrency"] == 4
+    assert payload["params"]["platform_proxy_mode"] == "manual"
+
+
+def test_relogin_batch_freezes_complete_v2_filter_result(client):
+    matched_id = _create_account(
+        email="relogin-filter-match@test.com",
+        extra={"region": "US", "account_source": "import", "import_method": "csv"},
+    )
+    _create_account(
+        email="relogin-filter-ignore@test.com",
+        extra={"region": "JP", "account_source": "import", "import_method": "text"},
+    )
+
+    response = client.post(
+        "/api/accounts/relogin/batch",
         json={
             "platform": "chatgpt",
             "select_all": True,

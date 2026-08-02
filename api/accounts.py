@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field
 from application.account_exports import AccountExportsService, ExportArtifact
 from application.accounts import AccountsService
 from application.account_pushes import AccountPushService
-from application.tasks import create_codex_oauth_batch_task
+from application.tasks import create_codex_oauth_batch_task, create_relogin_batch_task
 from services.task_runtime import task_runtime
 from domain.accounts import AccountExportSelection, AccountFilters, AccountQuery, AccountUpdateCommand
 from infrastructure.accounts_repository import AccountsRepository
@@ -82,6 +82,11 @@ class BatchExportRequest(BaseModel):
 
 
 class CodexOAuthBatchRequest(BatchExportRequest):
+    params: dict[str, Any] = Field(default_factory=dict)
+    concurrency: int = 1
+
+
+class ReloginBatchRequest(BatchExportRequest):
     params: dict[str, Any] = Field(default_factory=dict)
     concurrency: int = 1
 
@@ -269,6 +274,24 @@ def authorize_codex_oauth_batch(body: CodexOAuthBatchRequest):
             _selection(body)
         )
         task = create_codex_oauth_batch_task(
+            platform=body.platform or "chatgpt",
+            account_ids=[int(item.id or 0) for item in records],
+            params=body.params,
+            concurrency=body.concurrency,
+        )
+        task_runtime.wake_up()
+        return task
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@router.post("/relogin/batch")
+def relogin_batch(body: ReloginBatchRequest):
+    try:
+        records = AccountsRepository().select_for_export(
+            _selection(body)
+        )
+        task = create_relogin_batch_task(
             platform=body.platform or "chatgpt",
             account_ids=[int(item.id or 0) for item in records],
             params=body.params,

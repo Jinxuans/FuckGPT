@@ -31,12 +31,13 @@ from core.proxy_resolution import (
     resolve_proxy_by_mode,
 )
 from core.registry import get
-from infrastructure.platform_runtime import PlatformRuntime
+from infrastructure.platform_runtime import PlatformRuntime, persist_action_failure
 
 TASK_TYPE_REGISTER = "register"
 TASK_TYPE_ACCOUNT_CHECK_ALL = "account_check_all"
 TASK_TYPE_PLATFORM_ACTION = "platform_action"
 TASK_TYPE_CODEX_OAUTH_BATCH = "codex_oauth_batch"
+TASK_TYPE_RELOGIN_BATCH = "relogin_batch"
 TASK_TYPE_ACCOUNT_PUSH = "account_push"
 
 TASK_STATUS_PENDING = "pending"
@@ -53,6 +54,7 @@ TASK_STATUS_CANCELLED = "cancelled"
 # accidental unbounded thread pool.
 MAX_REGISTER_CONCURRENCY = 20
 MAX_CODEX_OAUTH_BATCH_CONCURRENCY = 20
+MAX_RELOGIN_BATCH_CONCURRENCY = 10
 
 TERMINAL_TASK_STATUSES = {
     TASK_STATUS_SUCCEEDED,
@@ -128,7 +130,7 @@ def _task_account_keys(task_type: str, payload: dict[str, Any]) -> list[str]:
         account_id = int(payload.get("account_id", 0) or 0)
         if account_id > 0:
             return [f"account:{account_id}"]
-    if task_type == TASK_TYPE_CODEX_OAUTH_BATCH:
+    if task_type in {TASK_TYPE_CODEX_OAUTH_BATCH, TASK_TYPE_RELOGIN_BATCH}:
         return [
             f"account:{int(item)}"
             for item in payload.get("account_ids", [])
@@ -258,6 +260,8 @@ def create_account_check_all_task(
     concurrency: int = 0,
     request_timeout_seconds: int = 0,
     automatic: bool = False,
+    relogin_invalid: bool = False,
+    relogin_params: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     normalized_ids = [int(item) for item in account_ids or [] if int(item or 0) > 0]
     payload: dict[str, Any] = {"platform": platform, "limit": int(limit or 50)}
@@ -271,6 +275,9 @@ def create_account_check_all_task(
         payload["request_timeout_seconds"] = int(request_timeout_seconds)
     if automatic:
         payload["automatic"] = True
+    if relogin_invalid:
+        payload["relogin_invalid"] = True
+        payload["relogin_params"] = dict(relogin_params or {})
     progress_total = max(int(limit or 50), 1)
     if account_ids is not None:
         payload["account_ids"] = normalized_ids
@@ -307,6 +314,28 @@ def create_codex_oauth_batch_task(
             "platform": platform or "chatgpt",
             "account_ids": normalized_ids,
             "action_id": "codex_oauth_authorize",
+            "params": dict(params or {}),
+            "concurrency": int(concurrency or 1),
+        },
+        progress_total=len(normalized_ids),
+    )
+
+
+def create_relogin_batch_task(
+    *,
+    platform: str,
+    account_ids: list[int],
+    params: dict[str, Any] | None = None,
+    concurrency: int = 1,
+) -> dict[str, Any]:
+    normalized_ids = [int(item) for item in account_ids or [] if int(item or 0) > 0]
+    return create_task(
+        task_type=TASK_TYPE_RELOGIN_BATCH,
+        platform=platform or "chatgpt",
+        payload={
+            "platform": platform or "chatgpt",
+            "account_ids": normalized_ids,
+            "action_id": "relogin",
             "params": dict(params or {}),
             "concurrency": int(concurrency or 1),
         },
@@ -905,6 +934,7 @@ def _refresh_account_after_codex_oauth(
     *,
     params: dict[str, Any] | None = None,
     scope_id: str = "",
+    event_label: str = "Codex OAuth",
 ) -> dict[str, Any]:
     """Refresh account usage after OAuth without changing OAuth success."""
     from core.worker_proxy import WorkerProxyPolicy, worker_proxy_manager
@@ -921,7 +951,7 @@ def _refresh_account_after_codex_oauth(
     policy = WorkerProxyPolicy.load()
     attempts = policy.replace_max_attempts if proxy_mode == PROXY_MODE_PROXY_SERVICE else 1
 
-    logger.log("Codex OAuth 授权完成，正在刷新账号额度")
+    logger.log(f"{event_label} 完成，正在刷新账号状态与额度")
     for proxy_attempt in range(1, attempts + 1):
         lease = None
         account_proxy = manual_proxy if proxy_mode == PROXY_MODE_MANUAL else None
@@ -942,7 +972,7 @@ def _refresh_account_after_codex_oauth(
             )
             if lease is not None:
                 lease.report_success()
-            logger.log(f"Codex OAuth 后额度刷新完成: {'有效' if valid else '失效'}")
+            logger.log(f"{event_label} 后账号刷新完成: {'有效' if valid else '失效'}")
             return {"ok": True, "valid": bool(valid), **result}
         except Exception as exc:
             if lease is not None and is_retryable_network_error(exc):
@@ -953,18 +983,154 @@ def _refresh_account_after_codex_oauth(
                 and is_retryable_network_error(exc)
             ):
                 logger.log(
-                    f"Codex OAuth 后额度刷新代理异常，换 IP 重试 "
+                    f"{event_label} 后账号刷新代理异常，换 IP 重试 "
                     f"({proxy_attempt + 1}/{attempts}): {exc}",
                     level="warning",
                 )
                 continue
-            logger.log(f"Codex OAuth 已成功，但额度刷新失败: {exc}", level="warning")
+            logger.log(f"{event_label} 已成功，但额度刷新失败: {exc}", level="warning")
             return {"ok": False, "error": str(exc)}
         finally:
             if lease is not None:
                 lease.release()
 
     return {"ok": False, "error": "额度刷新未执行"}
+
+
+def _refresh_account_after_relogin(
+    account_id: int,
+    logger: TaskLogger,
+    *,
+    params: dict[str, Any] | None = None,
+    scope_id: str = "",
+) -> dict[str, Any]:
+    return _refresh_account_after_codex_oauth(
+        account_id,
+        logger,
+        params=params,
+        scope_id=scope_id,
+        event_label="重新登录",
+    )
+
+
+def _safe_relogin_result_data(data: Any) -> dict[str, Any]:
+    if not isinstance(data, dict):
+        return {}
+    allowed_keys = {
+        "message",
+        "remote_email",
+        "account_id",
+        "registration_auth_mode",
+        "checked_at",
+        "last_login_status",
+        "failure_code",
+        "failed_at",
+    }
+    return {key: data.get(key) for key in allowed_keys if data.get(key) not in (None, "")}
+
+
+def _relogin_failure_code(data: Any, error: Any = "") -> str:
+    if isinstance(data, dict):
+        code = str(data.get("failure_code") or "").strip()
+        if code:
+            return code
+    text = str(error or "").casefold()
+    if "account_deactivated" in text or "deleted or disabled" in text:
+        return "account_deactivated"
+    return ""
+
+
+def _relogin_failure_log_message(email: str, prefix: str, error: Any, data: Any = None) -> str:
+    text = str(error or "重新登录失败")
+    if _relogin_failure_code(data, text) == "account_deactivated":
+        return f"{email}: {prefix}: 账号已封号（account_deactivated），已记录为封号状态。原因: {text}"
+    return f"{email}: {prefix}: {text}"
+
+
+def _persist_relogin_action_failure(
+    *,
+    platform: str,
+    account_id: int,
+    exc: Exception,
+) -> str:
+    from platforms.chatgpt.relogin import classify_relogin_failure, utcnow_iso
+
+    failure = classify_relogin_failure(exc)
+    persist_action_failure(
+        platform=platform,
+        account_id=account_id,
+        action_id="relogin",
+        error=failure.message,
+        data={"failure_code": failure.code, "failed_at": utcnow_iso()},
+    )
+    return failure.message
+
+
+def _execute_relogin_for_account(
+    *,
+    platform: str,
+    account_id: int,
+    email: str,
+    params: dict[str, Any],
+    logger: TaskLogger,
+    scope_id: str,
+) -> dict[str, Any]:
+    if logger.is_cancel_requested():
+        return {"account_id": account_id, "email": email, "cancelled": True}
+    try:
+        logger.log(f"{email}: 开始重新登录")
+        result = _execute_runtime_action_with_worker_proxy(
+            platform=platform,
+            account_id=account_id,
+            action_id="relogin",
+            params=params,
+            logger=logger,
+            scope_id=scope_id,
+        )
+        if logger.is_cancel_requested() or str(result.error or "") == "任务已取消":
+            return {"account_id": account_id, "email": email, "cancelled": True}
+        if not result.ok:
+            error = str(result.error or "重新登录失败")
+            data = result.data if isinstance(result.data, dict) else {}
+            if not data.get("failure_code"):
+                error = _persist_relogin_action_failure(
+                    platform=platform,
+                    account_id=account_id,
+                    exc=RuntimeError(error),
+                )
+            logger.record_error(error)
+            logger.log(_relogin_failure_log_message(email, "重新登录失败", error, data), level="error")
+            return {
+                "account_id": account_id,
+                "email": email,
+                "ok": False,
+                "error": error,
+                "data": _safe_relogin_result_data(data),
+            }
+        account_refresh = _refresh_account_after_relogin(
+            account_id,
+            logger,
+            params=params,
+            scope_id=scope_id,
+        )
+        logger.record_success()
+        logger.log(f"{email}: 重新登录完成")
+        return {
+            "account_id": account_id,
+            "email": email,
+            "ok": True,
+            "data": _safe_relogin_result_data(result.data),
+            "account_refresh": account_refresh,
+        }
+    except Exception as exc:
+        error = _persist_relogin_action_failure(
+            platform=platform,
+            account_id=account_id,
+            exc=exc,
+        )
+        logger.record_error(error)
+        logger.log(_relogin_failure_log_message(email, "重新登录异常", error), level="error")
+        return {"account_id": account_id, "email": email, "ok": False, "error": error}
 
 
 def _execute_configured_account_check_task(payload: dict[str, Any], logger: TaskLogger) -> None:
@@ -979,6 +1145,7 @@ def _execute_configured_account_check_task(payload: dict[str, Any], logger: Task
     concurrency = min(max(int(payload.get("concurrency") or settings.concurrency), 1), 20)
     request_timeout = min(max(int(payload.get("request_timeout_seconds") or settings.request_timeout_seconds), 5), 300)
     account_ids = [int(item) for item in payload.get("account_ids", []) if int(item or 0) > 0]
+    relogin_invalid = bool(payload.get("relogin_invalid"))
 
     with Session(engine) as session:
         q = select(AccountModel)
@@ -1011,10 +1178,20 @@ def _execute_configured_account_check_task(payload: dict[str, Any], logger: Task
     if proxy_mode == PROXY_MODE_MANUAL and not manual_proxy:
         logger.finish(TASK_STATUS_FAILED, error="手动代理模式需要填写代理 URL")
         return
+    relogin_params = dict(payload.get("relogin_params") or {})
+    if relogin_invalid:
+        if not relogin_params.get("browser_mode"):
+            relogin_params["browser_mode"] = "headless"
+        if not relogin_params.get("keep_browser_open"):
+            relogin_params["keep_browser_open"] = "false"
+        relogin_params.setdefault("platform_proxy_mode", proxy_mode)
+        if manual_proxy:
+            relogin_params.setdefault("platform_proxy_value", manual_proxy)
 
     task_id = str(logger.task_id or "")
     proxy_policy = WorkerProxyPolicy.load()
-    logger.log(f"账号有效性检测: {total} 个，并发 {concurrency}，请求超时 {request_timeout}s，代理 {proxy_mode}")
+    relogin_note = "，失效后重登" if relogin_invalid else ""
+    logger.log(f"账号有效性检测: {total} 个，并发 {concurrency}，请求超时 {request_timeout}s，代理 {proxy_mode}{relogin_note}")
 
     def _check_one(model: AccountModel) -> dict[str, Any]:
         email = str(model.email or "")
@@ -1035,6 +1212,32 @@ def _execute_configured_account_check_task(payload: dict[str, Any], logger: Task
                 )
                 if lease is not None:
                     lease.report_success()
+                if (not valid) and relogin_invalid:
+                    logger.log(f"{email}: 检测失效，开始重新登录", level="warning")
+                    relogin_result = _execute_relogin_for_account(
+                        platform=platform or str(model.platform or ""),
+                        account_id=int(model.id or 0),
+                        email=email,
+                        params=relogin_params,
+                        logger=logger,
+                        scope_id=task_id,
+                    )
+                    if relogin_result.get("cancelled"):
+                        return {"cancelled": True, "email": email}
+                    account_refresh = relogin_result.get("account_refresh")
+                    final_valid = bool(
+                        account_refresh.get("valid", True)
+                        if isinstance(account_refresh, dict)
+                        else relogin_result.get("ok")
+                    )
+                    return {
+                        "ok": True,
+                        **result,
+                        "valid": final_valid,
+                        "relogin_attempted": True,
+                        "relogin_ok": bool(relogin_result.get("ok")),
+                        "relogin_error": str(relogin_result.get("error") or ""),
+                    }
                 return {"ok": True, "valid": valid, **result}
             except Exception as exc:
                 retryable = is_retryable_network_error(exc)
@@ -1048,7 +1251,7 @@ def _execute_configured_account_check_task(payload: dict[str, Any], logger: Task
                     lease.release()
         return {"ok": False, "email": email, "error": "账号检测未执行"}
 
-    results = {"valid": 0, "invalid": 0, "error": 0}
+    results = {"valid": 0, "invalid": 0, "error": 0, "relogin_success": 0, "relogin_failed": 0}
     completed = 0
     cancelled = False
     pool = ThreadPoolExecutor(max_workers=min(concurrency, total))
@@ -1074,10 +1277,23 @@ def _execute_configured_account_check_task(payload: dict[str, Any], logger: Task
                     logger.log(f"{email}: 检测异常: {error}", level="error")
                 elif outcome.get("valid"):
                     results["valid"] += 1
-                    logger.log(f"{email}: 有效")
+                    if outcome.get("relogin_attempted"):
+                        results["relogin_success"] += 1
+                        logger.log(f"{email}: 失效后重登成功，当前有效")
+                    else:
+                        logger.log(f"{email}: 有效")
                 else:
                     results["invalid"] += 1
-                    logger.log(f"{email}: 失效", level="warning")
+                    if outcome.get("relogin_attempted"):
+                        if outcome.get("relogin_ok"):
+                            results["relogin_success"] += 1
+                            logger.log(f"{email}: 失效后重登完成，但刷新后仍为失效", level="warning")
+                        else:
+                            results["relogin_failed"] += 1
+                            error = str(outcome.get("relogin_error") or "重新登录失败")
+                            logger.log(_relogin_failure_log_message(email, "失效后重登失败", error), level="error")
+                    else:
+                        logger.log(f"{email}: 失效", level="warning")
                 completed += 1
                 logger.set_progress(completed, total)
     finally:
@@ -1111,6 +1327,7 @@ def execute_task(task_id: str) -> None:
         TASK_TYPE_ACCOUNT_CHECK_ALL: _execute_configured_account_check_task,
         TASK_TYPE_PLATFORM_ACTION: _execute_platform_action_task,
         TASK_TYPE_CODEX_OAUTH_BATCH: _execute_codex_oauth_batch_task,
+        TASK_TYPE_RELOGIN_BATCH: _execute_relogin_batch_task,
         TASK_TYPE_ACCOUNT_PUSH: _execute_account_push_task,
     }
     handler = handlers.get(task_type)
@@ -1163,7 +1380,7 @@ def _registration_concurrency(requested: Any, count: int) -> int:
     )
 
 
-def _codex_oauth_batch_concurrency(requested: Any, count: int) -> int:
+def _action_batch_concurrency(requested: Any, count: int, maximum: int) -> int:
     try:
         value = int(requested or 1)
     except Exception:
@@ -1171,8 +1388,16 @@ def _codex_oauth_batch_concurrency(requested: Any, count: int) -> int:
     return min(
         max(value, 1),
         max(int(count or 1), 1),
-        MAX_CODEX_OAUTH_BATCH_CONCURRENCY,
+        maximum,
     )
+
+
+def _codex_oauth_batch_concurrency(requested: Any, count: int) -> int:
+    return _action_batch_concurrency(requested, count, MAX_CODEX_OAUTH_BATCH_CONCURRENCY)
+
+
+def _relogin_batch_concurrency(requested: Any, count: int) -> int:
+    return _action_batch_concurrency(requested, count, MAX_RELOGIN_BATCH_CONCURRENCY)
 
 
 def _bounded_int(value: Any, default: int, *, minimum: int = 1, maximum: int | None = None) -> int:
@@ -1572,6 +1797,12 @@ def _execute_platform_action_task(payload: dict[str, Any], logger: TaskLogger) -
             scope_id=task_id,
         )
     except Exception as exc:
+        if action_id == "relogin" and str(exc or "") != "任务已取消":
+            _persist_relogin_action_failure(
+                platform=command_platform,
+                account_id=account_id,
+                exc=exc,
+            )
         logger.record_error(str(exc))
         logger.finish(TASK_STATUS_FAILED, error=str(exc))
         return
@@ -1600,6 +1831,15 @@ def _execute_platform_action_task(payload: dict[str, Any], logger: TaskLogger) -
 
         worker_proxy_manager.clear_scope(task_id)
         _log_codex_auto_push_enqueue(account_id, logger, platform=command_platform)
+    elif action_id == "relogin":
+        account_refresh = _refresh_account_after_relogin(
+            account_id,
+            logger,
+            params=params,
+            scope_id=task_id,
+        )
+        if isinstance(result_data, dict):
+            result_data["account_refresh"] = account_refresh
     logger.set_result_data(result_data)
     message = ""
     if isinstance(result_data, dict):
@@ -1821,6 +2061,122 @@ def _execute_codex_oauth_batch_task(payload: dict[str, Any], logger: TaskLogger)
     }
     logger.set_result_data(result_data)
     logger.log(f"Codex OAuth 批量授权完成: 成功 {success} 个, 失败 {len(errors)} 个", event_type="summary")
+    final_status = TASK_STATUS_FAILED if errors and success == 0 else TASK_STATUS_SUCCEEDED
+    logger.finish(final_status, error=errors[0] if final_status == TASK_STATUS_FAILED else "")
+
+
+def _execute_relogin_batch_task(payload: dict[str, Any], logger: TaskLogger) -> None:
+    platform = str(payload.get("platform") or "chatgpt")
+    account_ids = [
+        int(item)
+        for item in payload.get("account_ids", [])
+        if int(item or 0) > 0
+    ]
+    params = dict(payload.get("params") or {})
+    if not params.get("browser_mode"):
+        params["browser_mode"] = "headless"
+    if not params.get("keep_browser_open"):
+        params["keep_browser_open"] = "false"
+    concurrency = _relogin_batch_concurrency(payload.get("concurrency", 1), len(account_ids))
+    task_id = str(getattr(logger, "task_id", "") or "")
+
+    with Session(engine) as session:
+        records = session.exec(
+            select(AccountModel)
+            .where(AccountModel.id.in_(account_ids))
+            .where(AccountModel.platform == platform)
+        ).all() if account_ids else []
+        by_id = {int(item.id or 0): item for item in records}
+
+    accounts = [by_id[item] for item in account_ids if item in by_id]
+    total = len(accounts)
+    logger.set_progress(0, total)
+    logger.log(f"批量重新登录: {total} 个账号，并发 {concurrency}")
+    if total == 0:
+        logger.set_result_data({"success": 0, "fail": 0, "accounts": []})
+        logger.finish(TASK_STATUS_SUCCEEDED)
+        return
+
+    def _do_one(model: AccountModel) -> dict[str, Any]:
+        account_id = int(model.id or 0)
+        email = str(model.email or "")
+        logger.set_subtask(f"account_{account_id}", email or f"账号 {account_id}")
+        try:
+            return _execute_relogin_for_account(
+                platform=platform,
+                account_id=account_id,
+                email=email,
+                params=params,
+                logger=logger,
+                scope_id=task_id,
+            )
+        finally:
+            logger.clear_subtask()
+
+    completed = 0
+    success = 0
+    errors: list[str] = []
+    results: list[dict[str, Any]] = []
+    pool: ThreadPoolExecutor | None = None
+    cancel_pool = False
+    try:
+        pool = ThreadPoolExecutor(max_workers=concurrency)
+        pending = set()
+        next_index = 0
+        while next_index < total and len(pending) < concurrency and not logger.is_cancel_requested():
+            pending.add(pool.submit(_do_one, accounts[next_index]))
+            next_index += 1
+        while pending:
+            if logger.is_cancel_requested():
+                cancel_pool = True
+                for future in pending:
+                    future.cancel()
+                logger.finish(TASK_STATUS_CANCELLED, error="任务已取消")
+                return
+            done, pending = wait(pending, timeout=1, return_when=FIRST_COMPLETED)
+            if not done:
+                continue
+            for future in done:
+                if future.cancelled():
+                    continue
+                result = future.result()
+                if result.get("cancelled"):
+                    cancel_pool = True
+                    for item in pending:
+                        item.cancel()
+                    logger.finish(TASK_STATUS_CANCELLED, error="任务已取消")
+                    return
+                completed += 1
+                if result.get("ok"):
+                    success += 1
+                else:
+                    errors.append(str(result.get("error") or "unknown"))
+                results.append(result)
+                logger.set_progress(completed, total)
+                if logger.is_cancel_requested():
+                    cancel_pool = True
+                    for item in pending:
+                        item.cancel()
+                    logger.finish(TASK_STATUS_CANCELLED, error="任务已取消")
+                    return
+            while next_index < total and len(pending) < concurrency and not logger.is_cancel_requested():
+                pending.add(pool.submit(_do_one, accounts[next_index]))
+                next_index += 1
+    finally:
+        if pool is not None:
+            pool.shutdown(wait=not cancel_pool, cancel_futures=cancel_pool)
+        from core.worker_proxy import worker_proxy_manager
+
+        worker_proxy_manager.clear_scope(task_id)
+
+    result_data = {
+        "success": success,
+        "fail": len(errors),
+        "account_ids": [item["account_id"] for item in results if item.get("ok")],
+        "accounts": results,
+    }
+    logger.set_result_data(result_data)
+    logger.log(f"批量重新登录完成: 成功 {success} 个, 失败 {len(errors)} 个", event_type="summary")
     final_status = TASK_STATUS_FAILED if errors and success == 0 else TASK_STATUS_SUCCEEDED
     logger.finish(final_status, error=errors[0] if final_status == TASK_STATUS_FAILED else "")
 

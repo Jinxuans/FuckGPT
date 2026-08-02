@@ -16,6 +16,7 @@ class AccountStatus(str, Enum):
     SUBSCRIBED   = "subscribed"
     EXPIRED      = "expired"
     INVALID      = "invalid"
+    DEACTIVATED  = "deactivated"
 
 
 @dataclass

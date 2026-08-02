@@ -96,7 +96,7 @@ def _plan_state(plan: str) -> str:
         return "free"
     if "trial" in normalized:
         return "trial"
-    if normalized in {"expired", "invalid", "banned"}:
+    if normalized in {"expired", "invalid", "banned", "deactivated"}:
         return "expired"
     return "unknown"
 
@@ -225,6 +225,8 @@ def _build_account_state_summary(
         **security,
         "chatgpt_usage": usage,
     }
+    if str(status or "").strip().casefold() == "deactivated":
+        summary["validity_status"] = "deactivated"
     if valid is not None:
         summary["valid"] = bool(valid)
     else:
@@ -465,6 +467,7 @@ class ChatGPTPlatform(BasePlatform):
     capabilities = [
         "query_state",      # Query account state/quota
         "switch_desktop",   # Switch to Codex desktop
+        "relogin",          # Refresh ChatGPT browser login credentials
         "codex_oauth_authorize",  # Create Codex OAuth credentials through browser login
         "upload_cpa",       # Upload to CPA system
         "upload_tm",        # Upload to Team Manager
@@ -525,7 +528,7 @@ class ChatGPTPlatform(BasePlatform):
                     if should_report and proxy:
                         proxy_pool.report_success(proxy)
                     status = details.get("status")
-                    valid = status not in ("expired", "invalid", "banned", None)
+                    valid = status not in ("expired", "invalid", "banned", "deactivated", None)
                     overview = _build_account_state_summary(
                         valid=valid,
                         status=status,
@@ -725,6 +728,12 @@ class ChatGPTPlatform(BasePlatform):
         ]
         return [
             {"id": "switch_account", "label": "切换到 Codex 桌面端", "params": []},
+            {"id": "relogin", "label": "重新登录",
+             "params": [
+                 {"key": "browser_mode", "label": "浏览器模式", "type": "select", "options": ["headless", "headed"]},
+                 {"key": "keep_browser_open", "label": "完成后保留浏览器窗口", "type": "select", "options": ["false", "true"]},
+                 *proxy_params,
+             ]},
             {"id": "codex_oauth_authorize", "label": "Codex OAuth 授权",
              "params": [
                  {"key": "browser_mode", "label": "浏览器模式", "type": "select", "options": ["headless", "headed"]},
@@ -782,6 +791,80 @@ class ChatGPTPlatform(BasePlatform):
         a.user_id = account.user_id or ""
         a.account_id = extra.get("account_id") or extra.get("chatgpt_account_id") or account.user_id or ""
 
+        if action_id == "relogin":
+            from platforms.chatgpt.relogin import (
+                ChatGPTReloginError,
+                classify_relogin_failure,
+                perform_chatgpt_relogin,
+                utcnow_iso,
+            )
+
+            if not account.email:
+                failure = classify_relogin_failure(RuntimeError("本地账号缺少邮箱"))
+                return {
+                    "ok": False,
+                    "error": failure.message,
+                    "data": {"failure_code": failure.code, "failed_at": utcnow_iso()},
+                }
+
+            otp_callback = None
+            try:
+                from core.mailbox_store import MailboxStore
+
+                mailbox, mailbox_account, _mailbox_context = MailboxStore().resolve_mailbox_for_account(
+                    platform="chatgpt",
+                    account_id=int(getattr(account, "id", 0) or 0),
+                    proxy=mailbox_proxy or None,
+                    extra=self.config.extra if self.config else {},
+                )
+                if hasattr(mailbox, "set_cancel_checker"):
+                    mailbox.set_cancel_checker(self.is_cancel_requested)
+                before_ids = mailbox.get_current_ids(mailbox_account)
+
+                def _relogin_otp_callback():
+                    self.raise_if_cancelled()
+                    self.log("等待重新登录邮箱验证码...")
+                    code = mailbox.wait_for_code(
+                        mailbox_account,
+                        keyword="",
+                        timeout=180,
+                        before_ids=before_ids,
+                    )
+                    self.raise_if_cancelled()
+                    if code:
+                        self.log("重新登录验证码已获取")
+                    return code
+
+                otp_callback = _relogin_otp_callback
+            except Exception as exc:
+                self.log(f"未绑定可用验证邮箱，重新登录将仅尝试密码: {exc}")
+
+            browser_mode = str(params.get("browser_mode") or "headless").strip().lower()
+            headless = browser_mode not in {"headed", "false", "0", "no", "前台", "可见浏览器"}
+            keep_browser_open = _truthy(params.get("keep_browser_open"))
+            try:
+                result = perform_chatgpt_relogin(
+                    email=account.email,
+                    password=account.password,
+                    expected_account_id=a.account_id,
+                    proxy=proxy,
+                    headless=headless,
+                    otp_callback=otp_callback,
+                    keep_browser_open=keep_browser_open,
+                    cancel_check=self.is_cancel_requested,
+                    log_fn=self.log,
+                )
+                self.raise_if_cancelled()
+                return {"ok": True, "data": result}
+            except ChatGPTReloginError as exc:
+                failure = exc.failure
+                self.log(failure.message)
+                return {
+                    "ok": False,
+                    "error": failure.message,
+                    "data": {"failure_code": failure.code, "failed_at": utcnow_iso()},
+                }
+
         if action_id == "codex_oauth_authorize":
             from platforms.chatgpt.codex_oauth import perform_codex_oauth_login
 
@@ -821,7 +904,7 @@ class ChatGPTPlatform(BasePlatform):
                     )
                     self.raise_if_cancelled()
                     if code:
-                        self.log(f"Codex OAuth 验证码: {code}")
+                        self.log("Codex OAuth 验证码已获取")
                     return code
 
                 otp_callback = _otp_callback
