@@ -533,6 +533,118 @@ class TaskEventModel(SQLModel, table=True):
         self.detail_json = json.dumps(data or {}, ensure_ascii=False)
 
 
+class WorkflowDefinitionModel(SQLModel, table=True):
+    __tablename__ = "workflow_definitions"
+    __table_args__ = (
+        UniqueConstraint("key", "version", name="uq_workflow_definition_version"),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    key: str = Field(index=True)
+    version: int = Field(default=1, index=True)
+    name: str
+    description: str = ""
+    enabled: bool = Field(default=True, index=True)
+    definition_json: str = "{}"
+    created_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow)
+
+    def get_definition(self) -> dict:
+        return json.loads(self.definition_json or "{}")
+
+    def set_definition(self, data: dict):
+        self.definition_json = json.dumps(data or {}, ensure_ascii=False)
+
+
+class WorkflowRunModel(SQLModel, table=True):
+    __tablename__ = "workflow_runs"
+
+    id: str = Field(primary_key=True)
+    definition_key: str = Field(index=True)
+    definition_version: int = Field(default=1, index=True)
+    name: str = ""
+    status: str = Field(default="pending", index=True)
+    input_json: str = "{}"
+    context_json: str = "{}"
+    output_json: str = "{}"
+    definition_json: str = "{}"
+    current_step_id: str = ""
+    error: str = ""
+    cancellation_requested_at: Optional[datetime] = None
+    started_at: Optional[datetime] = None
+    finished_at: Optional[datetime] = None
+    created_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow)
+
+    def _get_json(self, value: str) -> dict:
+        return json.loads(value or "{}")
+
+    def get_input(self) -> dict:
+        return self._get_json(self.input_json)
+
+    def get_context(self) -> dict:
+        return self._get_json(self.context_json)
+
+    def get_output(self) -> dict:
+        return self._get_json(self.output_json)
+
+    def get_definition(self) -> dict:
+        return self._get_json(self.definition_json)
+
+
+class WorkflowStepRunModel(SQLModel, table=True):
+    __tablename__ = "workflow_step_runs"
+    __table_args__ = (
+        UniqueConstraint("workflow_run_id", "step_id", name="uq_workflow_run_step"),
+        Index("ix_workflow_steps_due", "status", "next_run_at"),
+    )
+
+    id: str = Field(primary_key=True)
+    workflow_run_id: str = Field(index=True, foreign_key="workflow_runs.id", ondelete="CASCADE")
+    step_id: str = Field(index=True)
+    name: str = ""
+    adapter_key: str = Field(index=True)
+    status: str = Field(default="pending", index=True)
+    attempt: int = 0
+    max_attempts: int = 1
+    input_json: str = "{}"
+    output_json: str = "{}"
+    error_json: str = "{}"
+    external_ref: str = Field(default="", index=True)
+    idempotency_key: str = Field(default="", index=True)
+    next_run_at: Optional[datetime] = Field(default=None, index=True)
+    timeout_at: Optional[datetime] = None
+    started_at: Optional[datetime] = None
+    finished_at: Optional[datetime] = None
+    created_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow)
+
+    def get_input(self) -> dict:
+        return json.loads(self.input_json or "{}")
+
+    def get_output(self) -> dict:
+        return json.loads(self.output_json or "{}")
+
+    def get_error(self) -> dict:
+        return json.loads(self.error_json or "{}")
+
+
+class WorkflowEventModel(SQLModel, table=True):
+    __tablename__ = "workflow_events"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    workflow_run_id: str = Field(index=True, foreign_key="workflow_runs.id", ondelete="CASCADE")
+    step_id: str = Field(default="", index=True)
+    type: str = Field(default="log", index=True)
+    level: str = "info"
+    message: str = ""
+    detail_json: str = "{}"
+    created_at: datetime = Field(default_factory=_utcnow)
+
+    def get_detail(self) -> dict:
+        return json.loads(self.detail_json or "{}")
+
+
 class ProxyModel(SQLModel, table=True):
     __tablename__ = "proxies"
 
