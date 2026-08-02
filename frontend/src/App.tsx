@@ -13,6 +13,7 @@ import Dashboard from "@/pages/Dashboard";
 import Accounts from "@/pages/Accounts";
 import MailboxResources from "@/pages/MailboxResources";
 import TaskHistory from "@/pages/TaskHistory";
+import Workflows from "@/pages/Workflows";
 import SettingsPage from "@/pages/SettingsPage";
 import UpdateBanner from "@/components/UpdateBanner";
 import WelcomeDialog from "@/components/WelcomeDialog";
@@ -26,6 +27,7 @@ import {
   Users,
   Mail,
   ListChecks,
+  GitBranch,
   PanelLeftClose,
   PanelLeft,
 } from "lucide-react";
@@ -55,6 +57,7 @@ const NAV_ITEMS: NavItem[] = [
   { path: "/accounts/chatgpt", labelKey: "nav.chatgptAccounts", icon: Users },
   { path: "/mailboxes", labelKey: "nav.mailboxResources", icon: Mail },
   { path: "/tasks", labelKey: "nav.tasks", icon: ListChecks },
+  { path: "/workflows", labelKey: "nav.workflows", icon: GitBranch },
   { path: "/settings", labelKey: "nav.settings", icon: SettingsIcon },
 ];
 
@@ -63,7 +66,7 @@ const SHELL_CONTENT_WIDTH = {
   workspace: "max-w-[1680px]",
 } as const;
 
-const WORKSPACE_ROUTE_PREFIXES = ["/", "/accounts", "/mailboxes", "/tasks"];
+const WORKSPACE_ROUTE_PREFIXES = ["/", "/accounts", "/mailboxes", "/tasks", "/workflows"];
 
 function getShellContentWidth(pathname: string) {
   const isWorkspace = WORKSPACE_ROUTE_PREFIXES.some(
@@ -280,6 +283,7 @@ function Shell({
             <Route path="/accounts/chatgpt" element={<Accounts />} />
             <Route path="/mailboxes" element={<MailboxResources />} />
             <Route path="/tasks" element={<TaskHistory />} />
+            <Route path="/workflows" element={<Workflows />} />
             <Route
               path="/settings"
               element={<SettingsPage theme={theme} setTheme={setTheme} />}
