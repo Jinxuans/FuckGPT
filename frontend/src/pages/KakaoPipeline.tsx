@@ -160,6 +160,17 @@ const ACTIVE_PIPELINE_STATES = new Set([
   'plus_checking',
   'plus_pending',
 ])
+const ATTENTION_PIPELINE_STATES = new Set([
+  'supplier_failed',
+  'supplier_poll_failed',
+  'supplier_submit_unconfirmed',
+  'scanner_failed',
+  'scanner_poll_failed',
+  'scanner_submit_unconfirmed',
+  'scanner_recovery_unconfirmed',
+  'plus_unconfirmed',
+  'plus_check_failed',
+])
 
 function parseError(error: unknown) {
   const message = error instanceof Error ? error.message : String(error || '操作失败')
@@ -565,14 +576,14 @@ function PipelineProgress({ account }: { account: KakaoAccount }) {
       const nextCheck = formatNextPlusCheck(pipeline.scanner_recovery_next_check_at)
       return [
         pipeline.scanner_status === 'DUPLICATE_ACCEPTED'
-          ? '上游已接收链接，正在观察 Plus'
-          : '扫码提交结果无法确认，正在观察 Plus',
+          ? '已提交给供应商，正在通过账号状态确认结果'
+          : '扫码提交结果无法确认，正在通过账号状态确认结果',
         count ? `已检测 ${count} 次` : '',
         nextCheck,
       ].filter(Boolean).join(' · ')
     }
-    if (pipeline.state === 'scanner_recovery_unconfirmed') return pipeline.last_error_message || '上游已接收链接，暂未确认 Plus'
-    if (pipeline.state === 'scanner_submit_unconfirmed') return pipeline.last_error_message || '扫码提交结果无法确认，可检测 Plus 或重置'
+    if (pipeline.state === 'scanner_recovery_unconfirmed') return pipeline.last_error_message || '30 分钟内未确认 Plus，请人工检查是否已扣费或重复提交'
+    if (pipeline.state === 'scanner_submit_unconfirmed') return pipeline.last_error_message || '扫码提交结果无法确认，请人工检查是否已扣费或重复提交'
     if (pipeline.state === 'scanner_poll_failed') return pipeline.last_error_message || '扫码订单查询已暂停，可继续查询原订单'
     if (pipeline.state === 'link_ready') return '长链已就绪，等待上传扫码'
     if (pipeline.state === 'scanner_succeeded') return '扫码已完成，正在启动 Plus 确认'
@@ -585,7 +596,7 @@ function PipelineProgress({ account }: { account: KakaoAccount }) {
         nextCheck,
       ].filter(Boolean).join(' · ')
     }
-    if (pipeline.state === 'plus_unconfirmed') return '扫码已完成，10 分钟内未确认 Plus，可手动检测'
+    if (pipeline.state === 'plus_unconfirmed') return pipeline.last_error_message || '10 分钟内未确认 Plus，请人工检查供应商结果'
     if (pipeline.state === 'plus_checking') return '正在检查 Plus，请稍候'
     if (['supplier_failed', 'scanner_failed', 'plus_check_failed'].includes(pipeline.state)) {
       return pipeline.last_error_message || '本次操作失败'
@@ -625,7 +636,7 @@ function PipelineProgress({ account }: { account: KakaoAccount }) {
       </div>
       <p className={cn(
         'mt-2 text-center text-xs leading-5',
-        ['supplier_failed', 'scanner_failed', 'plus_check_failed'].includes(pipeline.state)
+        ATTENTION_PIPELINE_STATES.has(pipeline.state)
           ? 'text-red-500'
           : 'text-[var(--text-secondary)]',
       )} title={stateText}>{stateText}</p>
@@ -1482,7 +1493,7 @@ export default function KakaoPipeline() {
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE))
   const activeCount = accounts.filter(account => ACTIVE_PIPELINE_STATES.has(account.pipeline.state)).length
   const readyCount = accounts.filter(account => account.pipeline.state === 'link_ready').length
-  const errorCount = accounts.filter(account => ['supplier_failed', 'scanner_failed', 'scanner_recovery_unconfirmed', 'plus_check_failed'].includes(account.pipeline.state)).length
+  const errorCount = accounts.filter(account => ATTENTION_PIPELINE_STATES.has(account.pipeline.state)).length
   const completedCount = accounts.filter(account => account.pipeline.state === 'completed' || accountIsPlus(account)).length
   const expandedAccount = expanded === null ? null : accounts.find(account => account.id === expanded) || null
 
@@ -1619,7 +1630,7 @@ export default function KakaoPipeline() {
               ) : accounts.map(account => (
                     <tr key={account.id} className={cn(
                       'align-top transition-colors hover:bg-[var(--bg-hover)]',
-                      account.pipeline.state === 'supplier_failed' || account.pipeline.state === 'scanner_failed'
+                      ATTENTION_PIPELINE_STATES.has(account.pipeline.state)
                         ? 'bg-red-500/[0.025]'
                         : account.pipeline.state === 'completed'
                           ? 'bg-emerald-500/[0.025]'
