@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 
 from sqlalchemy import func
+from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 
 from core.account_graph import (
@@ -220,8 +221,9 @@ def create_task(
     payload: dict[str, Any],
     progress_total: int = 1,
     result_seed: dict[str, Any] | None = None,
+    task_id: str = "",
 ) -> dict[str, Any]:
-    task_id = f"task_{int(time.time() * 1000)}_{uuid.uuid4().hex[:6]}"
+    task_id = str(task_id or f"task_{int(time.time() * 1000)}_{uuid.uuid4().hex[:6]}")
     task = TaskModel(
         id=task_id,
         type=task_type,
@@ -233,14 +235,24 @@ def create_task(
         progress_total=max(int(progress_total or 0), 0),
     )
     with Session(engine) as session:
+        existing = session.get(TaskModel, task_id)
+        if existing:
+            return serialize_task(existing)
         session.add(task)
-        session.commit()
-        session.refresh(task)
+        try:
+            session.commit()
+            session.refresh(task)
+        except IntegrityError:
+            session.rollback()
+            existing = session.get(TaskModel, task_id)
+            if existing:
+                return serialize_task(existing)
+            raise
     append_task_event(task.id, f"任务已创建: {task_type}", event_type="state")
     return serialize_task(task)
 
 
-def create_register_task(payload: dict[str, Any]) -> dict[str, Any]:
+def create_register_task(payload: dict[str, Any], *, task_id: str = "") -> dict[str, Any]:
     count = max(int(payload.get("count", 1) or 1), 1)
     payload = {**payload, "platform": "chatgpt"}
     return create_task(
@@ -248,6 +260,7 @@ def create_register_task(payload: dict[str, Any]) -> dict[str, Any]:
         platform="chatgpt",
         payload=payload,
         progress_total=count,
+        task_id=task_id,
     )
 
 
@@ -305,6 +318,8 @@ def create_codex_oauth_batch_task(
     account_ids: list[int],
     params: dict[str, Any] | None = None,
     concurrency: int = 1,
+    auto_push_after_oauth: bool = True,
+    task_id: str = "",
 ) -> dict[str, Any]:
     normalized_ids = [int(item) for item in account_ids or [] if int(item or 0) > 0]
     return create_task(
@@ -316,8 +331,10 @@ def create_codex_oauth_batch_task(
             "action_id": "codex_oauth_authorize",
             "params": dict(params or {}),
             "concurrency": int(concurrency or 1),
+            "auto_push_after_oauth": bool(auto_push_after_oauth),
         },
         progress_total=len(normalized_ids),
+        task_id=task_id,
     )
 
 
@@ -350,6 +367,7 @@ def create_account_push_task(
     target_key: str,
     payload_format: str,
     source: str = "manual",
+    task_id: str = "",
 ) -> dict[str, Any]:
     normalized_ids = [int(item) for item in account_ids or [] if int(item or 0) > 0]
     return create_task(
@@ -363,6 +381,7 @@ def create_account_push_task(
             "source": str(source or "manual"),
         },
         progress_total=len(normalized_ids),
+        task_id=task_id,
     )
 
 
@@ -1830,7 +1849,8 @@ def _execute_platform_action_task(payload: dict[str, Any], logger: TaskLogger) -
         from core.worker_proxy import worker_proxy_manager
 
         worker_proxy_manager.clear_scope(task_id)
-        _log_codex_auto_push_enqueue(account_id, logger, platform=command_platform)
+        if bool(payload.get("auto_push_after_oauth", True)):
+            _log_codex_auto_push_enqueue(account_id, logger, platform=command_platform)
     elif action_id == "relogin":
         account_refresh = _refresh_account_after_relogin(
             account_id,
@@ -1926,6 +1946,7 @@ def _execute_codex_oauth_batch_task(payload: dict[str, Any], logger: TaskLogger)
         if int(item or 0) > 0
     ]
     params = dict(payload.get("params") or {})
+    auto_push_after_oauth = bool(payload.get("auto_push_after_oauth", True))
     if not params.get("browser_mode"):
         params["browser_mode"] = "headless"
     if not params.get("keep_browser_open"):
@@ -1981,7 +2002,8 @@ def _execute_codex_oauth_batch_task(payload: dict[str, Any], logger: TaskLogger)
                 params=params,
                 scope_id=task_id,
             )
-            _log_codex_auto_push_enqueue(account_id, logger, platform=platform)
+            if auto_push_after_oauth:
+                _log_codex_auto_push_enqueue(account_id, logger, platform=platform)
             return {
                 "account_id": account_id,
                 "email": email,

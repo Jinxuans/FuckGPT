@@ -25,6 +25,8 @@ def test_sidebar_top_level_nav_keeps_public_entries():
     assert 'labelKey: "nav.mailboxResources"' in block
     assert 'path: "/tasks"' in block
     assert 'labelKey: "nav.tasks"' in block
+    assert 'path: "/workflows"' in block
+    assert 'labelKey: "nav.workflows"' in block
     assert 'path: "/settings"' in block
     assert 'labelKey: "nav.settings"' in block
 

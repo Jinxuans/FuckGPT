@@ -13,6 +13,7 @@ import Dashboard from "@/pages/Dashboard";
 import Accounts from "@/pages/Accounts";
 import MailboxResources from "@/pages/MailboxResources";
 import TaskHistory from "@/pages/TaskHistory";
+import Workflows from "@/pages/Workflows";
 import SettingsPage from "@/pages/SettingsPage";
 import KakaoPipeline from "@/pages/KakaoPipeline";
 import UpdateBanner from "@/components/UpdateBanner";
@@ -27,6 +28,7 @@ import {
   Users,
   Mail,
   ListChecks,
+  GitBranch,
   PanelLeftClose,
   PanelLeft,
   ScanLine,
@@ -58,6 +60,7 @@ const NAV_ITEMS: NavItem[] = [
   { path: "/kakao-pipeline", label: "Kakao 流水线", icon: ScanLine },
   { path: "/mailboxes", labelKey: "nav.mailboxResources", icon: Mail },
   { path: "/tasks", labelKey: "nav.tasks", icon: ListChecks },
+  { path: "/workflows", labelKey: "nav.workflows", icon: GitBranch },
   { path: "/settings", labelKey: "nav.settings", icon: SettingsIcon },
 ];
 
@@ -66,7 +69,14 @@ const SHELL_CONTENT_WIDTH = {
   workspace: "max-w-[1680px]",
 } as const;
 
-const WORKSPACE_ROUTE_PREFIXES = ["/", "/accounts", "/kakao-pipeline", "/mailboxes", "/tasks"];
+const WORKSPACE_ROUTE_PREFIXES = [
+  "/",
+  "/accounts",
+  "/kakao-pipeline",
+  "/mailboxes",
+  "/tasks",
+  "/workflows",
+];
 
 function getShellContentWidth(pathname: string) {
   const isWorkspace = WORKSPACE_ROUTE_PREFIXES.some(
@@ -284,6 +294,7 @@ function Shell({
             <Route path="/kakao-pipeline" element={<KakaoPipeline />} />
             <Route path="/mailboxes" element={<MailboxResources />} />
             <Route path="/tasks" element={<TaskHistory />} />
+            <Route path="/workflows" element={<Workflows />} />
             <Route
               path="/settings"
               element={<SettingsPage theme={theme} setTheme={setTheme} />}
