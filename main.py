@@ -96,8 +96,10 @@ async def lifespan(app: FastAPI):
     load_all()
     load_providers()
     from application.workflow_adapters import register_builtin_workflow_components
+    from features.kakao_pipeline.orchestration_adapter import register_kakao_workflow_components
     from application.workflows import sync_registered_workflow_definitions
     register_builtin_workflow_components()
+    register_kakao_workflow_components()
     sync_registered_workflow_definitions()
     print("[OK] 数据库初始化完成")
     from core.registry import list_platforms
