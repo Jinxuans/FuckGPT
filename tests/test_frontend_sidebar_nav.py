@@ -14,7 +14,7 @@ def _nav_items_block() -> str:
 def test_sidebar_top_level_nav_keeps_public_entries():
     block = _nav_items_block()
 
-    assert block.count("path:") == 6
+    assert block.count("path:") == 7
     assert 'path: "/"' in block
     assert 'labelKey: "nav.dashboard"' in block
     assert 'path: "/accounts/chatgpt"' in block

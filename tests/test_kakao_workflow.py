@@ -1,0 +1,259 @@
+from __future__ import annotations
+
+from typing import Any
+
+from application.workflow_adapters import register_builtin_workflow_components
+from application.workflow_registry import list_step_adapters, registered_workflow_definitions
+from domain.workflows import STEP_NEEDS_ATTENTION, STEP_SUCCEEDED, STEP_WAITING_EXTERNAL
+from features.kakao_pipeline.orchestration_adapter import (
+    KakaoUpgradeAdapter,
+    register_kakao_workflow_components,
+)
+
+
+class _FakeKakaoService:
+    def __init__(
+        self,
+        pipeline: dict[str, Any] | None = None,
+        *,
+        start_result: dict[str, Any] | None = None,
+        submit_result: dict[str, Any] | None = None,
+        advance_result: dict[str, Any] | None = None,
+        check_result: dict[str, Any] | None = None,
+        already_plus: bool = False,
+    ) -> None:
+        self.pipeline = pipeline
+        self.start_result = start_result
+        self.submit_result = submit_result
+        self.advance_result = advance_result
+        self.check_result = check_result
+        self.already_plus = already_plus
+        self.start_calls: list[dict[str, Any]] = []
+        self.submit_calls: list[dict[str, Any]] = []
+        self.advance_calls: list[int] = []
+        self.check_calls: list[dict[str, Any]] = []
+
+    def get_account_pipeline(self, account_id: int) -> dict[str, Any]:
+        if self.pipeline is None:
+            raise ValueError("账号还没有 Kakao 操作记录")
+        return {**self.pipeline, "account_id": account_id}
+
+    def _account_is_plus(self, account_id: int) -> bool:
+        return self.already_plus
+
+    def start_extraction(
+        self,
+        account_id: int,
+        supplier_setting_id: int | None = None,
+        payment_method: str = "kakao_pay",
+    ) -> dict[str, Any]:
+        self.start_calls.append(
+            {
+                "account_id": account_id,
+                "supplier_setting_id": supplier_setting_id,
+                "payment_method": payment_method,
+            }
+        )
+        self.pipeline = self.start_result or {
+            "account_id": account_id,
+            "state": "supplier_processing",
+            "supplier_status": "PENDING",
+        }
+        return self.pipeline
+
+    def submit_scanner(
+        self,
+        account_id: int,
+        scanner_setting_id: int | None = None,
+        scanner_kind: str = "",
+    ) -> dict[str, Any]:
+        self.submit_calls.append(
+            {
+                "account_id": account_id,
+                "scanner_setting_id": scanner_setting_id,
+                "scanner_kind": scanner_kind,
+            }
+        )
+        self.pipeline = self.submit_result or {
+            "account_id": account_id,
+            "state": "scanner_processing",
+            "scanner_status": "PENDING",
+            "scanner_order_id": "scanner-1",
+        }
+        return self.pipeline
+
+    def advance_background(self, account_id: int) -> dict[str, Any]:
+        self.advance_calls.append(account_id)
+        return self.advance_result or self.get_account_pipeline(account_id)
+
+    def check_plus(self, account_id: int, *, advance_pipeline: bool = False) -> dict[str, Any]:
+        self.check_calls.append({"account_id": account_id, "advance_pipeline": advance_pipeline})
+        self.pipeline = self.check_result or self.get_account_pipeline(account_id)
+        return self.pipeline
+
+
+def test_kakao_adapter_succeeds_when_pipeline_is_completed_plus():
+    adapter = KakaoUpgradeAdapter(
+        _FakeKakaoService(
+            {
+                "account_id": 7,
+                "state": "completed",
+                "plus_status": "plus",
+                "final_result": "plus",
+                "completion_source": "normal_scanner",
+            }
+        )
+    )
+
+    transition = adapter.start(inputs={"account_id": 7}, idempotency_key="wf_kakao", attempt=1)
+
+    assert transition.status == STEP_SUCCEEDED
+    assert transition.output["account_id"] == 7
+    assert transition.output["completion_source"] == "normal_scanner"
+
+
+def test_kakao_adapter_starts_missing_pipeline_and_waits():
+    service = _FakeKakaoService(
+        None,
+        start_result={
+            "account_id": 8,
+            "state": "supplier_processing",
+            "supplier_status": "PENDING",
+            "supplier_order_id": "supplier-1",
+        },
+    )
+    adapter = KakaoUpgradeAdapter(service)
+
+    transition = adapter.start(
+        inputs={"account_id": 8, "supplier_setting_id": 12, "payment_method": "kakao_pay"},
+        idempotency_key="wf_kakao",
+        attempt=1,
+    )
+
+    assert transition.status == STEP_WAITING_EXTERNAL
+    assert transition.external_ref == "kakao:8"
+    assert service.start_calls == [
+        {"account_id": 8, "supplier_setting_id": 12, "payment_method": "kakao_pay"}
+    ]
+
+
+def test_kakao_adapter_does_not_restart_existing_active_pipeline():
+    service = _FakeKakaoService(
+        {
+            "account_id": 9,
+            "state": "scanner_processing",
+            "scanner_status": "PENDING",
+            "scanner_order_id": "scanner-1",
+        }
+    )
+    adapter = KakaoUpgradeAdapter(service)
+
+    transition = adapter.start(inputs={"account_id": 9}, idempotency_key="wf_kakao", attempt=1)
+
+    assert transition.status == STEP_WAITING_EXTERNAL
+    assert transition.output["scanner_order_id"] == "scanner-1"
+    assert service.start_calls == []
+    assert service.submit_calls == []
+
+
+def test_kakao_adapter_auto_submits_scanner_when_link_is_ready():
+    service = _FakeKakaoService(
+        {
+            "account_id": 10,
+            "state": "link_ready",
+            "payment_url": "https://pay.nicepay.co.kr/v1/checkout/pay/link",
+        },
+        submit_result={
+            "account_id": 10,
+            "state": "scanner_processing",
+            "scanner_driver": "payment_submission",
+            "scanner_status": "PENDING",
+            "scanner_order_id": "submission-1",
+            "scanner_submit_attempts": 1,
+        },
+    )
+    adapter = KakaoUpgradeAdapter(service)
+
+    transition = adapter.start(
+        inputs={
+            "account_id": 10,
+            "scanner_setting_id": 3,
+            "scanner_kind": "scanner_546789",
+            "auto_submit_scanner": True,
+        },
+        idempotency_key="wf_kakao",
+        attempt=1,
+    )
+
+    assert transition.status == STEP_WAITING_EXTERNAL
+    assert transition.output["scanner_order_id"] == "submission-1"
+    assert service.submit_calls == [
+        {"account_id": 10, "scanner_setting_id": 3, "scanner_kind": "scanner_546789"}
+    ]
+
+
+def test_kakao_adapter_pauses_for_untracked_plus_confirmation_timeout():
+    adapter = KakaoUpgradeAdapter(
+        _FakeKakaoService(
+            {
+                "account_id": 11,
+                "state": "scanner_recovery_unconfirmed",
+                "scanner_status": "DUPLICATE_ACCEPTED",
+                "last_error_code": "untracked_plus_unconfirmed",
+                "last_error_message": "上游已接收链接，但 30 分钟内尚未确认 Plus",
+            }
+        )
+    )
+
+    transition = adapter.start(inputs={"account_id": 11}, idempotency_key="wf_kakao", attempt=1)
+
+    assert transition.status == STEP_NEEDS_ATTENTION
+    assert transition.error["code"] == "untracked_plus_unconfirmed"
+    assert "30 分钟" in transition.error["message"]
+
+
+def test_kakao_adapter_manual_retry_checks_paused_plus_state():
+    service = _FakeKakaoService(
+        {
+            "account_id": 12,
+            "state": "plus_unconfirmed",
+            "last_error_code": "plus_unconfirmed",
+        },
+        check_result={
+            "account_id": 12,
+            "state": "completed",
+            "plus_status": "plus",
+            "final_result": "plus",
+            "completion_source": "normal_scanner",
+        },
+    )
+    adapter = KakaoUpgradeAdapter(service)
+
+    transition = adapter.start(inputs={"account_id": 12}, idempotency_key="wf_kakao", attempt=2)
+
+    assert transition.status == STEP_SUCCEEDED
+    assert service.check_calls == [{"account_id": 12, "advance_pipeline": True}]
+
+
+def test_kakao_workflow_components_register_adapter_and_template():
+    register_builtin_workflow_components()
+    register_kakao_workflow_components()
+
+    definitions = registered_workflow_definitions()
+    kakao_definition = next(item for item in definitions if item["key"] == "register_kakao_codex_push")
+
+    assert "kakao.upgrade" in list_step_adapters()
+    assert [step["id"] for step in kakao_definition["steps"]] == ["register", "kakao", "codex", "push"]
+    assert kakao_definition["steps"][1]["needs"] == ["register"]
+    assert kakao_definition["steps"][2]["needs"] == ["kakao"]
+    assert kakao_definition["sample_input"]["kakao"]["auto_submit_scanner"] is True
+
+
+def test_kakao_workflow_template_is_visible_from_api(client):
+    response = client.get("/api/workflows/definitions")
+
+    assert response.status_code == 200
+    definitions = response.json()["items"]
+    kakao_definition = next(item for item in definitions if item["key"] == "register_kakao_codex_push")
+    assert kakao_definition["name"] == "注册 → Kakao 升级 → Codex 授权 → 推送"
+    assert kakao_definition["definition"]["sample_input"]["kakao"]["auto_submit_scanner"] is True
