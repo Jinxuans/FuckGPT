@@ -20,6 +20,7 @@ const STATUS_VARIANT: Record<string, any> = {
   subscribed: 'success',
   expired: 'warning',
   invalid: 'danger',
+  deactivated: 'danger',
   free: 'secondary',
   eligible: 'secondary',
   unknown: 'secondary',

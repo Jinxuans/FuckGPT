@@ -242,7 +242,9 @@ def build_account_display_summary(
     sections.extend(generic_sections)
 
     warnings: list[dict[str, Any]] = []
-    if validity_status == "invalid" or lifecycle_status == "invalid":
+    if validity_status == "deactivated" or lifecycle_status == "deactivated":
+        warnings.append({"key": "deactivated", "tone": "danger", "message": "账号已被 OpenAI 停用/封号"})
+    elif validity_status == "invalid" or lifecycle_status == "invalid":
         warnings.append({"key": "invalid", "tone": "danger", "message": "账号当前检测为失效"})
     if validity_status == "unknown":
         warnings.append({"key": "unknown_validity", "tone": "warning", "message": "尚未完成有效性检测"})
@@ -385,7 +387,9 @@ def build_account_view_display(
     warnings: list[dict[str, Any]] = []
     lifecycle = _text(status.get("lifecycle"))
     validity = _text(status.get("validity"))
-    if validity == "invalid" or lifecycle == "invalid":
+    if validity == "deactivated" or lifecycle == "deactivated":
+        warnings.append({"key": "deactivated", "tone": "danger", "message": "账号已被 OpenAI 停用/封号"})
+    elif validity == "invalid" or lifecycle == "invalid":
         warnings.append({"key": "invalid", "tone": "danger", "message": "账号当前检测为失效"})
     elif validity == "unknown":
         warnings.append({"key": "unknown_validity", "tone": "warning", "message": "尚未完成有效性检测"})

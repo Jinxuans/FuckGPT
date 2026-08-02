@@ -201,6 +201,15 @@ def test_codex_oauth_batch_concurrency_is_capped():
     assert tasks_module._codex_oauth_batch_concurrency(5, 2) == 2
 
 
+def test_relogin_batch_concurrency_is_capped():
+    assert tasks_module._relogin_batch_concurrency(1, 10) == 1
+    assert tasks_module._relogin_batch_concurrency(3, 10) == 3
+    assert tasks_module._relogin_batch_concurrency(10, 30) == 10
+    assert tasks_module._relogin_batch_concurrency(20, 30) == 10
+    assert tasks_module._relogin_batch_concurrency(99, 30) == 10
+    assert tasks_module._relogin_batch_concurrency(5, 2) == 2
+
+
 def test_register_task_enables_hotmail007_prefetch(monkeypatch):
     events = []
 

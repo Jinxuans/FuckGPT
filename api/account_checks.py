@@ -19,6 +19,10 @@ class AccountCheckAllRequest(BaseModel):
     filters: dict = Field(default_factory=dict)
     platform_proxy_mode: str = ""
     platform_proxy_value: str = ""
+    concurrency: int = 0
+    request_timeout_seconds: int = 0
+    relogin_invalid: bool = False
+    relogin_params: dict = Field(default_factory=dict)
 
 
 @router.post("/check-all")
@@ -42,4 +46,8 @@ def check_all_accounts(body: AccountCheckAllRequest | None = None, platform: str
         ),
         platform_proxy_mode=body.platform_proxy_mode,
         platform_proxy_value=body.platform_proxy_value,
+        concurrency=body.concurrency,
+        request_timeout_seconds=body.request_timeout_seconds,
+        relogin_invalid=body.relogin_invalid,
+        relogin_params=body.relogin_params,
     )

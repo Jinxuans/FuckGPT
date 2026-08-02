@@ -14,6 +14,8 @@ from platforms.chatgpt.protocol_register import (
     _SentinelBrowserRuntime,
 )
 from platforms.chatgpt.browser_register import (
+    ABOUT_YOU_SUBMIT_SELECTORS,
+    ABOUT_YOU_SUBMIT_TEXTS,
     ChatGPTBrowserRegister,
     ExistingAccountAuthenticationError,
     OTP_SUBMIT_SELECTORS,
@@ -22,11 +24,13 @@ from platforms.chatgpt.browser_register import (
     _browser_registration_flow,
     _check_required_about_you_consents,
     _click_first,
+    _click_visible_button_by_text,
     _click_otp_submit_button,
     _collect_visible_text_inputs,
     _extract_auth_error_text,
     _derive_registration_state_from_page,
     _infer_about_you_mode,
+    _is_account_deactivated_error,
     _is_login_password_url,
     _pick_best_about_you_input,
     _press_enter_on_input,
@@ -34,6 +38,7 @@ from platforms.chatgpt.browser_register import (
     _start_browser_signup_via_authorize,
     _submit_password_via_page,
     _submit_otp_via_page,
+    _wait_for_about_you_submit_progress,
 )
 
 
@@ -779,6 +784,40 @@ def test_extract_auth_error_text_recognizes_japanese_expired_code():
     assert _extract_auth_error_text(Page()) == "コードの有効期限が切れ"
 
 
+def test_extract_auth_error_text_recognizes_account_deactivated_page():
+    class Target:
+        def __init__(self, text=""):
+            self.text = text
+
+        @property
+        def first(self):
+            return self
+
+        def text_content(self, **kwargs):
+            return self.text
+
+        def inner_text(self, **kwargs):
+            return self.text
+
+    class Page:
+        def locator(self, selector):
+            if selector == "body":
+                return Target(
+                    "認証エラー\n"
+                    "アカウントは削除または無効化されているため、ご利用いただけません。\n"
+                    "誤りと思われる場合は、help.openai.comのへルプセンタ一からお問い合わせください。\n"
+                    "error_code: account_deactivated\n"
+                    "request_id: req_test"
+                )
+            return Target("")
+
+    error_text = _extract_auth_error_text(Page())
+    assert _is_account_deactivated_error(error_text)
+    assert "account_deactivated" in error_text
+    assert "認証エラー" in error_text
+    assert "アカウントは削除または無効化されているため、ご利用いただけません" in error_text
+
+
 def test_click_otp_submit_button_skips_hidden_submit():
     clicks = []
 
@@ -816,6 +855,41 @@ def test_click_otp_submit_button_skips_hidden_submit():
 
     assert selector == 'button[type="submit"] nth=1'
     assert clicks == [3000]
+
+
+def test_click_otp_submit_button_does_not_use_unbounded_locator_count():
+    class Button:
+        def is_visible(self, **kwargs):
+            return True
+
+        def is_enabled(self, **kwargs):
+            return True
+
+        def evaluate(self, script):
+            return "BUTTON|||continue|Continue"
+
+        def click(self, **kwargs):
+            return None
+
+    class Locator:
+        def __init__(self, available):
+            self.available = available
+
+        def count(self):
+            raise AssertionError("locator.count() must not be called")
+
+        def nth(self, index):
+            if not self.available or index:
+                raise IndexError(index)
+            return Button()
+
+    class Page:
+        def locator(self, selector):
+            return Locator(selector == 'button[data-testid="continue-button"]')
+
+    selector = _click_otp_submit_button(Page(), lambda message: None, timeout=1)
+
+    assert selector == 'button[data-testid="continue-button"]'
 
 
 def test_click_otp_submit_button_skips_oauth_provider_submit():
@@ -892,6 +966,8 @@ def test_click_otp_submit_button_uses_keyboard_when_pointer_click_is_intercepted
             return 1 if self.available else 0
 
         def nth(self, index):
+            if not self.available or index:
+                raise IndexError(index)
             return Button(self.page)
 
     class Page:
@@ -946,6 +1022,8 @@ def test_click_otp_submit_button_uses_real_mouse_after_confirmed_hit_test(monkey
             return 1 if self.available else 0
 
         def nth(self, index):
+            if not self.available or index:
+                raise IndexError(index)
             return Button(self.page)
 
     class Mouse:
@@ -1006,6 +1084,8 @@ def test_click_otp_submit_button_treats_timeout_then_navigation_as_progress(monk
             return 1 if self.available else 0
 
         def nth(self, index):
+            if not self.available or index:
+                raise IndexError(index)
             return Button(self.page)
 
     class Page:
@@ -1020,6 +1100,151 @@ def test_click_otp_submit_button_treats_timeout_then_navigation_as_progress(monk
     selector = _click_otp_submit_button(Page(), lambda message: None, timeout=1)
 
     assert selector == 'button[type="submit"] nth=0 delayed'
+
+
+def test_about_you_submit_selectors_support_japanese_continue_button():
+    clicks = []
+
+    class Button:
+        def is_visible(self, **kwargs):
+            return True
+
+        def is_enabled(self, **kwargs):
+            return True
+
+        def click(self, **kwargs):
+            clicks.append(True)
+
+    class Locator:
+        def __init__(self, available):
+            self.available = available
+
+        def count(self):
+            return 1 if self.available else 0
+
+        def nth(self, index):
+            if not self.available or index:
+                raise IndexError(index)
+            return Button()
+
+    class Page:
+        def locator(self, selector):
+            return Locator(selector == 'button:has-text("続ける")')
+
+    selector = _click_first(Page(), ABOUT_YOU_SUBMIT_SELECTORS, timeout=1)
+
+    assert selector == 'button:has-text("続ける")'
+    assert clicks == [True]
+
+
+def test_about_you_submit_dom_text_fallback_clicks_japanese_continue_button():
+    calls = []
+
+    class Page:
+        def evaluate(self, _script, texts):
+            assert "続行" in texts
+            calls.append(list(texts))
+            return "続行"
+
+    selector = _click_visible_button_by_text(Page(), ABOUT_YOU_SUBMIT_TEXTS, timeout=1)
+
+    assert selector == 'text="続行"'
+    assert calls
+
+
+def test_click_first_does_not_use_locator_count():
+    clicks = []
+
+    class Button:
+        def is_visible(self, **kwargs):
+            return True
+
+        def is_enabled(self, **kwargs):
+            return True
+
+        def click(self, **kwargs):
+            clicks.append(True)
+
+    class Locator:
+        def count(self):
+            raise AssertionError("count must not be used on dynamic auth pages")
+
+        def nth(self, index):
+            if index:
+                raise IndexError(index)
+            return Button()
+
+    class Page:
+        def locator(self, selector):
+            return Locator()
+
+    selector = _click_first(Page(), ["button[type='submit']"], timeout=1)
+
+    assert selector == "button[type='submit']"
+    assert clicks == [True]
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://auth.openai.com/create-account/password",
+        "https://auth.openai.com/log-in/password",
+    ],
+)
+def test_otp_submit_progress_recognizes_password_pages(url):
+    from platforms.chatgpt.browser_register import _otp_submit_progress_url
+
+    assert _otp_submit_progress_url(url) is True
+
+
+def test_about_you_submit_progress_rejects_unchanged_about_you_url(monkeypatch):
+    now = {"value": 1000.0}
+
+    class Page:
+        url = "https://auth.openai.com/about-you"
+
+    monkeypatch.setattr("platforms.chatgpt.browser_register.time.time", lambda: now["value"])
+    monkeypatch.setattr(
+        "platforms.chatgpt.browser_register.time.sleep",
+        lambda seconds: now.__setitem__("value", now["value"] + seconds),
+    )
+
+    assert (
+        _wait_for_about_you_submit_progress(
+            Page(),
+            start_url="https://auth.openai.com/about-you",
+            timeout=1,
+        )
+        is False
+    )
+
+
+def test_about_you_submit_progress_accepts_changed_chatgpt_url(monkeypatch):
+    now = {"value": 1000.0}
+
+    class Page:
+        @property
+        def url(self):
+            return (
+                "https://auth.openai.com/about-you"
+                if now["value"] < 1000.5
+                else "https://chatgpt.com/"
+            )
+
+    monkeypatch.setattr("platforms.chatgpt.browser_register.time.time", lambda: now["value"])
+    monkeypatch.setattr(
+        "platforms.chatgpt.browser_register.time.sleep",
+        lambda seconds: now.__setitem__("value", now["value"] + seconds),
+    )
+
+    assert (
+        _wait_for_about_you_submit_progress(
+            Page(),
+            start_url="https://auth.openai.com/about-you",
+            timeout=1,
+        )
+        is True
+    )
 
 
 def test_submit_otp_keyboard_refill_after_dom_fallback_enables_submit(monkeypatch):
@@ -1137,6 +1362,159 @@ def test_submit_otp_keyboard_refill_after_dom_fallback_enables_submit(monkeypatc
     assert result["status"] == 200
     assert any("DOM fallback 后提交按钮不可点击" in item for item in logs)
     assert any("键盘 fallback 重新填写输入框" in item for item in logs)
+
+
+def test_submit_otp_accepts_single_input_auto_submit_without_clicking_button(monkeypatch):
+    logs = []
+
+    class EmptyLocator:
+        def count(self):
+            return 0
+
+    class Input:
+        def __init__(self, page):
+            self.page = page
+            self.value = ""
+
+        @property
+        def first(self):
+            return self
+
+        def wait_for(self, **kwargs):
+            return None
+
+        def click(self, **kwargs):
+            return None
+
+        def press(self, key, **kwargs):
+            if key == "Backspace":
+                self.value = ""
+
+        def fill(self, value):
+            self.value = value
+
+        def type(self, value, **kwargs):
+            self.value += value
+            self.page.url = "https://auth.openai.com/about-you"
+
+        def input_value(self):
+            return self.value
+
+    class Candidate:
+        def __init__(self, target):
+            self.target = target
+
+        @property
+        def first(self):
+            return self.target
+
+    class Page:
+        def __init__(self):
+            self.url = "https://auth.openai.com/email-verification"
+            self.input = Input(self)
+
+        def wait_for_load_state(self, **kwargs):
+            return None
+
+        def locator(self, selector):
+            return EmptyLocator()
+
+        def get_by_label(self, *args, **kwargs):
+            return Candidate(self.input)
+
+        def get_by_role(self, *args, **kwargs):
+            return Candidate(self.input)
+
+    def fail_click(*args, **kwargs):
+        raise AssertionError("auto-submit flow must not search for a Continue button")
+
+    monkeypatch.setattr("platforms.chatgpt.browser_register.time.sleep", lambda seconds: None)
+    monkeypatch.setattr("platforms.chatgpt.browser_register._click_otp_submit_button", fail_click)
+
+    result = _submit_otp_via_page(Page(), "112450", logs.append)
+
+    assert result["ok"] is True
+    assert result["url"] == "https://auth.openai.com/about-you"
+    assert any("页面已自动提交" in item for item in logs)
+
+
+def test_submit_otp_presses_enter_on_existing_input_before_button_scan(monkeypatch):
+    logs = []
+
+    class EmptyLocator:
+        def count(self):
+            return 0
+
+    class Input:
+        def __init__(self, page):
+            self.page = page
+            self.value = ""
+
+        @property
+        def first(self):
+            return self
+
+        def wait_for(self, **kwargs):
+            return None
+
+        def click(self, **kwargs):
+            return None
+
+        def press(self, key, **kwargs):
+            if key == "Backspace":
+                self.value = ""
+            if key == "Enter":
+                self.page.url = "https://auth.openai.com/create-account/password"
+
+        def fill(self, value):
+            self.value = value
+
+        def type(self, value, **kwargs):
+            self.value += value
+
+        def input_value(self):
+            return self.value
+
+    class Candidate:
+        def __init__(self, target):
+            self.target = target
+
+        @property
+        def first(self):
+            return self.target
+
+    class Page:
+        def __init__(self):
+            self.url = "https://auth.openai.com/email-verification"
+            self.input = Input(self)
+
+        def wait_for_load_state(self, **kwargs):
+            return None
+
+        def locator(self, selector):
+            return EmptyLocator()
+
+        def get_by_label(self, *args, **kwargs):
+            return Candidate(self.input)
+
+        def get_by_role(self, *args, **kwargs):
+            return Candidate(self.input)
+
+    def progressed(page, *, start_url, timeout):
+        return page.url != start_url
+
+    def fail_click(*args, **kwargs):
+        raise AssertionError("existing OTP input should submit before button scan")
+
+    monkeypatch.setattr("platforms.chatgpt.browser_register.time.sleep", lambda seconds: None)
+    monkeypatch.setattr("platforms.chatgpt.browser_register._wait_for_otp_submit_progress", progressed)
+    monkeypatch.setattr("platforms.chatgpt.browser_register._click_otp_submit_button", fail_click)
+
+    result = _submit_otp_via_page(Page(), "112450", logs.append)
+
+    assert result["ok"] is True
+    assert result["url"] == "https://auth.openai.com/create-account/password"
+    assert any("按 Enter 后页面已推进" in item for item in logs)
 
 
 def test_protocol_register_completes_email_flow_without_browser():

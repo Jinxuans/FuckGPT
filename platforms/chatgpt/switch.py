@@ -370,7 +370,7 @@ def fetch_chatgpt_account_state(
             account.extra = {"chatgpt_account_id": chatgpt_account_id}
             details = fetch_subscription_status_details(account, proxy=proxy)
             status = details.get("status")
-            state["valid"] = status not in ("expired", "invalid", "banned", None)
+            state["valid"] = status not in ("expired", "invalid", "banned", "deactivated", None)
             state["subscription_status"] = status
             state["subscription_source"] = details.get("source")
             profile = details.get("me")

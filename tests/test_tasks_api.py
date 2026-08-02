@@ -3,6 +3,7 @@ from application.tasks import (
     TASK_STATUS_PENDING,
     TASK_TYPE_ACCOUNT_CHECK_ALL,
     TASK_TYPE_REGISTER,
+    TaskLogger,
     append_task_event,
     create_task,
 )
@@ -68,6 +69,7 @@ def test_task_events_support_latest_tail_and_older_page(client):
         payload={"count": 1},
         progress_total=1,
     )
+    TaskLogger(task["id"]).finish(TASK_STATUS_FAILED, error="test fixture")
     for index in range(5):
         append_task_event(task["id"], f"log {index + 1}")
 
