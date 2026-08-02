@@ -74,7 +74,7 @@ def build_otp_callback(
         code = mailbox.wait_for_code(mail_acct, **kwargs)
         _raise_if_cancelled(ctx.platform)
         if code:
-            ctx.log(f"{success_label}: {code}")
+            ctx.log(f"{success_label}已获取")
         return code
 
     def refresh_before_ids():

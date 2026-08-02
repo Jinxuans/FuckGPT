@@ -4,6 +4,8 @@ import json
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
+import pytest
+
 from core.base_mailbox import MAILBOX_FACTORY_REGISTRY, MailboxAccount
 from core.hotmail007_mailbox import Hotmail007Mailbox, parse_hotmail007_account
 from infrastructure.provider_definitions_repository import ProviderDefinitionsRepository
@@ -266,7 +268,42 @@ def test_hotmail007_wait_for_code_reads_latest_mail_from_inbox():
     }
     assert any("开始等待验证码：user@outlook.com" in item for item in logs)
     assert any("正在取件：user@outlook.com / inbox" in item for item in logs)
-    assert any("获取验证码成功：user@outlook.com，验证码 654321" in item for item in logs)
+    assert any("获取验证码成功：user@outlook.com" in item for item in logs)
+    assert not any("654321" in item for item in logs)
+    assert not any("client-key" in item or "refresh-token" in item or "mail-pass" in item for item in logs)
+
+
+def test_hotmail007_wait_for_code_fails_fast_when_mail_authentication_is_invalid():
+    logs = []
+    session = FakeSession(
+        [
+            {"code": 27006, "success": False, "message": "Mail authentication failed", "data": {}},
+            {"code": 27006, "success": False, "message": "Mail authentication failed", "data": {}},
+        ]
+    )
+    mailbox = Hotmail007Mailbox(
+        client_key="client-key",
+        product_id="11",
+        session=session,
+        log_fn=logs.append,
+    )
+    mail_account = MailboxAccount(
+        email="expired@outlook.com",
+        account_id="expired@outlook.com",
+        extra={
+            "provider_account": {
+                "credentials": {
+                    "api_account": "expired@outlook.com:mail-pass:refresh-token:client-id",
+                }
+            }
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="邮箱认证失败"):
+        mailbox.wait_for_code(mail_account, timeout=120)
+
+    assert len(session.calls) == 2
+    assert any("邮箱认证已失效，停止等待验证码" in item for item in logs)
     assert not any("client-key" in item or "refresh-token" in item or "mail-pass" in item for item in logs)
 
 

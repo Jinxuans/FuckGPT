@@ -289,7 +289,7 @@ class RemoteMailbox(BaseMailbox):
                         continue
                     code = self._extract_code(content, code_pattern)
                     if code:
-                        self._log(f"{self.provider_key} 收到验证码: {code}")
+                        self._log(f"{self.provider_key} 收到验证码")
                         return code
             except Exception as exc:  # transient mailbox errors are retried until timeout
                 self.raise_if_cancelled()
