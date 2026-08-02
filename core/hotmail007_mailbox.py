@@ -29,6 +29,10 @@ from core.base_mailbox import BaseMailbox, MailboxAccount, _extract_verification
 
 DEFAULT_BASE_URL = "https://hotmail007.com/api"
 DEFAULT_FOLDERS = ("inbox", "junkemail")
+PERMANENT_MAILBOX_ERROR_MARKERS = (
+    "code=27006",
+    "mail authentication failed",
+)
 
 
 class Hotmail007BuyError(RuntimeError):
@@ -79,6 +83,11 @@ def _split_product_ids(value: object) -> tuple[str, ...]:
         if product_id and product_id not in product_ids:
             product_ids.append(product_id)
     return tuple(product_ids)
+
+
+def _is_permanent_mailbox_error(error: object) -> bool:
+    value = str(error or "").strip().lower()
+    return bool(value) and any(marker in value for marker in PERMANENT_MAILBOX_ERROR_MARKERS)
 
 
 @dataclass(frozen=True)
@@ -641,15 +650,24 @@ class Hotmail007Mailbox(BaseMailbox):
                         code_pattern=code_pattern or DEFAULT_CODE_PATTERN,
                     )
                     if code:
-                        self._log(f"Hotmail007 获取验证码成功：{account.email}，验证码 {code}")
+                        self._log(f"Hotmail007 获取验证码成功：{account.email}")
                         return code
             except Exception as exc:  # noqa: BLE001
                 last_error = str(exc).strip() or exc.__class__.__name__
                 if log_attempt:
                     self._log(f"Hotmail007 第 {attempt} 次取验证码未成功：{last_error}")
+                if _is_permanent_mailbox_error(last_error):
+                    self._log(f"Hotmail007 邮箱认证已失效，停止等待验证码：{account.email}")
+                    raise RuntimeError(f"Hotmail007 邮箱认证失败: {last_error}") from exc
+                remaining = deadline - time.monotonic()
+                if remaining > 0:
+                    time.sleep(min(1.0, remaining))
                 continue
             if log_attempt:
                 self._log(f"Hotmail007 第 {attempt} 次取验证码未发现新验证码")
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                time.sleep(min(1.0, remaining))
         self._log(f"Hotmail007 等待验证码超时：{account.email}，最后错误：{last_error or 'none'}")
         suffix = f"，最后错误: {last_error}" if last_error else ""
         raise TimeoutError(f"等待 Hotmail007 验证码超时 ({timeout}s){suffix}")
@@ -669,6 +687,7 @@ class Hotmail007Mailbox(BaseMailbox):
         attempt = 0
         self._log(f"Hotmail007 开始等待验证链接：{account.email}，文件夹={','.join(self.folders)}")
         while time.monotonic() < deadline:
+            self.raise_if_cancelled()
             attempt += 1
             log_attempt = attempt <= 3 or attempt % 25 == 0
             try:
@@ -685,9 +704,18 @@ class Hotmail007Mailbox(BaseMailbox):
                 last_error = str(exc).strip() or exc.__class__.__name__
                 if log_attempt:
                     self._log(f"Hotmail007 第 {attempt} 次取验证链接未成功：{last_error}")
+                if _is_permanent_mailbox_error(last_error):
+                    self._log(f"Hotmail007 邮箱认证已失效，停止等待验证链接：{account.email}")
+                    raise RuntimeError(f"Hotmail007 邮箱认证失败: {last_error}") from exc
+                remaining = deadline - time.monotonic()
+                if remaining > 0:
+                    time.sleep(min(1.0, remaining))
                 continue
             if log_attempt:
                 self._log(f"Hotmail007 第 {attempt} 次取验证链接未发现新链接")
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                time.sleep(min(1.0, remaining))
         self._log(f"Hotmail007 等待验证链接超时：{account.email}，最后错误：{last_error or 'none'}")
         suffix = f"，最后错误: {last_error}" if last_error else ""
         raise TimeoutError(f"等待 Hotmail007 验证链接超时 ({timeout}s){suffix}")

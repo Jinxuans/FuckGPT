@@ -369,7 +369,7 @@ class SMSBowerClient(BaseSmsProvider):
         raw = self._request("getStatus", {"id": activation_id})
         status = self._status_from_text(raw)
         if status.code:
-            self._log(f"SMSBower 收到验证码：activationId={activation_id}, code={status.code}")
+            self._log(f"SMSBower 收到验证码：activationId={activation_id}")
         return status
 
     def set_status(self, activation_id: str, status: int | str) -> str:
@@ -394,7 +394,7 @@ class SMSBowerClient(BaseSmsProvider):
         interval = self.poll_interval if poll_interval is None else poll_interval
         self._log(f"SMSBower 开始等待短信验证码：activationId={activation_id}")
         code = super().wait_for_code(activation_id, timeout=timeout, poll_interval=interval)
-        self._log(f"SMSBower 等待验证码完成：activationId={activation_id}, code={code}")
+        self._log(f"SMSBower 等待验证码完成：activationId={activation_id}")
         return code
 
     def get_prices(self, service: str = "", country: str = "") -> str:

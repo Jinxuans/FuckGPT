@@ -89,6 +89,14 @@ type MailboxPayload = {
   paths?: Record<string, string>;
 };
 
+type MailboxRegistrationOptions = {
+  executorType: "headless" | "headed";
+  proxyMode: "direct" | "proxy_service" | "manual";
+  proxyValue: string;
+};
+
+const MAILBOX_REGISTER_OPTIONS_KEY = "fuckgpt.mailbox-register-options";
+
 const statusOptions = [
   { value: "all", label: "全部状态" },
   { value: "available", label: "空闲" },
@@ -265,6 +273,113 @@ function ActionMenu({
         </div>,
         document.body,
       )}
+    </div>
+  );
+}
+
+function MailboxRegisterConfigModal({
+  resources,
+  onStart,
+  onClose,
+}: {
+  resources: MailboxResource[];
+  onStart: (options: MailboxRegistrationOptions) => Promise<void>;
+  onClose: () => void;
+}) {
+  const [options, setOptions] = useState<MailboxRegistrationOptions>(() => {
+    if (typeof window !== "undefined") {
+      try {
+        const saved = JSON.parse(window.localStorage.getItem(MAILBOX_REGISTER_OPTIONS_KEY) || "{}");
+        return {
+          executorType: saved.executorType === "headed" ? "headed" : "headless",
+          proxyMode: ["direct", "proxy_service", "manual"].includes(saved.proxyMode) ? saved.proxyMode : "direct",
+          proxyValue: String(saved.proxyValue || ""),
+        };
+      } catch {
+        // Ignore invalid legacy browser storage and fall back to safe defaults.
+      }
+    }
+    return { executorType: "headless", proxyMode: "direct", proxyValue: "" };
+  });
+  const [starting, setStarting] = useState(false);
+  const [error, setError] = useState("");
+
+  const start = async () => {
+    const proxyValue = options.proxyValue.trim();
+    if (options.proxyMode === "manual" && !proxyValue) {
+      setError("手动代理模式需要填写代理 URL");
+      return;
+    }
+    setStarting(true);
+    setError("");
+    const normalized = { ...options, proxyValue };
+    try {
+      window.localStorage.setItem(MAILBOX_REGISTER_OPTIONS_KEY, JSON.stringify(normalized));
+      await onStart(normalized);
+    } catch (exc: any) {
+      setError(exc?.message || "创建注册任务失败");
+    } finally {
+      setStarting(false);
+    }
+  };
+
+  return (
+    <div className="dialog-backdrop" onClick={starting ? undefined : onClose}>
+      <div className="dialog-panel dialog-panel-md" onClick={(event) => event.stopPropagation()}>
+        <div className="flex items-start justify-between gap-4 border-b border-[var(--border)] px-6 py-5">
+          <div className="min-w-0">
+            <h2 className="text-lg font-semibold text-[var(--text-primary)]">配置固定邮箱注册</h2>
+            <p className="mt-1 text-xs text-[var(--text-muted)]">
+              将为 {resources.length} 个空闲邮箱分别创建注册任务
+            </p>
+          </div>
+          <button disabled={starting} onClick={onClose} className="rounded-full border border-[var(--border)] bg-[var(--bg-hover)] p-2 text-[var(--text-muted)] hover:text-[var(--text-primary)] disabled:opacity-40">
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+        <div className="space-y-4 px-6 py-5">
+          <div>
+            <label className="mb-1 block text-xs text-[var(--text-muted)]">执行方式</label>
+            <select
+              value={options.executorType}
+              onChange={(event) => setOptions((current) => ({ ...current, executorType: event.target.value as MailboxRegistrationOptions["executorType"] }))}
+              className="control-surface control-surface-compact appearance-none"
+            >
+              <option value="headless">后台浏览器自动</option>
+              <option value="headed">可视浏览器自动</option>
+            </select>
+          </div>
+          <div>
+            <label className="mb-1 block text-xs text-[var(--text-muted)]">ChatGPT/Codex 代理</label>
+            <select
+              value={options.proxyMode}
+              onChange={(event) => setOptions((current) => ({ ...current, proxyMode: event.target.value as MailboxRegistrationOptions["proxyMode"] }))}
+              className="control-surface control-surface-compact appearance-none"
+            >
+              <option value="direct">直连</option>
+              <option value="proxy_service">使用代理服务</option>
+              <option value="manual">手动填写</option>
+            </select>
+            {options.proxyMode === "manual" ? (
+              <input
+                value={options.proxyValue}
+                onChange={(event) => setOptions((current) => ({ ...current, proxyValue: event.target.value }))}
+                placeholder="http://127.0.0.1:7897"
+                spellCheck={false}
+                className="control-surface control-surface-compact mt-2 w-full font-mono text-xs"
+              />
+            ) : null}
+          </div>
+          <div className="max-h-28 overflow-y-auto rounded-lg border border-[var(--border)] bg-[var(--bg-hover)]/40 px-3 py-2 text-xs text-[var(--text-secondary)]">
+            {resources.map((resource) => <div key={resource.id} className="truncate">{resource.address}</div>)}
+          </div>
+          {error ? <div className="rounded-lg border border-red-500/20 bg-red-500/10 px-3 py-2 text-sm text-red-400">{error}</div> : null}
+        </div>
+        <div className="flex justify-end gap-2 border-t border-[var(--border)] px-6 py-4">
+          <Button variant="outline" onClick={onClose} disabled={starting}>取消</Button>
+          <Button onClick={start} disabled={starting}>{starting ? "创建中" : "开始注册"}</Button>
+        </div>
+      </div>
     </div>
   );
 }
@@ -517,6 +632,7 @@ export default function MailboxResources() {
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [detail, setDetail] = useState<MailboxResource | null>(null);
   const [mailDialog, setMailDialog] = useState<{ resource: MailboxResource; messages: MailMessage[]; loading: boolean; error: string } | null>(null);
+  const [registerCandidates, setRegisterCandidates] = useState<MailboxResource[]>([]);
   const [registerTask, setRegisterTask] = useState<{ resource: MailboxResource; taskId: string; status: string | null } | null>(null);
   const [loading, setLoading] = useState(false);
   const [bulkAction, setBulkAction] = useState("");
@@ -651,22 +767,23 @@ export default function MailboxResources() {
     if (resource.status === "bound" || resource.status === "registered" || resource.chatgpt_account_id) {
       throw new Error("该邮箱已注册或已绑定账号");
     }
-    if (!confirm(`使用 ${resource.address} 注册 ChatGPT？`)) return;
-    const data = await createRegisterTask(resource);
-    if (data?.task_id) {
-      setRegisterTask({ resource, taskId: data.task_id, status: null });
-    }
+    setRegisterCandidates([resource]);
   };
 
-  const createRegisterTask = async (resource: MailboxResource) => {
+  const createRegisterTask = async (resource: MailboxResource, options: MailboxRegistrationOptions) => {
     return apiFetch("/tasks/register", {
       method: "POST",
       body: JSON.stringify({
         email: resource.address,
         count: 1,
         concurrency: 1,
-        executor_type: "headless",
+        executor_type: options.executorType,
         captcha_solver: "auto",
+        proxy: options.proxyMode === "manual" ? options.proxyValue : null,
+        platform_proxy_mode: options.proxyMode,
+        platform_proxy_value: options.proxyValue,
+        mailbox_proxy_mode: "direct",
+        mailbox_proxy_value: "",
         extra: {
           identity_provider: "mailbox",
           mail_provider: resource.provider,
@@ -675,6 +792,25 @@ export default function MailboxResources() {
         },
       }),
     });
+  };
+
+  const startRegisterTasks = async (options: MailboxRegistrationOptions) => {
+    const candidates = [...registerCandidates];
+    if (candidates.length === 0) return;
+    const results = await Promise.allSettled(candidates.map((item) => createRegisterTask(item, options)));
+    const taskIds = results
+      .filter((item): item is PromiseFulfilledResult<any> => item.status === "fulfilled")
+      .map((item) => String(item.value?.task_id || ""))
+      .filter(Boolean);
+    const firstTask = taskIds[0];
+    if (!firstTask) {
+      const firstError = results.find((item): item is PromiseRejectedResult => item.status === "rejected");
+      throw firstError?.reason || new Error("注册任务创建失败");
+    }
+    setRegisterCandidates([]);
+    setRegisterTask({ resource: candidates[0], taskId: firstTask, status: null });
+    setNotice(`已创建 ${taskIds.length}/${candidates.length} 个注册任务`);
+    setSelectedIds(new Set());
   };
 
   const runBulkAction = async (action: string) => {
@@ -692,16 +828,7 @@ export default function MailboxResources() {
       if (action === "register") {
         const candidates = items.filter((item) => item.status === "available" && !item.chatgpt_account_id);
         if (candidates.length === 0) throw new Error("选中项里没有可注册邮箱");
-        if (!confirm(`使用 ${candidates.length} 个选中邮箱创建注册任务？`)) return;
-        const results = await Promise.allSettled(candidates.map(createRegisterTask));
-        const taskIds = results
-          .filter((item): item is PromiseFulfilledResult<any> => item.status === "fulfilled")
-          .map((item) => String(item.value?.task_id || ""))
-          .filter(Boolean);
-        const firstTask = taskIds[0];
-        if (firstTask) setRegisterTask({ resource: candidates[0], taskId: firstTask, status: null });
-        setNotice(`已创建 ${taskIds.length}/${candidates.length} 个注册任务`);
-        setSelectedIds(new Set());
+        setRegisterCandidates(candidates);
         return;
       }
       if (action === "release") {
@@ -949,6 +1076,14 @@ export default function MailboxResources() {
           error={mailDialog.error}
           onRefresh={() => fetchMessages(mailDialog.resource)}
           onClose={() => setMailDialog(null)}
+        />
+      ) : null}
+
+      {registerCandidates.length > 0 ? (
+        <MailboxRegisterConfigModal
+          resources={registerCandidates}
+          onStart={startRegisterTasks}
+          onClose={() => setRegisterCandidates([])}
         />
       ) : null}
 
