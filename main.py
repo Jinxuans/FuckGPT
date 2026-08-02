@@ -83,6 +83,7 @@ from api.provider_settings import router as provider_settings_router
 from api.system import router as system_router
 from api.task_commands import router as task_commands_router
 from api.tasks import router as tasks_router
+from api.workflows import router as workflows_router
 from core.db import init_db
 from core.registry import load_all
 from providers.registry import load_all as load_providers
@@ -93,6 +94,10 @@ async def lifespan(app: FastAPI):
     init_db()
     load_all()
     load_providers()
+    from application.workflow_adapters import register_builtin_workflow_components
+    from application.workflows import sync_registered_workflow_definitions
+    register_builtin_workflow_components()
+    sync_registered_workflow_definitions()
     print("[OK] 数据库初始化完成")
     from core.registry import list_platforms
     print(f"[OK] 已加载平台: {[p['name'] for p in list_platforms()]}")
@@ -100,6 +105,8 @@ async def lifespan(app: FastAPI):
     scheduler.start()
     from services.task_runtime import task_runtime
     task_runtime.start()
+    from services.workflow_runtime import workflow_runtime
+    workflow_runtime.start()
     from core.lifecycle import lifecycle_manager
     lifecycle_manager.start()
     yield
@@ -107,6 +114,8 @@ async def lifespan(app: FastAPI):
     _lifecycle_manager.stop()
     from core.scheduler import scheduler as _scheduler
     _scheduler.stop()
+    from services.workflow_runtime import workflow_runtime as _workflow_runtime
+    _workflow_runtime.stop()
     from services.task_runtime import task_runtime as _task_runtime
     _task_runtime.stop()
     from services.solver_manager import stop
@@ -136,6 +145,7 @@ app.include_router(provider_settings_router, prefix="/api")
 app.include_router(tasks_router, prefix="/api")
 app.include_router(task_commands_router, prefix="/api")
 app.include_router(system_router, prefix="/api")
+app.include_router(workflows_router, prefix="/api")
 
 
 _static_dir = os.path.join(os.path.dirname(__file__), "static")
