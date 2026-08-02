@@ -31,8 +31,19 @@ export async function apiFetch(path: string, opts?: RequestInit) {
     window.location.reload()
     throw new Error('Unauthorized')
   }
-  if (!res.ok) throw new Error(await res.text())
-  return res.json()
+  const text = await res.text()
+  if (!res.ok) throw new Error(text || `HTTP ${res.status}`)
+  if (!text) return null
+  const contentType = res.headers.get('Content-Type') || ''
+  const looksLikeHtml = /^\s*<!doctype html/i.test(text) || /^\s*<html/i.test(text)
+  if (!contentType.includes('application/json') || looksLikeHtml) {
+    throw new Error('接口返回了前端页面而不是 JSON，请确认后端已启动并已重启到当前代码。')
+  }
+  try {
+    return JSON.parse(text)
+  } catch {
+    throw new Error('接口返回内容不是合法 JSON，请检查后端响应。')
+  }
 }
 
 export async function apiDownload(path: string, opts?: RequestInit) {
