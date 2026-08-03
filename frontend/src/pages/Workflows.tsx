@@ -1954,62 +1954,75 @@ export default function Workflows() {
             </div>
 
             <div className="glass-table-wrap">
-              <table className="w-full min-w-[760px] text-sm">
+              <table className="w-full table-fixed text-sm">
                 <thead>
                   <tr className="border-b border-[var(--border)] text-[var(--text-muted)]">
-                    <th className="px-3 py-2 text-left">{t('workflows.run')}</th>
-                    <th className="px-3 py-2 text-left">{t('common.status')}</th>
-                    <th className="px-3 py-2 text-left">{t('workflows.currentStep')}</th>
-                    <th className="px-3 py-2 text-left">{t('common.date')}</th>
-                    <th className="px-3 py-2 text-right">{t('common.actions')}</th>
+                    <th className="w-[58%] px-3 py-2 text-left">{t('workflows.run')}</th>
+                    <th className="w-[18%] px-3 py-2 text-left">{t('common.status')}</th>
+                    <th className="w-[24%] px-3 py-2 text-right">{t('common.actions')}</th>
                   </tr>
                 </thead>
                 <tbody>
                   {runs.map((run) => (
                     <tr
                       key={run.id}
+                      tabIndex={0}
+                      aria-label={`${t('workflows.viewRun')}: ${run.name || run.definition_key}`}
                       className={cn(
-                        'border-b border-[var(--border-soft)] hover:bg-[var(--bg-hover)]',
+                        'cursor-pointer border-b border-[var(--border-soft)] outline-none hover:bg-[var(--bg-hover)] focus-visible:bg-[var(--bg-hover)] focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-[var(--accent-strong)]',
                         selectedRunId === run.id && 'bg-[var(--accent-soft)]',
                       )}
+                      onClick={() => setSelectedRunId(run.id)}
+                      onKeyDown={(event) => {
+                        if (event.target !== event.currentTarget) return
+                        if (event.key === 'Enter' || event.key === ' ') {
+                          event.preventDefault()
+                          setSelectedRunId(run.id)
+                        }
+                      }}
                     >
                       <td className="px-3 py-3 align-top">
-                        <button
-                          className="max-w-[280px] truncate text-left text-sm font-medium text-[var(--text-primary)] hover:text-[var(--accent-strong)]"
-                          onClick={() => setSelectedRunId(run.id)}
-                        >
+                        <div className="truncate text-sm font-medium text-[var(--text-primary)]">
                           {run.name || run.definition_key}
-                        </button>
-                        <div className="mt-1 max-w-[280px] truncate font-mono text-xs text-[var(--text-muted)]">
+                        </div>
+                        <div className="mt-1 truncate font-mono text-xs text-[var(--text-muted)]">
                           {run.id}
                         </div>
-                        {run.batch_id && (
-                          <div className="mt-1 text-xs text-[var(--text-muted)]">
-                            {t('workflows.batchItem')}: #{run.batch_item_index || 0}
-                          </div>
-                        )}
+                        <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-xs text-[var(--text-muted)]">
+                          <span className="truncate">
+                            {t('workflows.currentStep')}: {run.current_step_id || '-'}
+                          </span>
+                          <span>{formatMaybeDate(run.created_at, language)}</span>
+                          {run.batch_id && (
+                            <span>{t('workflows.batchItem')}: #{run.batch_item_index || 0}</span>
+                          )}
+                        </div>
                       </td>
                       <td className="px-3 py-3 align-top">
                         <Badge variant={WORKFLOW_STATUS_VARIANTS[run.status] || 'secondary'}>
                           {getWorkflowStatusText(run.status, language)}
                         </Badge>
                       </td>
-                      <td className="px-3 py-3 align-top text-[var(--text-secondary)]">
-                        {run.current_step_id || '-'}
-                      </td>
-                      <td className="px-3 py-3 align-top text-xs text-[var(--text-muted)]">
-                        {formatMaybeDate(run.created_at, language)}
-                      </td>
                       <td className="px-3 py-3 align-top">
-                        <div className="flex justify-end gap-2">
-                          <Button variant="outline" size="sm" onClick={() => setSelectedRunId(run.id)}>
+                        <div className="flex flex-wrap justify-end gap-2">
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            onClick={(event) => {
+                              event.stopPropagation()
+                              setSelectedRunId(run.id)
+                            }}
+                          >
                             {t('workflows.viewRun')}
                           </Button>
                           {CANCELLABLE_WORKFLOW_STATUSES.has(run.status) && (
                             <Button
                               variant="outline"
                               size="sm"
-                              onClick={() => cancelRun(run.id)}
+                              onClick={(event) => {
+                                event.stopPropagation()
+                                cancelRun(run.id)
+                              }}
                               disabled={actionId === run.id}
                               className="text-amber-500 hover:text-amber-400"
                             >
