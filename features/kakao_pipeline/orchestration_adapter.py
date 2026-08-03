@@ -339,6 +339,8 @@ def register_kakao_workflow_components() -> None:
                     "count": 1,
                     "concurrency": 1,
                     "executor_type": "headless",
+                    "platform_proxy_mode": "direct",
+                    "platform_proxy_value": "",
                     "extra": {
                         "identity_provider": "mailbox",
                     },
@@ -353,11 +355,105 @@ def register_kakao_workflow_components() -> None:
                 "codex": {
                     "browser_mode": "headless",
                     "keep_browser_open": "false",
+                    "platform_proxy_mode": "direct",
+                    "platform_proxy_value": "",
                 },
                 "push": {
                     "target_key": "nvtokens",
                     "payload_format": "codex",
                 },
+            },
+            "ui_schema": {
+                "sections": [
+                    {
+                        "title": "注册",
+                        "fields": [
+                            {"path": "registration.count", "label": "注册数量", "type": "number", "min": 1, "max": 200},
+                            {"path": "registration.concurrency", "label": "注册并发", "type": "number", "min": 1, "max": 20},
+                            {
+                                "path": "registration.executor_type",
+                                "label": "注册执行器",
+                                "type": "select",
+                                "options": [
+                                    {"label": "无头模式", "value": "headless"},
+                                    {"label": "可视模式", "value": "headed"},
+                                ],
+                            },
+                            {
+                                "path": "registration.platform_proxy_mode",
+                                "label": "注册代理模式",
+                                "type": "select",
+                                "options": [
+                                    {"label": "直连", "value": "direct"},
+                                    {"label": "手动代理", "value": "manual"},
+                                    {"label": "代理服务", "value": "proxy_service"},
+                                ],
+                            },
+                            {
+                                "path": "registration.platform_proxy_value",
+                                "label": "注册手动代理",
+                                "type": "text",
+                                "placeholder": "http://user:pass@host:port",
+                            },
+                        ],
+                    },
+                    {
+                        "title": "Kakao",
+                        "fields": [
+                            {"path": "kakao.payment_method", "label": "支付方式", "type": "text", "placeholder": "kakao_pay"},
+                            {"path": "kakao.supplier_setting_id", "label": "提链供应商 ID", "type": "number", "min": 0},
+                            {"path": "kakao.scanner_setting_id", "label": "扫码供应商 ID", "type": "number", "min": 0},
+                            {"path": "kakao.scanner_kind", "label": "扫码供应商类型", "type": "text", "placeholder": "scanner_546789"},
+                            {"path": "kakao.auto_submit_scanner", "label": "自动上传扫码", "type": "boolean"},
+                        ],
+                    },
+                    {
+                        "title": "Codex",
+                        "fields": [
+                            {
+                                "path": "codex.browser_mode",
+                                "label": "浏览器模式",
+                                "type": "select",
+                                "options": [
+                                    {"label": "无头模式", "value": "headless"},
+                                    {"label": "可视模式", "value": "headed"},
+                                ],
+                            },
+                            {"path": "codex.keep_browser_open", "label": "保持浏览器打开", "type": "boolean"},
+                            {
+                                "path": "codex.platform_proxy_mode",
+                                "label": "Codex 代理模式",
+                                "type": "select",
+                                "options": [
+                                    {"label": "直连", "value": "direct"},
+                                    {"label": "手动代理", "value": "manual"},
+                                    {"label": "代理服务", "value": "proxy_service"},
+                                ],
+                            },
+                            {
+                                "path": "codex.platform_proxy_value",
+                                "label": "Codex 手动代理",
+                                "type": "text",
+                                "placeholder": "http://user:pass@host:port",
+                            },
+                        ],
+                    },
+                    {
+                        "title": "推送",
+                        "fields": [
+                            {"path": "push.target_key", "label": "推送目标", "type": "text", "placeholder": "nvtokens"},
+                            {
+                                "path": "push.payload_format",
+                                "label": "推送格式",
+                                "type": "select",
+                                "options": [
+                                    {"label": "Codex", "value": "codex"},
+                                    {"label": "账号", "value": "account"},
+                                ],
+                            },
+                        ],
+                    },
+                ],
             },
             "steps": [
                 {

@@ -100,6 +100,8 @@ const DEFAULT_REGISTER_KAKAO_CODEX_PUSH_INPUT = {
     count: 1,
     concurrency: 1,
     executor_type: 'headless',
+    platform_proxy_mode: 'direct',
+    platform_proxy_value: '',
     extra: {
       identity_provider: 'mailbox',
     },
@@ -114,6 +116,8 @@ const DEFAULT_REGISTER_KAKAO_CODEX_PUSH_INPUT = {
   codex: {
     browser_mode: 'headless',
     keep_browser_open: 'false',
+    platform_proxy_mode: 'direct',
+    platform_proxy_value: '',
   },
   push: {
     target_key: 'nvtokens',

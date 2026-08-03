@@ -305,6 +305,17 @@ def test_kakao_workflow_components_register_adapter_and_template():
     assert kakao_definition["steps"][1]["needs"] == ["register"]
     assert kakao_definition["steps"][2]["needs"] == ["kakao"]
     assert kakao_definition["sample_input"]["kakao"]["auto_submit_scanner"] is True
+    assert kakao_definition["sample_input"]["registration"]["platform_proxy_mode"] == "direct"
+    assert kakao_definition["sample_input"]["codex"]["platform_proxy_mode"] == "direct"
+    field_paths = {
+        field["path"]
+        for section in kakao_definition["ui_schema"]["sections"]
+        for field in section["fields"]
+    }
+    assert "registration.platform_proxy_mode" in field_paths
+    assert "registration.platform_proxy_value" in field_paths
+    assert "codex.platform_proxy_mode" in field_paths
+    assert "codex.platform_proxy_value" in field_paths
 
 
 def test_kakao_workflow_template_is_visible_from_api(client):
@@ -315,3 +326,5 @@ def test_kakao_workflow_template_is_visible_from_api(client):
     kakao_definition = next(item for item in definitions if item["key"] == "register_kakao_codex_push")
     assert kakao_definition["name"] == "注册 → Kakao 升级 → Codex 授权 → 推送"
     assert kakao_definition["definition"]["sample_input"]["kakao"]["auto_submit_scanner"] is True
+    assert kakao_definition["definition"]["sample_input"]["registration"]["platform_proxy_value"] == ""
+    assert kakao_definition["definition"]["sample_input"]["codex"]["platform_proxy_value"] == ""
