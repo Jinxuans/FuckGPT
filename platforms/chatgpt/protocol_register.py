@@ -268,8 +268,16 @@ class _SentinelBrowserRuntime:
         )
         if hook not in sdk_code:
             raise RuntimeError("Sentinel SDK 内部接口发生变化，无法生成 VM token")
+        sdk_declaration = "var SentinelSDK="
+        if sdk_declaration not in sdk_code:
+            raise RuntimeError("Sentinel SDK 全局声明发生变化，无法安装 VM token 运行时")
+        patched_sdk_code = sdk_code.replace(hook, replacement).replace(
+            sdk_declaration,
+            "window.SentinelSDK=",
+            1,
+        )
         self._page.evaluate(
-            "code => window.eval(code)", sdk_code.replace(hook, replacement)
+            "code => window.eval(code)", patched_sdk_code
         )
         if self._page.evaluate("typeof window.SentinelSDK") != "object":
             raise RuntimeError("Sentinel SDK 初始化失败")
