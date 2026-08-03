@@ -206,6 +206,7 @@ export type WorkflowRunSummary = {
   definition_key: string
   status: string
   terminal: boolean
+  batch_paused?: boolean
   account_id: number
   email: string
   current_stage: string
