@@ -113,14 +113,14 @@ function Sidebar({
   return (
     <aside
       className={cn(
-        "flex h-screen flex-col border-r border-[var(--border)] bg-[var(--bg-surface)] transition-[width] duration-200",
+        "flex h-screen flex-col border-r border-[var(--border)] bg-[var(--bg-surface)] transition-[width] duration-200 max-[720px]:h-auto max-[720px]:w-full max-[720px]:border-b max-[720px]:border-r-0 max-[720px]:transition-none",
         collapsed ? "w-16" : "w-[220px]",
       )}
     >
       {/* Header */}
       <div
         className={cn(
-          "flex h-12 shrink-0 items-center border-b border-[var(--border)] px-3",
+          "flex h-12 shrink-0 items-center border-b border-[var(--border)] px-3 max-[720px]:hidden",
           collapsed && "justify-center",
         )}
       >
@@ -142,7 +142,7 @@ function Sidebar({
       </div>
 
       {/* Nav */}
-      <nav className="flex-1 overflow-y-auto px-2 py-3 space-y-0.5">
+      <nav className="flex-1 overflow-y-auto px-2 py-3 space-y-0.5 max-[720px]:flex max-[720px]:flex-none max-[720px]:gap-1 max-[720px]:overflow-x-auto max-[720px]:overflow-y-hidden max-[720px]:py-2 max-[720px]:space-y-0">
         {NAV_ITEMS.map(({ path, labelKey, label: itemLabel, icon: Icon, exact }) => {
           const active = exact
             ? location.pathname === path
@@ -188,7 +188,7 @@ function Sidebar({
       </nav>
 
       {/* Footer */}
-      <div className="shrink-0 border-t border-[var(--border)] px-2 py-1.5 flex items-center gap-1">
+      <div className="shrink-0 border-t border-[var(--border)] px-2 py-1.5 flex items-center gap-1 max-[720px]:hidden">
         <button
           onClick={toggleTheme}
           className={cn(
@@ -267,7 +267,7 @@ function Shell({
   const contentWidthClass = getShellContentWidth(location.pathname);
 
   return (
-    <div className="flex h-screen overflow-hidden bg-[var(--bg-base)]">
+    <div className="flex h-screen overflow-hidden bg-[var(--bg-base)] max-[720px]:flex-col">
       <WelcomeDialog />
       <Sidebar
         theme={theme}
@@ -276,7 +276,7 @@ function Shell({
         setCollapsed={setCollapsed}
       />
       <main className="min-w-0 flex-1 overflow-y-auto">
-        <div className={cn("mx-auto px-6 py-6 lg:px-8", contentWidthClass)}>
+        <div className={cn("mx-auto px-6 py-6 max-[720px]:px-3 max-[720px]:py-4 lg:px-8", contentWidthClass)}>
           <UpdateBanner />
           <Routes>
             <Route path="/" element={<Dashboard />} />

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { type ReactNode, useCallback, useEffect, useMemo, useState } from 'react'
 import {
   AlertTriangle,
   CheckCircle2,
@@ -242,6 +242,91 @@ function summaryCount(summary: WorkflowBatchSummary['summary'] | WorkflowBatch['
   return Number((summary as Record<string, number>)[key] || 0)
 }
 
+function WorkflowPanel({
+  children,
+  className,
+}: {
+  children: ReactNode
+  className?: string
+}) {
+  return (
+    <section
+      className={cn(
+        'overflow-hidden rounded-xl border border-[var(--border)] bg-[var(--bg-card)] shadow-[var(--shadow-soft)]',
+        className,
+      )}
+    >
+      {children}
+    </section>
+  )
+}
+
+function WorkflowPanelHeader({
+  title,
+  description,
+  icon,
+  action,
+  className,
+}: {
+  title: ReactNode
+  description?: ReactNode
+  icon?: ReactNode
+  action?: ReactNode
+  className?: string
+}) {
+  return (
+    <div
+      className={cn(
+        'flex items-start justify-between gap-3 border-b border-[var(--border)] px-4 py-3',
+        className,
+      )}
+    >
+      <div className="min-w-0">
+        <div className="flex min-w-0 items-center gap-2">
+          {icon}
+          <h2 className="truncate text-sm font-semibold text-[var(--text-primary)]">
+            {title}
+          </h2>
+        </div>
+        {description && (
+          <p className="mt-1 max-w-[72ch] text-xs leading-5 text-[var(--text-muted)]">
+            {description}
+          </p>
+        )}
+      </div>
+      {action && <div className="shrink-0">{action}</div>}
+    </div>
+  )
+}
+
+function WorkflowStatChip({
+  label,
+  value,
+  tone = 'muted',
+  mono = false,
+}: {
+  label: string
+  value: ReactNode
+  tone?: 'muted' | 'accent' | 'warning'
+  mono?: boolean
+}) {
+  return (
+    <div className="inline-flex min-w-0 items-center gap-2 rounded-lg border border-[var(--border-soft)] bg-[var(--bg-pane)]/50 px-2.5 py-1.5 text-xs">
+      <span className="text-[var(--text-muted)]">{label}</span>
+      <span
+        className={cn(
+          'min-w-0 truncate font-medium text-[var(--text-primary)]',
+          mono && 'font-mono',
+          tone === 'accent' && 'text-[var(--accent-strong)]',
+          tone === 'warning' && 'text-amber-400',
+        )}
+      >
+        {value}
+      </span>
+    </div>
+  )
+}
+
 function WorkflowInputFields({
   sections,
   value,
@@ -252,78 +337,100 @@ function WorkflowInputFields({
   onChange: (path: string, nextValue: unknown) => void
 }) {
   if (sections.length === 0) return null
-  return (
-    <div className="space-y-3 rounded-md border border-[var(--border-soft)] bg-[var(--bg-pane)]/35 p-3">
-      {sections.map((section) => (
-        <div key={section.title} className="space-y-2">
-          <div>
-            <h3 className="text-xs font-semibold text-[var(--text-primary)]">{section.title}</h3>
-            {section.description && (
-              <p className="mt-0.5 text-xs text-[var(--text-muted)]">{section.description}</p>
-            )}
-          </div>
-          <div className="grid gap-2 sm:grid-cols-2">
-            {(section.fields || []).map((field) => {
-              const currentValue = getPathValue(value, field.path)
-              if (field.type === 'boolean') {
-                return (
-                  <label
-                    key={field.path}
-                    className="flex min-h-9 items-center gap-2 rounded-md border border-[var(--border-soft)] bg-[var(--bg-card)] px-3 py-2 text-sm text-[var(--text-secondary)]"
-                  >
-                    <input
-                      type="checkbox"
-                      checked={boolFromValue(currentValue)}
-                      onChange={(event) => {
-                        const checked = event.target.checked
-                        onChange(field.path, typeof currentValue === 'string' ? String(checked) : checked)
-                      }}
-                    />
-                    <span>{field.label}</span>
-                  </label>
-                )
+
+  const renderField = (field: WorkflowUiField) => {
+    const currentValue = getPathValue(value, field.path)
+    if (field.type === 'boolean') {
+      return (
+        <label
+          key={field.path}
+          className="flex min-h-9 items-start gap-2 rounded-lg border border-[var(--border-soft)] bg-[var(--bg-input)] px-3 py-2 text-sm text-[var(--text-secondary)] transition-colors hover:border-[var(--accent-edge)] hover:text-[var(--text-primary)]"
+        >
+          <input
+            className="checkbox-accent mt-0.5"
+            type="checkbox"
+            checked={boolFromValue(currentValue)}
+            onChange={(event) => {
+              const checked = event.target.checked
+              onChange(field.path, typeof currentValue === 'string' ? String(checked) : checked)
+            }}
+          />
+          <span>
+            <span className="block">{field.label}</span>
+            {field.helper && <span className="mt-0.5 block text-[11px] text-[var(--text-muted)]">{field.helper}</span>}
+          </span>
+        </label>
+      )
+    }
+    return (
+      <label key={field.path} className="block">
+        <span className="mb-1 block text-xs font-medium text-[var(--text-muted)]">
+          {field.label}
+        </span>
+        {field.type === 'select' ? (
+          <select
+            className="control-surface control-surface-compact"
+            value={String(currentValue ?? '')}
+            onChange={(event) => onChange(field.path, selectValueForField(field, event.target.value))}
+          >
+            {(field.options || []).map((option) => (
+              <option key={`${field.path}:${String(option.value)}`} value={String(option.value)}>
+                {option.label}
+              </option>
+            ))}
+          </select>
+        ) : (
+          <input
+            className="control-surface control-surface-compact"
+            type={field.type === 'number' ? 'number' : 'text'}
+            min={field.min}
+            max={field.max}
+            placeholder={field.placeholder || ''}
+            value={String(currentValue ?? '')}
+            onChange={(event) => {
+              if (field.type === 'number') {
+                onChange(field.path, event.target.value === '' ? null : Number(event.target.value))
+                return
               }
-              return (
-                <label key={field.path} className="block">
-                  <span className="mb-1 block text-xs font-medium text-[var(--text-muted)]">
-                    {field.label}
-                  </span>
-                  {field.type === 'select' ? (
-                    <select
-                      className="control-surface control-surface-compact"
-                      value={String(currentValue ?? '')}
-                      onChange={(event) => onChange(field.path, selectValueForField(field, event.target.value))}
-                    >
-                      {(field.options || []).map((option) => (
-                        <option key={`${field.path}:${String(option.value)}`} value={String(option.value)}>
-                          {option.label}
-                        </option>
-                      ))}
-                    </select>
-                  ) : (
-                    <input
-                      className="control-surface control-surface-compact"
-                      type={field.type === 'number' ? 'number' : 'text'}
-                      min={field.min}
-                      max={field.max}
-                      placeholder={field.placeholder || ''}
-                      value={String(currentValue ?? '')}
-                      onChange={(event) => {
-                        if (field.type === 'number') {
-                          onChange(field.path, Number(event.target.value || 0))
-                          return
-                        }
-                        onChange(field.path, event.target.value)
-                      }}
-                    />
-                  )}
-                  {field.helper && <span className="mt-1 block text-[11px] text-[var(--text-muted)]">{field.helper}</span>}
-                </label>
-              )
-            })}
-          </div>
-        </div>
-      ))}
+              onChange(field.path, event.target.value)
+            }}
+          />
+        )}
+        {field.helper && <span className="mt-1 block text-[11px] text-[var(--text-muted)]">{field.helper}</span>}
+      </label>
+    )
+  }
+
+  return (
+    <div className="overflow-hidden rounded-lg border border-[var(--border-soft)] bg-[var(--bg-pane)]/25">
+      {sections.map((section) => {
+        const fields = section.fields || []
+        const primaryFields = fields.filter((field) => !field.advanced)
+        const advancedFields = fields.filter((field) => field.advanced)
+        return (
+          <div key={section.title} className="space-y-3 border-b border-[var(--border-soft)] p-3 last:border-b-0">
+            <div>
+              <h3 className="text-xs font-semibold text-[var(--text-primary)]">{section.title}</h3>
+              {section.description && (
+                <p className="mt-1 max-w-[65ch] text-xs leading-5 text-[var(--text-muted)]">{section.description}</p>
+              )}
+            </div>
+            <div className="grid gap-3 sm:grid-cols-2">
+              {primaryFields.map(renderField)}
+            </div>
+            {advancedFields.length > 0 && (
+              <details className="rounded-lg border border-dashed border-[var(--border-soft)] bg-[var(--bg-input)] px-3 py-2">
+                <summary className="cursor-pointer select-none text-xs font-medium text-[var(--text-secondary)]">
+                  高级设置（通常无需配置）
+                </summary>
+                 <div className="mt-3 grid gap-3 sm:grid-cols-2">
+                   {advancedFields.map(renderField)}
+                 </div>
+               </details>
+             )}
+           </div>
+        )
+      })}
     </div>
   )
 }
@@ -1320,63 +1427,43 @@ export default function Workflows() {
 
   return (
     <div className="space-y-4">
-      <div className="flex flex-wrap items-center justify-between gap-3">
-        <div>
-          <h1 className="text-xl font-semibold text-[var(--text-primary)]">
-            {t('workflows.title')}
-          </h1>
-          <p className="mt-1 text-sm text-[var(--text-muted)]">
-            {t('workflows.subtitle')}
-          </p>
+      <div className="rounded-xl border border-[var(--border)] bg-[var(--bg-card)] px-4 py-3 shadow-[var(--shadow-soft)]">
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div className="min-w-0">
+            <h1 className="text-xl font-semibold text-[var(--text-primary)]">
+              {t('workflows.title')}
+            </h1>
+            <p className="mt-1 text-sm text-[var(--text-muted)]">
+              {t('workflows.subtitle')}
+            </p>
+          </div>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => {
+              loadRuns()
+              loadBatches()
+              loadBatchSummary()
+              loadSelectedRun()
+            }}
+            disabled={loading}
+          >
+            <RefreshCw className={cn('mr-1.5 h-4 w-4', loading && 'animate-spin')} />
+            {t('common.refresh')}
+          </Button>
         </div>
-        <Button
-          variant="outline"
-          size="sm"
-          onClick={() => {
-            loadRuns()
-            loadBatches()
-            loadBatchSummary()
-            loadSelectedRun()
-          }}
-          disabled={loading}
-        >
-          <RefreshCw className={cn('mr-1.5 h-4 w-4', loading && 'animate-spin')} />
-          {t('common.refresh')}
-        </Button>
-      </div>
-
-      <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
-        <div className="rounded-lg border border-[var(--border-soft)] bg-[var(--bg-pane)]/45 px-3 py-3">
-          <p className="text-[11px] font-medium text-[var(--text-muted)]">
-            {t('workflows.metric.definitions')}
-          </p>
-          <p className="mt-1 text-xl font-semibold text-[var(--text-primary)]">
-            {definitions.length}
-          </p>
-        </div>
-        <div className="rounded-lg border border-[var(--border-soft)] bg-[var(--bg-pane)]/45 px-3 py-3">
-          <p className="text-[11px] font-medium text-[var(--text-muted)]">
-            {t('workflows.metric.running')}
-          </p>
-          <p className="mt-1 text-xl font-semibold text-[var(--text-primary)]">
-            {running}
-          </p>
-        </div>
-        <div className="rounded-lg border border-[var(--border-soft)] bg-[var(--bg-pane)]/45 px-3 py-3">
-          <p className="text-[11px] font-medium text-[var(--text-muted)]">
-            {t('workflows.metric.batches')}
-          </p>
-          <p className="mt-1 text-xl font-semibold text-[var(--text-primary)]">
-            {batchTotal}
-          </p>
-        </div>
-        <div className="rounded-lg border border-[var(--border-soft)] bg-[var(--bg-pane)]/45 px-3 py-3">
-          <p className="text-[11px] font-medium text-[var(--text-muted)]">
-            {t('workflows.metric.selected')}
-          </p>
-          <p className="mt-1 truncate text-sm font-medium text-[var(--text-primary)]">
-            {selectedDefinition?.name || '-'}
-          </p>
+        <div className="mt-3 flex flex-wrap gap-2">
+          <WorkflowStatChip label={t('workflows.metric.definitions')} value={definitions.length} />
+          <WorkflowStatChip
+            label={t('workflows.metric.running')}
+            value={running}
+            tone={running > 0 ? 'accent' : 'muted'}
+          />
+          <WorkflowStatChip label={t('workflows.metric.batches')} value={batchTotal} />
+          <WorkflowStatChip
+            label={t('workflows.metric.selected')}
+            value={selectedDefinition?.name || '-'}
+          />
         </div>
       </div>
 
@@ -1386,14 +1473,14 @@ export default function Workflows() {
         </div>
       )}
 
-      <div className="grid gap-4 xl:grid-cols-[minmax(440px,0.9fr)_minmax(560px,1.1fr)]">
-        <section className="space-y-4">
-          <div className="rounded-lg border border-[var(--border)] bg-[var(--bg-card)]">
-            <div className="border-b border-[var(--border)] px-3 py-3">
-              <h2 className="text-sm font-semibold text-[var(--text-primary)]">
-                {t('workflows.startTitle')}
-              </h2>
-            </div>
+      <div className="grid gap-4 2xl:grid-cols-[420px_minmax(0,1fr)]">
+        <div className="space-y-4 2xl:sticky 2xl:top-4 2xl:max-h-[calc(100vh-2rem)] 2xl:self-start 2xl:overflow-auto">
+          <WorkflowPanel>
+            <WorkflowPanelHeader
+              title={t('workflows.startTitle')}
+              description="选择模板、套用配置，确认后启动单次或批量任务。"
+              icon={<Play className="h-4 w-4 text-[var(--accent-strong)]" />}
+            />
             <div className="space-y-3 p-3">
               <label className="block">
                 <span className="mb-1.5 block text-xs font-medium text-[var(--text-muted)]">
@@ -1546,8 +1633,8 @@ export default function Workflows() {
                 </div>
               )}
 
-              <details open className="rounded-md border border-[var(--border-soft)] bg-[var(--bg-pane)]/20">
-                <summary className="cursor-pointer px-3 py-2 text-xs font-medium text-[var(--text-accent)]">
+              <details className="rounded-lg border border-[var(--border-soft)] bg-[var(--bg-pane)]/20">
+                <summary className="cursor-pointer px-3 py-2 text-xs font-medium text-[var(--text-secondary)] hover:text-[var(--text-primary)]">
                   {t('workflows.advancedJson')}
                 </summary>
                 <div className="border-t border-[var(--border-soft)] p-3">
@@ -1576,12 +1663,13 @@ export default function Workflows() {
                 </Button>
               </div>
             </div>
-          </div>
+          </WorkflowPanel>
 
-          <div className="rounded-lg border border-[var(--border)] bg-[var(--bg-card)]">
+          <WorkflowPanel>
             <details>
-              <summary className="cursor-pointer border-b border-[var(--border)] px-3 py-3 text-sm font-semibold text-[var(--text-primary)]">
+              <summary className="cursor-pointer border-b border-[var(--border)] px-4 py-3 text-sm font-semibold text-[var(--text-primary)]">
                 {t('workflows.templateEditor')}
+                <span className="ml-2 text-xs font-normal text-[var(--text-muted)]">仅维护模板时打开</span>
               </summary>
               <div className="space-y-3 p-3">
                 <p className="text-xs leading-5 text-[var(--text-muted)]">
@@ -1614,8 +1702,8 @@ export default function Workflows() {
                   setError={setTemplateError}
                   t={t}
                 />
-                <details open className="rounded-md border border-[var(--border-soft)] bg-[var(--bg-pane)]/20">
-                  <summary className="cursor-pointer px-3 py-2 text-xs font-medium text-[var(--text-accent)]">
+                <details className="rounded-md border border-[var(--border-soft)] bg-[var(--bg-pane)]/20">
+                  <summary className="cursor-pointer px-3 py-2 text-xs font-medium text-[var(--text-secondary)] hover:text-[var(--text-primary)]">
                     {t('workflows.advancedJson')}
                   </summary>
                   <div className="border-t border-[var(--border-soft)] p-3">
@@ -1645,16 +1733,24 @@ export default function Workflows() {
                 </div>
               </div>
             </details>
-          </div>
+          </WorkflowPanel>
+        </div>
 
-          <div className="rounded-lg border border-[var(--border)] bg-[var(--bg-card)]">
-            <div className="border-b border-[var(--border)] px-3 py-3">
+        <div className="grid gap-4 xl:grid-cols-[minmax(420px,0.95fr)_minmax(480px,1.05fr)]">
+          <div className="space-y-4">
+          <WorkflowPanel>
+            <div className="border-b border-[var(--border)] px-4 py-3">
               <div className="flex flex-wrap items-center justify-between gap-2">
-                <div className="flex items-center gap-2">
-                  <Layers3 className="h-4 w-4 text-[var(--text-muted)]" />
-                  <h2 className="text-sm font-semibold text-[var(--text-primary)]">
-                    {t('workflows.batches')}
-                  </h2>
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2">
+                    <Layers3 className="h-4 w-4 text-[var(--text-muted)]" />
+                    <h2 className="text-sm font-semibold text-[var(--text-primary)]">
+                      {t('workflows.batches')}
+                    </h2>
+                  </div>
+                  <p className="mt-1 text-xs text-[var(--text-muted)]">
+                    最近创建的批量任务，选中后会过滤下方运行记录。
+                  </p>
                 </div>
                 {selectedBatchId && (
                   <div className="flex flex-wrap justify-end gap-2">
@@ -1719,7 +1815,7 @@ export default function Workflows() {
                 )}
               </div>
               {activeBatchSummary && (
-                <div className="mt-2 grid grid-cols-2 gap-2 text-xs sm:grid-cols-3 xl:grid-cols-6">
+                <div className="mt-3 grid grid-cols-2 gap-2 text-xs sm:grid-cols-3 xl:grid-cols-6">
                   <div className="rounded-md bg-[var(--bg-pane)] px-2 py-1 text-[var(--text-muted)]">
                     {t('common.total')}: {summaryCount(activeBatchSummary, 'total')}
                   </div>
@@ -1774,44 +1870,54 @@ export default function Workflows() {
                 </button>
               ))}
             </div>
-          </div>
+          </WorkflowPanel>
 
-          <div className="rounded-lg border border-[var(--border)] bg-[var(--bg-card)]">
-            <div className="flex flex-wrap items-center gap-2 border-b border-[var(--border)] px-3 py-3">
-              <select
-                className="control-surface control-surface-compact w-auto min-w-40"
-                value={definitionFilter}
-                onChange={(event) => {
-                  setDefinitionFilter(event.target.value)
-                  setOffset(0)
-                }}
-              >
-                <option value="">{t('workflows.allDefinitions')}</option>
-                {definitions.map((definition) => (
-                  <option key={`${definition.key}:filter`} value={definition.key}>
-                    {definition.name}
-                  </option>
-                ))}
-              </select>
-              <select
-                className="control-surface control-surface-compact w-auto min-w-40"
-                value={status}
-                onChange={(event) => {
-                  setStatus(event.target.value)
-                  setOffset(0)
-                }}
-              >
-                {STATUS_OPTIONS.map((value) => (
-                  <option key={value || 'all'} value={value}>
-                    {value ? getWorkflowStatusText(value, language) : t('workflows.allStatuses')}
-                  </option>
-                ))}
-              </select>
-              {(status || definitionFilter || selectedBatchId) && (
-                <Button variant="ghost" size="sm" onClick={resetFilters}>
-                  {t('common.clear')}
-                </Button>
-              )}
+          <WorkflowPanel>
+            <div className="border-b border-[var(--border)] px-4 py-3">
+              <div className="flex flex-wrap items-start justify-between gap-3">
+                <div className="min-w-0">
+                  <h2 className="text-sm font-semibold text-[var(--text-primary)]">运行记录</h2>
+                  <p className="mt-1 text-xs text-[var(--text-muted)]">
+                    {selectedBatchId ? '当前只显示选中批次下的运行。' : '按模板和状态筛选最近的工作流运行。'}
+                  </p>
+                </div>
+                <div className="flex flex-wrap items-center justify-end gap-2">
+                  <select
+                    className="control-surface control-surface-compact w-auto min-w-40"
+                    value={definitionFilter}
+                    onChange={(event) => {
+                      setDefinitionFilter(event.target.value)
+                      setOffset(0)
+                    }}
+                  >
+                    <option value="">{t('workflows.allDefinitions')}</option>
+                    {definitions.map((definition) => (
+                      <option key={`${definition.key}:filter`} value={definition.key}>
+                        {definition.name}
+                      </option>
+                    ))}
+                  </select>
+                  <select
+                    className="control-surface control-surface-compact w-auto min-w-40"
+                    value={status}
+                    onChange={(event) => {
+                      setStatus(event.target.value)
+                      setOffset(0)
+                    }}
+                  >
+                    {STATUS_OPTIONS.map((value) => (
+                      <option key={value || 'all'} value={value}>
+                        {value ? getWorkflowStatusText(value, language) : t('workflows.allStatuses')}
+                      </option>
+                    ))}
+                  </select>
+                  {(status || definitionFilter || selectedBatchId) && (
+                    <Button variant="ghost" size="sm" onClick={resetFilters}>
+                      {t('common.clear')}
+                    </Button>
+                  )}
+                </div>
+              </div>
             </div>
 
             <div className="glass-table-wrap">
@@ -1912,11 +2018,11 @@ export default function Workflows() {
                 </Button>
               </div>
             </div>
+          </WorkflowPanel>
           </div>
-        </section>
 
-        <section className="rounded-lg border border-[var(--border)] bg-[var(--bg-card)]">
-          <div className="flex items-center justify-between gap-3 border-b border-[var(--border)] px-3 py-3">
+          <WorkflowPanel className="xl:sticky xl:top-4 xl:max-h-[calc(100vh-2rem)] xl:overflow-auto">
+          <div className="flex items-center justify-between gap-3 border-b border-[var(--border)] px-4 py-3">
             <div className="min-w-0">
               <h2 className="truncate text-sm font-semibold text-[var(--text-primary)]">
                 {selectedRun?.name || t('workflows.runDetail')}
@@ -2214,7 +2320,8 @@ export default function Workflows() {
               </div>
             </div>
           )}
-        </section>
+          </WorkflowPanel>
+        </div>
       </div>
     </div>
   )

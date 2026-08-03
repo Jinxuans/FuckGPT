@@ -28,6 +28,7 @@ export type WorkflowUiField = {
   path: string
   label: string
   type?: 'text' | 'number' | 'select' | 'boolean'
+  advanced?: boolean
   options?: WorkflowUiOption[]
   placeholder?: string
   helper?: string
