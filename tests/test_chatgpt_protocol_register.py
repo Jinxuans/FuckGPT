@@ -1616,14 +1616,17 @@ def test_sentinel_headers_include_vm_and_session_observer_tokens():
 
 def test_sentinel_runtime_uses_camoufox_and_releases_it(monkeypatch):
     events = []
+    evaluated_code = []
 
     class _Page:
         def goto(self, *_args, **_kwargs):
             events.append("goto")
 
-        def evaluate(self, expression, *_args):
+        def evaluate(self, expression, *args):
             if expression == "typeof window.SentinelSDK":
                 return "object"
+            if expression == "code => window.eval(code)":
+                evaluated_code.append(args[0])
             return None
 
     class _Browser:
@@ -1645,7 +1648,7 @@ def test_sentinel_runtime_uses_camoufox_and_releases_it(monkeypatch):
 
     class _Session:
         def get(self, *_args, **_kwargs):
-            return _FakeResponse(text="before t.token=ye,t}({}); after")
+            return _FakeResponse(text="var SentinelSDK=before t.token=ye,t}({}); after")
 
     monkeypatch.setitem(
         sys.modules,
@@ -1666,6 +1669,9 @@ def test_sentinel_runtime_uses_camoufox_and_releases_it(monkeypatch):
         "username": "name",
         "password": "pass",
     }
+    assert evaluated_code
+    assert evaluated_code[0].startswith("window.SentinelSDK=")
+    assert "t.___n=_n,t.__Nt=Nt,t.__D=D,t.__jt=jt" in evaluated_code[0]
 
     runtime.close()
     runtime.close()
