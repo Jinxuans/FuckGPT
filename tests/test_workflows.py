@@ -8,8 +8,8 @@ import pytest
 from sqlmodel import Session, select
 
 from application.tasks import TASK_STATUS_SUCCEEDED, TASK_TYPE_CODEX_OAUTH_BATCH, create_task
-from application.workflow_adapters import CodexAuthorizeAdapter
-from application.workflow_registry import register_step_adapter
+from application.workflow_adapters import CodexAuthorizeAdapter, register_builtin_workflow_components
+from application.workflow_registry import register_step_adapter, registered_workflow_definitions
 from application.workflows import (
     cancel_workflow_batch,
     cancel_workflow_run,
@@ -199,6 +199,26 @@ def test_condition_dsl_supports_safe_ops():
         },
         context,
     )
+
+
+def test_builtin_workflow_template_exposes_proxy_inputs():
+    register_builtin_workflow_components()
+    definition = next(item for item in registered_workflow_definitions() if item["key"] == "register_codex_push")
+
+    assert definition["sample_input"]["registration"]["platform_proxy_mode"] == "direct"
+    assert definition["sample_input"]["registration"]["platform_proxy_value"] == ""
+    assert definition["sample_input"]["codex"]["platform_proxy_mode"] == "direct"
+    assert definition["sample_input"]["codex"]["platform_proxy_value"] == ""
+
+    field_paths = {
+        field["path"]
+        for section in definition["ui_schema"]["sections"]
+        for field in section["fields"]
+    }
+    assert "registration.platform_proxy_mode" in field_paths
+    assert "registration.platform_proxy_value" in field_paths
+    assert "codex.platform_proxy_mode" in field_paths
+    assert "codex.platform_proxy_value" in field_paths
 
 
 def test_step_transition_adds_error_category_and_operator_hint():
