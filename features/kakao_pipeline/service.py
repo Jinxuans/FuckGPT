@@ -12,6 +12,12 @@ from urllib.parse import urlsplit
 from sqlalchemy import or_
 from sqlmodel import Session, select
 
+from application.account_recovery import (
+    AccountReloginResult,
+    AccountStateSnapshot,
+    check_and_recover_account,
+    execute_runtime_action_with_worker_proxy,
+)
 from application.accounts import AccountsService
 from core.db import AccountModel, KakaoPipelineModel, ProviderSettingModel, engine
 from core.platform_accounts import build_platform_account
@@ -23,8 +29,8 @@ from core.proxy_resolution import (
     normalize_proxy_mode,
 )
 from domain.accounts import AccountQuery
-from domain.actions import ActionExecutionCommand, ActionExecutionResult
-from infrastructure.platform_runtime import PlatformRuntime
+from domain.actions import ActionExecutionResult
+from infrastructure.platform_runtime import PlatformRuntime  # re-exported for existing integration hooks
 from infrastructure.provider_settings_repository import ProviderSettingsRepository
 
 from .client import CustomerApiClient, CustomerApiProblem, normalize_base_url
@@ -779,64 +785,84 @@ class KakaoPipelineService:
         instead of repeatedly starting browser workers on the short Plus poll
         interval.
         """
-        runtime = PlatformRuntime()
-
-        def execute(action_id: str, params: dict[str, Any]) -> ActionExecutionResult:
-            return runtime.execute_action(
-                ActionExecutionCommand(
-                    platform="chatgpt",
-                    account_id=int(account_id),
-                    action_id=action_id,
-                    params=params,
-                )
-            )
-
         proxy_options = self._account_proxy_options()
         query_params = {
             "platform_proxy_mode": proxy_options["mode"],
             "platform_proxy_value": proxy_options["value"],
         }
-        result = execute("query_state", query_params)
-        result_data = result.data if isinstance(getattr(result, "data", None), dict) else {}
-        if not result.ok or result_data.get("valid") is not False:
-            return result, {"attempted": False, "relogin_ok": False, "recovery_failed": False}
+        scope_id = f"kakao-plus:{int(account_id)}"
 
-        self._append_account_pipeline_event(
-            account_id,
-            "Plus 检测发现账号登录已失效，开始自动重新登录",
-            level="warning",
-        )
-        relogin = execute(
-            "relogin",
-            {
-                "browser_mode": "headless",
-                "keep_browser_open": "false",
-                **query_params,
-            },
-        )
-        if not relogin.ok:
-            error = str(relogin.error or "自动重新登录失败")
-            self._append_account_pipeline_event(
-                account_id,
-                f"账号自动重新登录失败: {error}",
-                level="error",
-            )
-            return (
-                ActionExecutionResult(ok=False, data=relogin.data, error=f"账号失效且{error}"),
-                {"attempted": True, "relogin_ok": False, "recovery_failed": True},
+        def pipeline_log(message: str, *, level: str = "info", **_kwargs: Any) -> None:
+            self._append_account_pipeline_event(account_id, str(message), level=level)
+
+        def execute(action_id: str, params: dict[str, Any]) -> ActionExecutionResult:
+            return execute_runtime_action_with_worker_proxy(
+                platform="chatgpt",
+                account_id=int(account_id),
+                action_id=action_id,
+                params=params,
+                scope_id=scope_id,
+                log_fn=pipeline_log,
+                runtime_factory=PlatformRuntime,
             )
 
-        self._append_account_pipeline_event(account_id, "账号自动重新登录成功，重新检测 Plus")
-        refreshed = execute("query_state", query_params)
-        refreshed_data = refreshed.data if isinstance(getattr(refreshed, "data", None), dict) else {}
-        if refreshed.ok and refreshed_data.get("valid") is False:
-            error = "自动重新登录后账号仍为失效状态"
-            self._append_account_pipeline_event(account_id, error, level="error")
-            return (
-                ActionExecutionResult(ok=False, data=refreshed.data, error=error),
-                {"attempted": True, "relogin_ok": True, "recovery_failed": True},
+        def check_state() -> AccountStateSnapshot:
+            return AccountStateSnapshot.from_action(execute("query_state", query_params))
+
+        def relogin_account() -> AccountReloginResult:
+            return AccountReloginResult.from_action(
+                execute(
+                    "relogin",
+                    {
+                        "browser_mode": "headless",
+                        "keep_browser_open": "false",
+                        **query_params,
+                    },
+                )
             )
-        return refreshed, {"attempted": True, "relogin_ok": True, "recovery_failed": False}
+
+        try:
+            recovery = check_and_recover_account(
+                check_state=check_state,
+                relogin=relogin_account,
+                relogin_invalid=True,
+                log_fn=pipeline_log,
+                label="Plus ",
+            )
+        finally:
+            from core.worker_proxy import worker_proxy_manager
+
+            worker_proxy_manager.clear_scope(scope_id)
+
+        flags = {
+            "attempted": recovery.relogin_attempted,
+            "relogin_ok": recovery.relogin_ok,
+            "recovery_failed": recovery.recovery_failed,
+        }
+        if not recovery.relogin_attempted:
+            return ActionExecutionResult(
+                ok=recovery.initial.ok,
+                data=recovery.initial.data,
+                error=recovery.initial.error,
+            ), flags
+        if not recovery.relogin_ok:
+            error = recovery.relogin_error or "自动重新登录失败"
+            return ActionExecutionResult(
+                ok=False,
+                data=recovery.relogin_data,
+                error=f"账号失效且{error}",
+            ), flags
+        if recovery.recovery_failed:
+            return ActionExecutionResult(
+                ok=False,
+                data=recovery.final.data,
+                error=recovery.relogin_error or "自动重新登录后账号仍为失效状态",
+            ), flags
+        return ActionExecutionResult(
+            ok=recovery.final.ok,
+            data=recovery.final.data,
+            error=recovery.final.error,
+        ), flags
 
     @staticmethod
     def _serialize_pipeline(model: KakaoPipelineModel | None, *, detail: bool = False) -> dict:

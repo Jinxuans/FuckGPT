@@ -1058,6 +1058,7 @@ def test_pipeline_plus_check_relogins_invalid_account_before_rechecking(monkeypa
     def execute_action(_runtime, command, **_kwargs):
         actions.append((command.action_id, dict(command.params)))
         if command.action_id == "relogin":
+            _kwargs["log_fn"]("重新登录浏览器：已进入账号验证页面")
             return SimpleNamespace(ok=True, data={"checked_at": "2099-01-01T00:00:00Z"}, error="")
         if sum(action_id == "query_state" for action_id, _params in actions) == 1:
             return SimpleNamespace(ok=True, data={"valid": False}, error="")
@@ -1087,6 +1088,7 @@ def test_pipeline_plus_check_relogins_invalid_account_before_rechecking(monkeypa
     assert result["final_result"] == "plus"
     messages = [item["message"] for item in result["events"]]
     assert any("登录已失效" in message for message in messages)
+    assert any("已进入账号验证页面" in message for message in messages)
     assert any("重新登录成功" in message for message in messages)
 
 

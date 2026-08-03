@@ -1324,15 +1324,29 @@ export default function KakaoPipeline() {
       return
     }
     setExpanded(accountId)
-    if (details[accountId]) return
-    try {
-      const detail = await apiFetch(`/kakao-pipeline/accounts/${accountId}`)
-      setDetails(current => ({ ...current, [accountId]: detail }))
-    } catch (error) {
-      setExpanded(null)
-      setToast({ type: 'error', text: parseError(error) })
-    }
   }
+
+  useEffect(() => {
+    if (expanded === null) return
+    let cancelled = false
+    const refreshDetail = async () => {
+      try {
+        const detail = await apiFetch(`/kakao-pipeline/accounts/${expanded}`)
+        if (!cancelled) setDetails(current => ({ ...current, [expanded]: detail }))
+      } catch (error) {
+        if (!cancelled) {
+          setExpanded(null)
+          setToast({ type: 'error', text: parseError(error) })
+        }
+      }
+    }
+    void refreshDetail()
+    const timer = window.setInterval(refreshDetail, 2000)
+    return () => {
+      cancelled = true
+      window.clearInterval(timer)
+    }
+  }, [expanded])
 
   const copyLink = async (value: string) => {
     try {
