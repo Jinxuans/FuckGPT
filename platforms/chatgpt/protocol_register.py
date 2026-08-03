@@ -508,7 +508,7 @@ class ChatGPTProtocolRegister:
 
     user_agent = (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36"
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
     )
 
     def __init__(
@@ -518,7 +518,7 @@ class ChatGPTProtocolRegister:
         otp_callback: Callable[[], str] | None = None,
         log_fn: Callable[[str], None] | None = None,
         cancel_check: Callable[[], bool] | None = None,
-        impersonate: str = "firefox144",
+        impersonate: str = "chrome136",
         session=None,
         sentinel_runtime: bool = True,
     ):

@@ -1517,6 +1517,23 @@ def test_submit_otp_presses_enter_on_existing_input_before_button_scan(monkeypat
     assert any("按 Enter 后页面已推进" in item for item in logs)
 
 
+def test_protocol_register_uses_supported_coherent_default_impersonation(monkeypatch):
+    captured = {}
+    session = object()
+
+    def create_session(**kwargs):
+        captured.update(kwargs)
+        return session
+
+    monkeypatch.setattr("platforms.chatgpt.protocol_register.requests.Session", create_session)
+
+    worker = ChatGPTProtocolRegister(sentinel_runtime=False)
+
+    assert worker.session is session
+    assert captured["impersonate"] == "chrome136"
+    assert "Chrome/136.0.0.0" in worker.user_agent
+
+
 def test_protocol_register_completes_email_flow_without_browser():
     session = _FakeSession()
     logs = []
