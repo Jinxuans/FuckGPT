@@ -827,14 +827,25 @@ def test_register_task_failure_releases_canonical_mailbox_allocation(monkeypatch
     }
 
 
-def test_register_api_rejects_protocol_without_outlook_pool(client):
-    response = client.post(
-        "/api/tasks/register",
-        json={"executor_type": "protocol", "count": 1, "extra": {}},
+def test_register_api_allows_protocol_with_global_mailbox_provider(client, monkeypatch):
+    captured = {}
+    monkeypatch.setattr(
+        "api.task_commands.command_service.create_register_task",
+        lambda payload: captured.update(payload) or {"task_id": "task_protocol"},
     )
 
-    assert response.status_code == 400
-    assert "Outlook" in response.json()["detail"]
+    response = client.post(
+        "/api/tasks/register",
+        json={
+            "executor_type": "protocol",
+            "count": 1,
+            "extra": {"mail_provider": "api_mailbox"},
+        },
+    )
+
+    assert response.status_code == 200
+    assert captured["extra"]["mail_provider"] == "api_mailbox"
+    assert "local_ms_pool_alias_count" not in captured["extra"]
 
 
 def test_platform_action_task_finishes_cancelled_without_starting_runtime(monkeypatch):

@@ -47,30 +47,30 @@ def create_register_task(body: RegisterTaskRequest):
             raise HTTPException(400, "指定邮箱注册暂不支持协议模式，请使用 headless/headed")
         pool_text = str(extra.get("local_ms_pool_text") or "").strip()
         pool_file = str(extra.get("local_ms_pool_file") or "").strip()
-        if not pool_text and not pool_file:
-            raise HTTPException(400, "协议注册需要 Outlook 账号池文本或账号池文件")
-        from core.local_ms_mailbox import MAX_OUTLOOK_SUBADDRESS_COUNT
+        # Keep compatibility with callers that still submit an inline Outlook
+        # pool. Otherwise protocol registration uses the same configured
+        # mailbox provider selection as browser registration.
+        if pool_text or pool_file:
+            from core.local_ms_mailbox import MAX_OUTLOOK_SUBADDRESS_COUNT
 
-        # Protocol registration uses Outlook plus addressing.  Each parent
-        # mailbox yields six independently reserved child addresses.
-        extra["local_ms_pool_alias_count"] = MAX_OUTLOOK_SUBADDRESS_COUNT
-        if pool_text:
-            from core.local_ms_mailbox import parse_local_ms_pool_rows
+            extra["local_ms_pool_alias_count"] = MAX_OUTLOOK_SUBADDRESS_COUNT
+            if pool_text:
+                from core.local_ms_mailbox import parse_local_ms_pool_rows
 
-            rows = parse_local_ms_pool_rows(pool_text)
-            if not rows:
-                raise HTTPException(400, "Outlook 账号池未解析到有效账号，请检查输入格式")
-            allow_reuse = str(extra.get("local_ms_pool_allow_reuse") or "").strip().lower() in {
-                "1", "true", "yes", "on"
-            }
-            capacity = len(rows) * MAX_OUTLOOK_SUBADDRESS_COUNT
-            if not allow_reuse and capacity < body.count:
-                raise HTTPException(
-                    400,
-                    f"Outlook 子邮箱容量 {capacity} 少于注册数量 {body.count}（每个母邮箱最多 6 个）",
-                )
-        mail_provider = "local_ms_pool"
-        extra["mail_provider"] = mail_provider
+                rows = parse_local_ms_pool_rows(pool_text)
+                if not rows:
+                    raise HTTPException(400, "Outlook 账号池未解析到有效账号，请检查输入格式")
+                allow_reuse = str(extra.get("local_ms_pool_allow_reuse") or "").strip().lower() in {
+                    "1", "true", "yes", "on"
+                }
+                capacity = len(rows) * MAX_OUTLOOK_SUBADDRESS_COUNT
+                if not allow_reuse and capacity < body.count:
+                    raise HTTPException(
+                        400,
+                        f"Outlook 子邮箱容量 {capacity} 少于注册数量 {body.count}（每个母邮箱最多 6 个）",
+                    )
+            mail_provider = "local_ms_pool"
+            extra["mail_provider"] = mail_provider
     payload["extra"] = extra
     if mail_provider:
         extra["mail_provider"] = mail_provider

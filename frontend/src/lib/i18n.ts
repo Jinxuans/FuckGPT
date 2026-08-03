@@ -439,14 +439,7 @@ const ZH_MESSAGES = {
   "accounts.verificationSummary": "验证策略",
   "accounts.missingDefaultMailbox":
     "未配置默认邮箱 provider，请先到设置页启用一个邮箱 provider",
-  "accounts.outlookPoolLabel": "Outlook 账号池（协议注册）",
-  "accounts.outlookPoolHint":
-    "支持两种格式：① 邮箱----密码----Client ID----Refresh Token；② Xinlan/BH Mailer common 19 列格式。每行一个账号。",
-  "accounts.outlookPoolPlaceholder":
-    "account@outlook.com----邮箱密码----client_id----refresh_token\n或粘贴 Xinlan/BH Mailer common 19 列账号",
-  "accounts.outlookPoolRequired": "协议注册必须填写 Outlook 账号池",
-  "accounts.outlookAliasHint": "每个 Outlook 母邮箱自动分配 6 个 +reg 子邮箱，并按收件人隔离验证码。",
-  "accounts.protocolVerificationSummary": "内置 Sentinel + Outlook 邮箱 OTP",
+  "accounts.protocolVerificationSummary": "内置 Sentinel + 全局邮箱验证码",
   "accounts.preferPasswordRegistration": "优先使用密码注册",
   "accounts.preferPasswordRegistrationHint":
     "默认开启，浏览器会主动进入密码创建页。关闭后保留邮箱验证码入口；若服务端仍要求密码，流程会继续自动处理。",
@@ -1006,14 +999,7 @@ const EN_MESSAGES: Record<TranslationKey, string> = {
   "accounts.verificationSummary": "Verification Strategy",
   "accounts.missingDefaultMailbox":
     "No default mailbox provider is configured. Enable one in Settings first.",
-  "accounts.outlookPoolLabel": "Outlook Account Pool (Protocol)",
-  "accounts.outlookPoolHint":
-    "Supports two formats: email----password----client ID----refresh token, or the 19-column Xinlan/BH Mailer common format. One account per line.",
-  "accounts.outlookPoolPlaceholder":
-    "account@outlook.com----mail password----client_id----refresh_token\nor paste a 19-column Xinlan/BH Mailer common row",
-  "accounts.outlookPoolRequired": "Outlook account pool is required for protocol registration",
-  "accounts.outlookAliasHint": "Each parent Outlook inbox is assigned six +reg child addresses, with OTPs isolated by recipient.",
-  "accounts.protocolVerificationSummary": "Built-in Sentinel + Outlook email OTP",
+  "accounts.protocolVerificationSummary": "Built-in Sentinel + global mailbox OTP",
   "accounts.preferPasswordRegistration": "Prefer password registration",
   "accounts.preferPasswordRegistrationHint":
     "Enabled by default. The browser proactively opens the password creation page. When disabled, it keeps the email-code entry path; a server-requested password step is still handled automatically.",
