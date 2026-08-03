@@ -479,7 +479,6 @@ function RegisterModal({
   const [concurrency, setConcurrency] = useState(1)
   const [platformProxyMode, setPlatformProxyMode] = useState('direct')
   const [platformProxyValue, setPlatformProxyValue] = useState('')
-  const [outlookPoolText, setOutlookPoolText] = useState('')
   const [preferPasswordRegistration, setPreferPasswordRegistration] = useState(true)
   const [autoCodexOAuth, setAutoCodexOAuth] = useState(false)
   const [codexOAuthBrowserMode, setCodexOAuthBrowserMode] = useState('headless')
@@ -601,18 +600,10 @@ function RegisterModal({
         extra.prefer_password_registration = preferPasswordRegistration
       }
       if (selection.identityProvider === 'mailbox') {
-        if (selection.executorType === 'protocol') {
-          if (!outlookPoolText.trim()) {
-            throw new Error(t('accounts.outlookPoolRequired'))
-          }
-          extra.mail_provider = 'local_ms_pool'
-          extra.local_ms_pool_text = outlookPoolText.trim()
-        } else {
-          if (!defaultMailboxProvider?.provider_key) {
-            throw new Error(t('accounts.missingDefaultMailbox'))
-          }
-          extra.mail_provider = defaultMailboxProvider.provider_key
+        if (!defaultMailboxProvider?.provider_key) {
+          throw new Error(t('accounts.missingDefaultMailbox'))
         }
+        extra.mail_provider = defaultMailboxProvider.provider_key
       }
       const res = await apiFetch('/tasks/register', {
         method: 'POST',
@@ -716,28 +707,6 @@ function RegisterModal({
                     })}
                   </div>
                 </div>
-
-                {selection.executorType === 'protocol' ? (
-                  <div className="rounded-xl border border-[var(--border)] bg-[var(--bg-pane)]/45 p-4">
-                    <label className="text-sm font-semibold text-[var(--text-primary)] block mb-1">
-                      {t('accounts.outlookPoolLabel')}
-                    </label>
-                    <div className="mb-2 text-xs text-[var(--text-muted)]">
-                      {t('accounts.outlookPoolHint')}
-                    </div>
-                    <div className="mb-2 text-xs text-sky-300">
-                      {t('accounts.outlookAliasHint')}
-                    </div>
-                    <textarea
-                      value={outlookPoolText}
-                      onChange={(event) => setOutlookPoolText(event.target.value)}
-                      rows={7}
-                      spellCheck={false}
-                      placeholder={t('accounts.outlookPoolPlaceholder')}
-                      className="control-surface w-full resize-y font-mono text-xs"
-                    />
-                  </div>
-                ) : null}
 
                 {platformMeta?.name === 'chatgpt' && selection.executorType !== 'protocol' ? (
                   <div className="rounded-xl border border-[var(--border)] bg-[var(--bg-pane)]/45 px-4 py-3">
@@ -865,7 +834,7 @@ function RegisterModal({
 
                 <Button
                   onClick={start}
-                  disabled={starting || !selection.identityProvider || !selection.executorType || (selection.executorType === 'protocol' && !outlookPoolText.trim())}
+                  disabled={starting || !selection.identityProvider || !selection.executorType}
                   className="w-full"
                 >
                   {starting ? t('accounts.starting') : t('accounts.startAutoRegister')}
