@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 import threading
 import uuid
@@ -59,7 +60,10 @@ FAILURE_POLICY_NEEDS_ATTENTION = "needs_attention"
 FAILURE_POLICY_SKIP = "skip"
 FAILURE_POLICIES = {FAILURE_POLICY_FAIL, FAILURE_POLICY_NEEDS_ATTENTION, FAILURE_POLICY_SKIP}
 LIMIT_HELD_STEP_STATUSES = {STEP_RUNNING, STEP_WAITING_EXTERNAL}
+LOCAL_SLOT_HELD_STEP_STATUSES = {STEP_READY, STEP_RUNNING}
 DEFAULT_STUCK_SECONDS = 30 * 60
+DEFAULT_EXTERNAL_WAITING_LIMIT = 20
+BATCH_RETRY_SLOT_HOLD_SECONDS = 60
 _workflow_claim_lock = threading.Lock()
 
 
@@ -219,6 +223,14 @@ def _status_counts(runs: list[WorkflowRunModel]) -> dict[str, int]:
         else:
             counts["active"] += 1
     return counts
+
+
+def _run_steps_progress_count(steps: list[WorkflowStepRunModel]) -> int:
+    return sum(
+        1
+        for step in steps
+        if step.status not in {STEP_PENDING, STEP_READY} or int(step.attempt or 0) > 0
+    )
 
 
 def _batch_status_from_counts(counts: dict[str, int]) -> str:
@@ -403,6 +415,49 @@ def _step_def_map(definition: dict[str, Any]) -> dict[str, dict[str, Any]]:
 
 def _step_order(definition: dict[str, Any]) -> dict[str, int]:
     return {str(item.get("id") or ""): index for index, item in enumerate(_step_defs(definition))}
+
+
+def _sort_datetime(value: datetime | str | None) -> datetime:
+    return ensure_utc_datetime(value) or datetime.min.replace(tzinfo=timezone.utc)
+
+
+def _run_promotion_sort_key(session: Session, run: WorkflowRunModel) -> tuple:
+    steps = _steps_for_run(session, run.id)
+    progress = _run_steps_progress_count(steps)
+    return (
+        str(run.batch_id or ""),
+        0 if progress > 0 else 1,
+        -progress,
+        int(run.batch_item_index or 0),
+        _sort_datetime(run.created_at),
+        run.id,
+    )
+
+
+def _step_claim_sort_key(session: Session, step: WorkflowStepRunModel) -> tuple:
+    run = session.get(WorkflowRunModel, step.workflow_run_id)
+    if not run:
+        return (9, "", 1, 0, 0, 99, _sort_datetime(step.next_run_at), _sort_datetime(step.created_at), step.id)
+    steps = _steps_for_run(session, run.id)
+    progress = _run_steps_progress_count(steps)
+    definition_order = _step_order(run.get_definition())
+    status_priority = {
+        STEP_WAITING_EXTERNAL: 0,
+        STEP_RETRY_SCHEDULED: 1,
+        STEP_READY: 2,
+    }.get(step.status, 9)
+    return (
+        0,
+        str(run.batch_id or ""),
+        0 if progress > 0 else 1,
+        -progress,
+        int(run.batch_item_index or 0),
+        definition_order.get(step.step_id, 0),
+        status_priority,
+        _sort_datetime(step.next_run_at),
+        _sort_datetime(step.created_at),
+        step.id,
+    )
 
 
 def _stuck_threshold_seconds(definition: dict[str, Any], step_id: str = "") -> int:
@@ -721,6 +776,10 @@ def _promote_ready_steps(session: Session, run: WorkflowRunModel) -> bool:
     changed = False
     definition = run.get_definition()
     step_defs = _step_def_map(definition)
+    if run.batch_id:
+        batch = session.get(WorkflowBatchModel, run.batch_id)
+        if batch and batch.status == RUN_PAUSED:
+            return False
     while True:
         loop_changed = False
         steps = _steps_for_run(session, run.id)
@@ -758,10 +817,13 @@ def _promote_ready_steps(session: Session, run: WorkflowRunModel) -> bool:
                 _mark_step_skipped(session, run, step, message="步骤条件未满足，已跳过")
                 loop_changed = True
                 continue
+            now = _utcnow()
+            if not _batch_can_promote_step(session, run, now=now):
+                continue
             step.input_json = _dump_json(resolve_value(spec.get("input") or {}, context))
             step.status = STEP_READY
-            step.next_run_at = _utcnow()
-            step.updated_at = _utcnow()
+            step.next_run_at = now
+            step.updated_at = now
             session.add(step)
             _append_event_in_session(session, run.id, "步骤已就绪", step_id=step.step_id, event_type="state")
             loop_changed = True
@@ -787,6 +849,7 @@ def _finish_run(
     run.error = error
     run.finished_at = now
     run.updated_at = now
+    run.started_at = run.started_at or now
     if steps is None:
         steps = _steps_for_run(session, run.id)
     run.output_json = _dump_json(_run_output_from_steps(steps))
@@ -809,19 +872,46 @@ def _refresh_batch_status_in_session(session: Session, batch_id: str) -> None:
     session.add(batch)
 
 
-def _batch_inflight_run_count(session: Session, batch_id: str, *, exclude_run_id: str = "") -> int:
+def _step_holds_local_batch_slot(step: WorkflowStepRunModel, *, now: datetime) -> bool:
+    if step.status in LOCAL_SLOT_HELD_STEP_STATUSES:
+        return True
+    if step.status != STEP_RETRY_SCHEDULED:
+        return False
+    retry_at = ensure_utc_datetime(step.next_run_at)
+    if retry_at is None:
+        return True
+    scheduled_at = ensure_utc_datetime(step.updated_at) or now
+    retry_delay_seconds = max(int((retry_at - scheduled_at).total_seconds()), 0)
+    return retry_delay_seconds <= BATCH_RETRY_SLOT_HOLD_SECONDS
+
+
+def _batch_local_slot_run_count(session: Session, batch_id: str, *, now: datetime, exclude_run_id: str = "") -> int:
     if not batch_id:
         return 0
-    rows = session.exec(
-        select(WorkflowStepRunModel.workflow_run_id)
+    steps = session.exec(
+        select(WorkflowStepRunModel)
         .join(WorkflowRunModel, WorkflowRunModel.id == WorkflowStepRunModel.workflow_run_id)
         .where(WorkflowRunModel.batch_id == batch_id)
-        .where(WorkflowStepRunModel.status.in_([STEP_RUNNING, STEP_WAITING_EXTERNAL, STEP_RETRY_SCHEDULED]))
+        .where(WorkflowStepRunModel.status.in_(list(LOCAL_SLOT_HELD_STEP_STATUSES | {STEP_RETRY_SCHEDULED})))
     ).all()
-    return len({str(run_id) for run_id in rows if str(run_id) != exclude_run_id})
+    run_ids: set[str] = set()
+    for step in steps:
+        run_id = str(step.workflow_run_id)
+        if run_id == exclude_run_id:
+            continue
+        if _step_holds_local_batch_slot(step, now=now):
+            run_ids.add(run_id)
+    return len(run_ids)
 
 
-def _batch_can_claim_step(session: Session, run: WorkflowRunModel) -> bool:
+def _batch_run_holds_local_slot(session: Session, run: WorkflowRunModel, *, now: datetime) -> bool:
+    if not run.batch_id:
+        return True
+    steps = _steps_for_run(session, run.id)
+    return any(_step_holds_local_batch_slot(step, now=now) for step in steps)
+
+
+def _batch_can_promote_step(session: Session, run: WorkflowRunModel, *, now: datetime) -> bool:
     if not run.batch_id:
         return True
     batch = session.get(WorkflowBatchModel, run.batch_id)
@@ -830,7 +920,25 @@ def _batch_can_claim_step(session: Session, run: WorkflowRunModel) -> bool:
     if batch.status == RUN_PAUSED:
         return False
     concurrency = max(int(batch.concurrency or 1), 1)
-    return _batch_inflight_run_count(session, run.batch_id, exclude_run_id=run.id) < concurrency
+    if _batch_run_holds_local_slot(session, run, now=now):
+        return True
+    return _batch_local_slot_run_count(session, run.batch_id, now=now, exclude_run_id=run.id) < concurrency
+
+
+def _batch_can_claim_step(session: Session, run: WorkflowRunModel, step: WorkflowStepRunModel, *, now: datetime) -> bool:
+    if not run.batch_id:
+        return True
+    batch = session.get(WorkflowBatchModel, run.batch_id)
+    if not batch:
+        return True
+    if batch.status == RUN_PAUSED:
+        return False
+    if step.status == STEP_WAITING_EXTERNAL:
+        return True
+    concurrency = max(int(batch.concurrency or 1), 1)
+    if _batch_run_holds_local_slot(session, run, now=now):
+        return True
+    return _batch_local_slot_run_count(session, run.batch_id, now=now, exclude_run_id=run.id) < concurrency
 
 
 def _workflow_limits(definition: dict[str, Any]) -> dict[str, dict[str, int]]:
@@ -841,6 +949,17 @@ def _workflow_limits(definition: dict[str, Any]) -> dict[str, dict[str, int]]:
     }
 
 
+def _default_external_waiting_limit() -> int:
+    try:
+        return _normalize_positive_limit(
+            os.environ.get("WORKFLOW_DEFAULT_EXTERNAL_WAITING_LIMIT"),
+            default=DEFAULT_EXTERNAL_WAITING_LIMIT,
+            maximum=200,
+        )
+    except ValueError:
+        return DEFAULT_EXTERNAL_WAITING_LIMIT
+
+
 def _inflight_adapter_count(session: Session, adapter_key: str, *, exclude_step_pk: str = "") -> int:
     return int(
         session.exec(
@@ -849,6 +968,39 @@ def _inflight_adapter_count(session: Session, adapter_key: str, *, exclude_step_
             .where(WorkflowStepRunModel.adapter_key == adapter_key)
             .where(WorkflowStepRunModel.status.in_(list(LIMIT_HELD_STEP_STATUSES)))
             .where(WorkflowStepRunModel.id != exclude_step_pk)
+        ).one()
+        or 0
+    )
+
+
+def _waiting_external_adapter_count(session: Session, adapter_key: str, *, exclude_step_pk: str = "") -> int:
+    return int(
+        session.exec(
+            select(func.count())
+            .select_from(WorkflowStepRunModel)
+            .where(WorkflowStepRunModel.adapter_key == adapter_key)
+            .where(WorkflowStepRunModel.status == STEP_WAITING_EXTERNAL)
+            .where(WorkflowStepRunModel.id != exclude_step_pk)
+        ).one()
+        or 0
+    )
+
+
+def _waiting_external_definition_step_count(
+    session: Session,
+    run: WorkflowRunModel,
+    step: WorkflowStepRunModel,
+) -> int:
+    return int(
+        session.exec(
+            select(func.count())
+            .select_from(WorkflowStepRunModel)
+            .join(WorkflowRunModel, WorkflowRunModel.id == WorkflowStepRunModel.workflow_run_id)
+            .where(WorkflowRunModel.definition_key == run.definition_key)
+            .where(WorkflowRunModel.definition_version == run.definition_version)
+            .where(WorkflowStepRunModel.step_id == step.step_id)
+            .where(WorkflowStepRunModel.status == STEP_WAITING_EXTERNAL)
+            .where(WorkflowStepRunModel.id != step.id)
         ).one()
         or 0
     )
@@ -888,6 +1040,20 @@ def _step_can_claim_by_limits(session: Session, run: WorkflowRunModel, step: Wor
     )
     if step_limit and _inflight_definition_step_count(session, run, step) >= step_limit:
         return False
+    if step.status != STEP_WAITING_EXTERNAL:
+        external_adapter_limit = adapter_limit or _default_external_waiting_limit()
+        if (
+            external_adapter_limit
+            and _waiting_external_adapter_count(session, step.adapter_key, exclude_step_pk=step.id)
+            >= external_adapter_limit
+        ):
+            return False
+        if (
+            step_limit
+            and _waiting_external_definition_step_count(session, run, step)
+            >= step_limit
+        ):
+            return False
     return True
 
 
@@ -950,7 +1116,8 @@ def _refresh_run_status(session: Session, run: WorkflowRunModel) -> None:
         run.status = RUN_WAITING_EXTERNAL
     else:
         run.status = RUN_PENDING
-    run.started_at = run.started_at or now
+    if run.status != RUN_PENDING or any(status != STEP_PENDING for status in statuses):
+        run.started_at = run.started_at or now
     run.updated_at = now
     _set_run_context(session, run, steps)
     session.add(run)
@@ -966,6 +1133,7 @@ def create_workflow_run(
     batch_id: str = "",
     batch_item_index: int = 0,
     metadata: dict[str, Any] | None = None,
+    activate: bool = True,
 ) -> dict[str, Any] | None:
     with Session(engine) as session:
         definition_model = _get_definition_model(session, definition_key, version=version)
@@ -986,7 +1154,7 @@ def create_workflow_run(
             output_json="{}",
             definition_json=_dump_json(definition),
             metadata_json=_dump_json(metadata or {}),
-            started_at=_utcnow(),
+            started_at=None,
         )
         session.add(run)
         session.flush()
@@ -1010,8 +1178,9 @@ def create_workflow_run(
             event_type="state",
             detail={"definition_key": run.definition_key, "definition_version": run.definition_version},
         )
-        _promote_ready_steps(session, run)
-        _refresh_run_status(session, run)
+        if activate:
+            _promote_ready_steps(session, run)
+            _refresh_run_status(session, run)
         session.commit()
         steps = sorted(_steps_for_run(session, run.id), key=lambda item: _step_order(definition).get(item.step_id, 0))
         session.refresh(run)
@@ -1072,6 +1241,7 @@ def create_workflow_batch(
             batch_id=batch_id,
             batch_item_index=int(item["index"]),
             metadata=dict(item["metadata"]),
+            activate=False,
         )
         if run:
             created_runs.append(run)
@@ -1080,11 +1250,29 @@ def create_workflow_batch(
         batch = session.get(WorkflowBatchModel, batch_id)
         if not batch:
             return None
+        runs = session.exec(
+            select(WorkflowRunModel)
+            .where(WorkflowRunModel.batch_id == batch_id)
+            .order_by(WorkflowRunModel.batch_item_index, WorkflowRunModel.created_at)
+        ).all()
+        for run in runs:
+            _promote_ready_steps(session, run)
+            _refresh_run_status(session, run)
         batch.updated_at = _utcnow()
         session.add(batch)
         session.commit()
         payload = _serialize_batch(session, batch, include_runs=True)
-        payload["runs"] = created_runs
+        payload["runs"] = [
+            _serialize_run(
+                run,
+                steps=sorted(
+                    _steps_for_run(session, run.id),
+                    key=lambda item: _step_order(run.get_definition()).get(item.step_id, 0),
+                ),
+                include_definition=False,
+            )
+            for run in runs
+        ] or created_runs
         return payload
 
 
@@ -1286,22 +1474,24 @@ def list_workflow_events(
 
 
 def _claim_next_due_step() -> dict[str, Any] | None:
-    now = _utcnow()
     with Session(engine) as session:
         active_runs = session.exec(
             select(WorkflowRunModel).where(WorkflowRunModel.status.notin_(list(RUN_TERMINAL)))
         ).all()
+        active_runs = sorted(active_runs, key=lambda item: _run_promotion_sort_key(session, item))
         for run in active_runs:
             _promote_ready_steps(session, run)
             _refresh_run_status(session, run)
         session.commit()
 
+    now = _utcnow()
     with Session(engine) as session:
         candidates = session.exec(
             select(WorkflowStepRunModel)
             .where(WorkflowStepRunModel.status.in_([STEP_READY, STEP_RETRY_SCHEDULED, STEP_WAITING_EXTERNAL]))
             .order_by(WorkflowStepRunModel.next_run_at, WorkflowStepRunModel.created_at)
         ).all()
+        candidates = sorted(candidates, key=lambda item: _step_claim_sort_key(session, item))
         for step in candidates:
             if not _due(step.next_run_at, now):
                 continue
@@ -1312,7 +1502,7 @@ def _claim_next_due_step() -> dict[str, Any] | None:
                 _refresh_run_status(session, run)
                 session.commit()
                 return {"cancelled": True}
-            if not _batch_can_claim_step(session, run):
+            if not _batch_can_claim_step(session, run, step, now=now):
                 continue
             if not _step_can_claim_by_limits(session, run, step):
                 continue
