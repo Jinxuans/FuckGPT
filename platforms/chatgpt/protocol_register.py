@@ -553,17 +553,21 @@ class ChatGPTProtocolRegister:
             "user-agent": self.user_agent,
         }
 
-    def _follow_authorize_chain(self, location: str) -> None:
+    def _follow_authorize_chain(self, location: str) -> str:
         current = str(location or "").strip()
         for _ in range(15):
             if not current:
-                return
+                return ""
             self._check_cancelled()
-            response = self.session.get(urljoin(OPENAI_AUTH, current), allow_redirects=False)
-            current = str(response.headers.get("location") or "").strip()
+            requested_url = urljoin(OPENAI_AUTH, current)
+            response = self.session.get(requested_url, allow_redirects=False)
+            next_url = str(response.headers.get("location") or "").strip()
+            if not next_url:
+                return str(getattr(response, "url", "") or requested_url)
+            current = next_url
         raise RuntimeError("OpenAI 授权重定向次数过多")
 
-    def _initialize_signup(self, email: str) -> None:
+    def _initialize_signup(self, email: str) -> str:
         self.log("初始化 ChatGPT 协议注册会话...")
         response = self.session.get(CHATGPT_APP, allow_redirects=True)
         if getattr(response, "status_code", 0) >= 400:
@@ -609,13 +613,42 @@ class ChatGPTProtocolRegister:
         ).strip()
         if getattr(signin_response, "status_code", 0) >= 400 or not location:
             raise RuntimeError(f"OpenAI 注册授权初始化失败: {_response_error(signin_response, signin_payload)}")
-        self._follow_authorize_chain(location)
+        final_url = self._follow_authorize_chain(location)
         try:
             cookie_device_id = str(self.session.cookies.get("oai-did") or "").strip()
             if cookie_device_id:
                 self.device_id = cookie_device_id
         except Exception:
             pass
+        return final_url
+
+    def _prepare_password_registration(self, email: str, password: str, referer: str) -> None:
+        password_url = f"{OPENAI_AUTH}/create-account/password"
+        response = self.session.get(
+            password_url,
+            headers={
+                "referer": str(referer or f"{OPENAI_AUTH}/email-verification"),
+                "user-agent": self.user_agent,
+            },
+            allow_redirects=True,
+        )
+        if getattr(response, "status_code", 0) >= 400:
+            raise RuntimeError(f"ChatGPT 密码设置页访问失败: {_response_error(response)}")
+
+        password_result = self._register_password(email, password)
+        continue_url = str(password_result.get("continue_url") or "").strip()
+        if not continue_url:
+            raise RuntimeError("设置 ChatGPT 密码成功但缺少验证码跳转地址")
+        response = self.session.get(
+            urljoin(OPENAI_AUTH, continue_url),
+            headers={
+                "referer": password_url,
+                "user-agent": self.user_agent,
+            },
+            allow_redirects=True,
+        )
+        if getattr(response, "status_code", 0) >= 400:
+            raise RuntimeError(f"ChatGPT 验证码发送失败: {_response_error(response)}")
 
     def _validate_otp(self, code: str) -> dict:
         response = self.session.post(
@@ -712,7 +745,9 @@ class ChatGPTProtocolRegister:
         self._check_cancelled()
         self.log(f"开始 ChatGPT 协议注册: {email}")
         try:
-            self._initialize_signup(email)
+            authorize_url = self._initialize_signup(email)
+            self._prepare_password_registration(email, password, authorize_url)
+            self.log("ChatGPT 登录密码设置成功，验证码已触发")
             self.log("等待 Outlook 验证码...")
             code = str(self.otp_callback() or "").strip()
             if not code:
@@ -729,19 +764,6 @@ class ChatGPTProtocolRegister:
                     },
                     allow_redirects=True,
                 )
-            if "password" in continue_url.lower():
-                password_result = self._register_password(email, password)
-                self.log("ChatGPT 登录密码设置成功")
-                password_continue_url = str(password_result.get("continue_url") or "").strip()
-                if password_continue_url:
-                    self.session.get(
-                        urljoin(OPENAI_AUTH, password_continue_url),
-                        headers={
-                            "referer": f"{OPENAI_AUTH}/create-account/password",
-                            "user-agent": self.user_agent,
-                        },
-                        allow_redirects=True,
-                    )
             name, birthdate = _random_profile()
             created = self._create_account(name, birthdate)
             self.log("ChatGPT 账号资料创建成功")

@@ -669,15 +669,20 @@ def _wait_for_about_you_submit_progress(page, *, start_url: str, timeout: float)
     deadline = time.time() + max(float(timeout), 0)
     while time.time() < deadline:
         current_url = str(getattr(page, "url", "") or "")
-        if (
-            current_url
-            and current_url != original_url
-            and "about-you" not in current_url.lower()
-            and _otp_submit_progress_url(current_url)
-        ):
+        if _about_you_submit_progress_url(current_url, original_url):
             return True
         time.sleep(0.25)
     return False
+
+
+def _about_you_submit_progress_url(current_url: str, start_url: str) -> bool:
+    current = str(current_url or "")
+    return bool(
+        current
+        and current != str(start_url or "")
+        and "about-you" not in current.lower()
+        and _otp_submit_progress_url(current)
+    )
 
 
 def _fill_otp_with_keyboard_fallback(page, otp: str, log: Callable[[str], None]) -> bool:
@@ -3387,7 +3392,7 @@ def _submit_about_you_via_page(page, log) -> dict:
     enter_selector = direct_age_selector or direct_name_selector
     if enter_selector and _press_enter_on_input(page, enter_selector):
         log(f"about_you 已从输入框按 Enter 提交: {enter_selector}")
-        if _wait_for_about_you_submit_progress(page, start_url=about_submit_url, timeout=5):
+        if _wait_for_about_you_submit_progress(page, start_url=about_submit_url, timeout=15):
             current_url = str(getattr(page, "url", "") or about_submit_url)
             log("about_you 按 Enter 后页面已推进")
             return {"ok": True, "status": 200, "url": current_url, "data": None, "text": ""}
@@ -3396,6 +3401,10 @@ def _submit_about_you_via_page(page, log) -> dict:
     if not submit_selector:
         submit_selector = _click_visible_button_by_text(page, ABOUT_YOU_SUBMIT_TEXTS, timeout=3)
     if not submit_selector:
+        current_url = str(getattr(page, "url", "") or "")
+        if _about_you_submit_progress_url(current_url, about_submit_url):
+            log("about_you 查找提交按钮期间页面已推进")
+            return {"ok": True, "status": 200, "url": current_url, "data": None, "text": ""}
         log(f"about_you 提交控件状态: {_summarize_otp_submit_state(page)}")
         raise RuntimeError("about_you 未找到提交按钮")
     log(f"about_you 已点击继续按钮: {submit_selector}")

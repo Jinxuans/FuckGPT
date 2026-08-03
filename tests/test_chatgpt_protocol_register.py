@@ -251,7 +251,7 @@ class _FakeSession:
             return _FakeResponse(payload={"url": "https://auth.openai.com/authorize-start"})
         if url == OPENAI_API_ENDPOINTS["validate_otp"]:
             assert kwargs["json"] == {"code": "123456"}
-            return _FakeResponse(payload={"continue_url": "/create-account/password"})
+            return _FakeResponse(payload={"continue_url": "/about-you"})
         if url == SENTINEL_REQ_URL:
             request_payload = json.loads(kwargs["data"])
             return _FakeResponse(
@@ -270,7 +270,7 @@ class _FakeSession:
             )
         if url == OPENAI_API_ENDPOINTS["register"]:
             self.password_body = kwargs["json"]
-            return _FakeResponse(payload={"continue_url": "/about-you"})
+            return _FakeResponse(payload={"continue_url": "/api/accounts/email-otp/send"})
         raise AssertionError(f"unexpected POST {url}")
 
     def close(self):
@@ -1559,6 +1559,10 @@ def test_protocol_register_completes_email_flow_without_browser():
     sentinel = json.loads(session.create_headers["openai-sentinel-token"])
     assert sentinel["flow"] == "oauth_create_account"
     assert sentinel["c"] == "challenge-token"
+    request_order = [url for method, url, _ in session.calls if method == "POST"]
+    assert request_order.index(OPENAI_API_ENDPOINTS["register"]) < request_order.index(
+        OPENAI_API_ENDPOINTS["validate_otp"]
+    )
     assert any("协议注册完成" in line for line in logs)
 
 
