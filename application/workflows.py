@@ -310,19 +310,52 @@ def _step_summary(step: WorkflowStepRunModel, definition: dict[str, Any]) -> dic
     }
 
 
+def _current_summary_step(
+    run: WorkflowRunModel,
+    steps: list[WorkflowStepRunModel],
+) -> WorkflowStepRunModel | None:
+    attention = next((step for step in steps if step.status in {STEP_NEEDS_ATTENTION, STEP_FAILED}), None)
+    if attention:
+        return attention
+    for status in (STEP_RUNNING, STEP_READY, STEP_WAITING_EXTERNAL, STEP_RETRY_SCHEDULED):
+        current = next((step for step in steps if step.status == status), None)
+        if current:
+            return current
+    if run.current_step_id:
+        current = next((step for step in steps if step.step_id == run.current_step_id), None)
+        if current:
+            return current
+    return next((step for step in reversed(steps) if step.status != STEP_PENDING), None)
+
+
 def _run_summary(run: WorkflowRunModel, steps: list[WorkflowStepRunModel]) -> dict[str, Any]:
+    return _run_summary_with_batch_state(run, steps, batch_paused=False)
+
+
+def _run_summary_with_batch_state(
+    run: WorkflowRunModel,
+    steps: list[WorkflowStepRunModel],
+    *,
+    batch_paused: bool = False,
+) -> dict[str, Any]:
     definition = run.get_definition()
     by_status = {step.status for step in steps}
-    current = next((step for step in steps if step.step_id == run.current_step_id), None)
-    attention = next((step for step in steps if step.status in {STEP_NEEDS_ATTENTION, STEP_FAILED}), None)
     register = next((step for step in steps if step.step_id == "register"), None)
     register_output = register.get_output() if register else {}
     account = register_output.get("account") if isinstance(register_output.get("account"), dict) else {}
     account_id = int(register_output.get("account_id") or account.get("account_id") or 0)
     email = str(account.get("email") or "")
-    current_step = attention or current or next((step for step in reversed(steps) if step.status != STEP_PENDING), None)
+    current_step = _current_summary_step(run, steps)
     current_error = current_step.get_error() if current_step else {}
-    if run.status == RUN_SUCCEEDED:
+    if batch_paused and run.status not in RUN_TERMINAL:
+        step_label = (current_step.name if current_step else run.current_step_id) or "-"
+        if run.status == RUN_NEEDS_ATTENTION:
+            display_status = f"批次已暂停: {str(current_error.get('message') or step_label)}"
+            operator_action = "处理问题后恢复批次"
+        else:
+            display_status = f"批次已暂停: {step_label}"
+            operator_action = "恢复批次后继续"
+    elif run.status == RUN_SUCCEEDED:
         display_status = "工作流已完成"
         operator_action = "无需操作"
     elif run.status == RUN_FAILED:
@@ -338,8 +371,16 @@ def _run_summary(run: WorkflowRunModel, steps: list[WorkflowStepRunModel]) -> di
         display_status = "等待自动重试"
         operator_action = "可等待或人工重试"
     elif run.status == RUN_RUNNING:
-        display_status = f"正在执行: {(current_step.name if current_step else run.current_step_id) or '-'}"
-        operator_action = "等待执行完成"
+        step_label = (current_step.name if current_step else run.current_step_id) or "-"
+        if current_step and current_step.status == STEP_RUNNING:
+            display_status = f"正在执行: {step_label}"
+            operator_action = "等待执行完成"
+        elif current_step and current_step.status == STEP_READY:
+            display_status = f"等待执行: {step_label}"
+            operator_action = "等待 worker 接手"
+        else:
+            display_status = f"正在推进: {step_label}"
+            operator_action = "等待自动推进"
     else:
         display_status = "等待调度"
         operator_action = "等待启动"
@@ -351,6 +392,7 @@ def _run_summary(run: WorkflowRunModel, steps: list[WorkflowStepRunModel]) -> di
         "definition_key": run.definition_key,
         "status": run.status,
         "terminal": run.status in RUN_TERMINAL,
+        "batch_paused": bool(batch_paused and run.status not in RUN_TERMINAL),
         "account_id": account_id,
         "email": email,
         "current_stage": (current_step.step_id if current_step else run.current_step_id) or "",
@@ -1380,7 +1422,12 @@ def get_workflow_run_summary(run_id: str) -> dict[str, Any] | None:
         definition = run.get_definition()
         order = _step_order(definition)
         steps = sorted(_steps_for_run(session, run.id), key=lambda item: order.get(item.step_id, 0))
-        return _run_summary(run, steps)
+        batch = session.get(WorkflowBatchModel, run.batch_id) if run.batch_id else None
+        return _run_summary_with_batch_state(
+            run,
+            steps,
+            batch_paused=bool(batch and batch.status == RUN_PAUSED),
+        )
 
 
 def get_workflow_batch_summary(batch_id: str) -> dict[str, Any] | None:
@@ -1394,13 +1441,14 @@ def get_workflow_batch_summary(batch_id: str) -> dict[str, Any] | None:
             .order_by(WorkflowRunModel.batch_item_index, WorkflowRunModel.created_at)
         ).all()
         summaries = []
+        counts = _status_counts(runs)
+        status = _batch_status_from_counts(counts)
+        batch_paused = bool(batch.status == RUN_PAUSED and status not in RUN_TERMINAL)
         for run in runs:
             definition = run.get_definition()
             order = _step_order(definition)
             steps = sorted(_steps_for_run(session, run.id), key=lambda item: order.get(item.step_id, 0))
-            summaries.append(_run_summary(run, steps))
-        counts = _status_counts(runs)
-        status = _batch_status_from_counts(counts)
+            summaries.append(_run_summary_with_batch_state(run, steps, batch_paused=batch_paused))
         if batch.status == RUN_PAUSED and status not in RUN_TERMINAL:
             status = RUN_PAUSED
         return {

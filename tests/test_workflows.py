@@ -521,6 +521,52 @@ def test_workflow_batch_prefers_existing_pipeline_before_opening_next_item():
     assert second_detail["steps"][1]["status"] == STEP_READY
 
 
+def test_workflow_summary_distinguishes_ready_running_and_waiting_external():
+    _register_test_adapters()
+    create_or_update_workflow_definition(
+        _definition(
+            "test_summary_state_copy",
+            [
+                {"id": "first", "name": "第一步", "uses": "test.immediate"},
+                {"id": "second", "name": "第二步", "uses": "test.immediate", "needs": ["first"]},
+            ],
+        )
+    )
+    run = create_workflow_run(definition_key="test_summary_state_copy", inputs={})
+
+    assert run_due_workflow_once()
+    summary = get_workflow_run_summary(run["id"])
+    assert summary["current_stage"] == "second"
+    assert summary["display_status"] == "等待执行: 第二步"
+
+    with Session(engine) as session:
+        model = session.get(WorkflowRunModel, run["id"])
+        second = session.exec(
+            select(WorkflowStepRunModel)
+            .where(WorkflowStepRunModel.workflow_run_id == run["id"])
+            .where(WorkflowStepRunModel.step_id == "second")
+        ).one()
+        second.status = STEP_RUNNING
+        model.status = RUN_RUNNING
+        model.current_step_id = "second"
+        session.add(second)
+        session.add(model)
+        session.commit()
+
+    summary = get_workflow_run_summary(run["id"])
+    assert summary["current_stage"] == "second"
+    assert summary["display_status"] == "正在执行: 第二步"
+
+    create_or_update_workflow_definition(
+        _definition("test_summary_waiting_copy", [{"id": "wait", "name": "外部步骤", "uses": "test.hold"}])
+    )
+    waiting_run = create_workflow_run(definition_key="test_summary_waiting_copy", inputs={})
+    assert run_due_workflow_once()
+    summary = get_workflow_run_summary(waiting_run["id"])
+    assert summary["current_stage"] == "wait"
+    assert summary["display_status"] == "等待外部结果: 外部步骤"
+
+
 def test_workflow_runtime_executes_due_steps_concurrently():
     _register_test_adapters()
     _ConcurrentBlockingAdapter.reset()
@@ -569,10 +615,20 @@ def test_workflow_batch_pause_resume_cancel_and_retry_failed_items():
 
     paused = pause_workflow_batch(paused_batch["id"])
     assert paused["status"] == RUN_PAUSED
+    paused_run_summary = get_workflow_run_summary(paused_batch["runs"][0]["id"])
+    assert paused_run_summary["batch_paused"] is True
+    assert paused_run_summary["display_status"] == "批次已暂停: first"
+    assert paused_run_summary["operator_action"] == "恢复批次后继续"
+    paused_batch_summary = get_workflow_batch_summary(paused_batch["id"])
+    assert paused_batch_summary["runs"][0]["batch_paused"] is True
+    assert paused_batch_summary["runs"][0]["display_status"] == "批次已暂停: first"
     assert not run_due_workflow_once()
 
     resumed = resume_workflow_batch(paused_batch["id"])
     assert resumed["status"] in {RUN_PENDING, RUN_RUNNING}
+    resumed_run_summary = get_workflow_run_summary(paused_batch["runs"][0]["id"])
+    assert resumed_run_summary["batch_paused"] is False
+    assert resumed_run_summary["display_status"] == "等待执行: first"
     assert run_due_workflow_once()
     assert run_due_workflow_once()
     assert get_workflow_batch_summary(paused_batch["id"])["summary"]["succeeded"] == 2
