@@ -151,7 +151,11 @@ class KakaoPipelineReconciler:
             logger.warning("Kakao 后台刷新失败 account_id=%s: %s", account_id, exc)
             return
 
-        state = str(result.get("state") or "") if isinstance(result, dict) else ""
+        state = (
+            str(result.get("_background_state") or result.get("state") or "")
+            if isinstance(result, dict)
+            else ""
+        )
         with self._guard:
             self._inflight.discard(account_id)
             if state not in BACKGROUND_POLL_STATES:

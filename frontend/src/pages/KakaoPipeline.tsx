@@ -49,6 +49,22 @@ type AccountProxySetting = {
   preview: string
 }
 
+type PipelinePostAction = {
+  status?: string | null
+  task_id?: string | number | null
+  error?: string | null
+  authorized?: boolean
+  enabled?: boolean
+  target_key?: string | null
+}
+
+type PushDelivery = {
+  status?: string | null
+  last_error?: string | null
+  error?: string | null
+  target_key?: string | null
+}
+
 type KakaoSettings = Record<SettingKind, KakaoSetting> & {
   default_scanner_kind: ScannerKind
   auto_upload_after_extract: boolean
@@ -103,6 +119,10 @@ type Pipeline = {
   events?: Array<{ time: string; level: string; message: string }>
   supplier_response?: Record<string, unknown>
   scanner_response?: Record<string, unknown>
+  post_actions?: {
+    codex?: PipelinePostAction | null
+    push?: PipelinePostAction | null
+  } | null
 }
 
 type KakaoAccount = {
@@ -118,7 +138,12 @@ type KakaoAccount = {
       phone_bound?: boolean
       phone_number_masked?: string
     }
+    codex?: {
+      authorized?: boolean
+    }
+    push_deliveries?: PushDelivery[]
   }
+  push_deliveries?: PushDelivery[]
   pipeline: Pipeline
 }
 
@@ -176,6 +201,16 @@ const ATTENTION_PIPELINE_STATES = new Set([
   'scanner_poll_failed',
   'scanner_submit_unconfirmed',
   'scanner_recovery_unconfirmed',
+  'plus_unconfirmed',
+  'plus_check_failed',
+])
+const ADVANCE_PLUS_PIPELINE_STATES = new Set([
+  'scanner_succeeded',
+  'scanner_accepted_untracked',
+  'scanner_recovery_unconfirmed',
+  'scanner_submit_unconfirmed',
+  'plus_checking',
+  'plus_pending',
   'plus_unconfirmed',
   'plus_check_failed',
 ])
@@ -278,7 +313,10 @@ function AccountMoreMenu({
   onCheckPlus,
   onAuthorizeCodex,
   onPush,
+  codexReady,
+  codexTitle,
   pushReady,
+  pushTitle,
   actionDisabled = false,
   onShowLog,
 }: {
@@ -288,7 +326,10 @@ function AccountMoreMenu({
   onCheckPlus: () => void
   onAuthorizeCodex: () => void
   onPush: () => void
+  codexReady: boolean
+  codexTitle: string
   pushReady: boolean
+  pushTitle: string
   actionDisabled?: boolean
   onShowLog?: () => void
 }) {
@@ -362,7 +403,8 @@ function AccountMoreMenu({
           <button
             type="button"
             role="menuitem"
-            disabled={actionDisabled}
+            disabled={actionDisabled || !codexReady}
+            title={codexTitle}
             className="flex w-full items-center px-3 py-2 text-left text-xs font-medium text-violet-500 transition-colors hover:bg-violet-500/10 focus-visible:bg-violet-500/10 focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-40"
             onClick={() => {
               setOpen(false)
@@ -375,7 +417,7 @@ function AccountMoreMenu({
             type="button"
             role="menuitem"
             disabled={actionDisabled || !pushReady}
-            title={pushReady ? '推送到默认目标' : '请先到设置中配置并启用推送目标'}
+            title={pushTitle}
             className="flex w-full items-center px-3 py-2 text-left text-xs font-medium text-[var(--text-primary)] transition-colors hover:bg-[var(--bg-hover)] focus-visible:bg-[var(--bg-hover)] focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-40"
             onClick={() => {
               setOpen(false)
@@ -446,7 +488,95 @@ function AccountMoreMenu({
   )
 }
 
-type StepState = 'waiting' | 'active' | 'complete' | 'paused' | 'error'
+type StepState = 'waiting' | 'active' | 'complete' | 'skipped' | 'paused' | 'error'
+
+const ACTIVE_POST_ACTION_STATUSES = new Set(['pending', 'queued', 'claimed', 'running', 'cancel_requested'])
+
+function normalizePostActionStatus(value?: string | null) {
+  return String(value || '').trim().toLowerCase()
+}
+
+function pipelinePlusComplete(account: KakaoAccount) {
+  const pipeline = account.pipeline
+  return pipeline.state === 'completed' || pipeline.final_result === 'plus' || accountIsPlus(account)
+}
+
+function latestPushDelivery(account: KakaoAccount, targetKey = 'nvtokens') {
+  const deliveries = Array.isArray(account.push_deliveries)
+    ? account.push_deliveries
+    : Array.isArray(account.account_view?.push_deliveries)
+      ? account.account_view.push_deliveries
+      : []
+  return deliveries.find(delivery => String(delivery?.target_key || '').trim() === targetKey) || null
+}
+
+function postActionStepState(
+  action?: PipelinePostAction | null,
+  options: { complete?: boolean; disabled?: boolean } = {},
+): StepState {
+  const status = normalizePostActionStatus(action?.status)
+  if (['success', 'succeeded'].includes(status)) return 'complete'
+  if (status === 'failed') return 'error'
+  if (['paused', 'interrupted', 'cancelled'].includes(status)) return 'paused'
+  if (['skipped', 'disabled'].includes(status) || options.disabled) return 'skipped'
+  if (ACTIVE_POST_ACTION_STATUSES.has(status)) return 'active'
+  if (options.complete) return 'complete'
+  return 'waiting'
+}
+
+function getPostActionPresentation(account: KakaoAccount) {
+  const plusComplete = pipelinePlusComplete(account)
+  const codex = account.pipeline.post_actions?.codex || null
+  const codexAuthorized = typeof codex?.authorized === 'boolean'
+    ? codex.authorized
+    : account.account_view?.codex?.authorized === true
+  const codexStatus = normalizePostActionStatus(codex?.status)
+  // A stored authorization may satisfy an untouched/waiting stage, but it must
+  // never mask the outcome of a newer task that is active, paused, or failed.
+  const reusableCodexAuthorization = codexAuthorized && (!codexStatus || codexStatus === 'waiting')
+  const codexState = plusComplete
+    ? postActionStepState(codex, { complete: reusableCodexAuthorization })
+    : 'waiting'
+
+  const explicitPush = account.pipeline.post_actions?.push || null
+  const delivery = explicitPush ? null : latestPushDelivery(account)
+  const push: PipelinePostAction | null = explicitPush || (delivery
+    ? {
+        status: delivery.status,
+        error: delivery.last_error || delivery.error,
+        target_key: delivery.target_key,
+      }
+    : null)
+  const codexSettled = codexState === 'complete' || (codexState === 'skipped' && codexAuthorized)
+  const pushState = plusComplete && codexSettled
+    ? postActionStepState(push, { disabled: explicitPush?.enabled === false })
+    : 'waiting'
+
+  return {
+    plusComplete,
+    codex,
+    codexAuthorized,
+    codexSettled,
+    codexState,
+    push,
+    pushState,
+  }
+}
+
+function postActionsAreActive(account: KakaoAccount) {
+  const { codexState, pushState } = getPostActionPresentation(account)
+  return codexState === 'active' || pushState === 'active'
+}
+
+function postActionsHaveError(account: KakaoAccount) {
+  const { codexState, pushState } = getPostActionPresentation(account)
+  return codexState === 'error' || pushState === 'error'
+}
+
+function pipelineFlowComplete(account: KakaoAccount) {
+  const { plusComplete, codexSettled, pushState } = getPostActionPresentation(account)
+  return plusComplete && codexSettled && ['complete', 'skipped'].includes(pushState)
+}
 
 function formatLatestTime(value?: string | null) {
   if (!value) return null
@@ -511,8 +641,15 @@ function formatNextPlusCheck(value?: string | null) {
 
 function PipelineProgress({ account }: { account: KakaoAccount }) {
   const pipeline = account.pipeline
-  const alreadyPlus = accountIsPlus(account)
-  const scannerReached = [
+  const {
+    plusComplete,
+    codex,
+    codexAuthorized,
+    codexState,
+    push,
+    pushState,
+  } = getPostActionPresentation(account)
+  const scannerReached = plusComplete || [
     'scanner_submitting',
     'scanner_processing',
     'scanner_accepted_untracked',
@@ -527,7 +664,7 @@ function PipelineProgress({ account }: { account: KakaoAccount }) {
     'plus_check_failed',
     'completed',
   ].includes(pipeline.state)
-  const scannerComplete = ['scanner_succeeded', 'plus_checking', 'plus_pending', 'plus_unconfirmed', 'plus_check_failed', 'completed'].includes(pipeline.state)
+  const scannerComplete = plusComplete || ['scanner_succeeded', 'plus_checking', 'plus_pending', 'plus_unconfirmed', 'plus_check_failed', 'completed'].includes(pipeline.state)
   const scannerUncertain = ['scanner_accepted_untracked', 'scanner_recovery_unconfirmed', 'scanner_submit_unconfirmed', 'scanner_poll_failed'].includes(pipeline.state)
   const steps: Array<{ label: string; state: StepState }> = [
     {
@@ -558,7 +695,7 @@ function PipelineProgress({ account }: { account: KakaoAccount }) {
       label: 'Plus',
       state: pipeline.state === 'plus_check_failed'
         ? 'error'
-        : pipeline.state === 'completed' || pipeline.final_result === 'plus' || alreadyPlus
+        : plusComplete
           ? 'complete'
           : ['plus_unconfirmed', 'scanner_accepted_untracked', 'scanner_recovery_unconfirmed', 'scanner_submit_unconfirmed'].includes(pipeline.state)
             ? 'paused'
@@ -566,11 +703,43 @@ function PipelineProgress({ account }: { account: KakaoAccount }) {
             ? 'active'
             : 'waiting',
     },
+    {
+      label: 'Codex',
+      state: codexState,
+    },
+    {
+      label: '推送',
+      state: pushState,
+    },
   ]
 
   const stateText = (() => {
-    if (pipeline.state === 'completed' || pipeline.final_result === 'plus') return '已确认升级 Plus'
-    if (alreadyPlus) return '账号当前已是 Plus'
+    if (plusComplete) {
+      const codexError = String(codex?.error || '').trim()
+      const pushError = String(push?.error || '').trim()
+      const codexStatus = normalizePostActionStatus(codex?.status)
+      const pushStatus = normalizePostActionStatus(push?.status)
+
+      if (codexState === 'error') return `Plus 已确认，Codex 授权失败${codexError ? `：${codexError}` : ''}`
+      if (codexState === 'paused') return `Plus 已确认，Codex 授权已中断${codexError ? `：${codexError}` : ''}`
+      if (codexState === 'active') {
+        return ['running', 'cancel_requested'].includes(codexStatus)
+          ? 'Plus 已确认，正在进行 Codex 授权'
+          : 'Plus 已确认，Codex 授权任务排队中'
+      }
+      if (codexState === 'skipped' && !codexAuthorized) return 'Plus 已确认，Codex 授权已跳过'
+      if (codexState === 'waiting') return 'Plus 已确认，等待 Codex 授权'
+
+      if (pushState === 'error') return `Codex 已授权，推送失败${pushError ? `：${pushError}` : ''}`
+      if (pushState === 'paused') return `Codex 已授权，推送已中断${pushError ? `：${pushError}` : ''}`
+      if (pushState === 'active') return ['running', 'cancel_requested'].includes(pushStatus) ? 'Codex 已授权，正在推送' : 'Codex 已授权，推送任务排队中'
+      if (pushState === 'skipped') {
+        const disabled = pipeline.post_actions?.push?.enabled === false || pushStatus === 'disabled'
+        return disabled ? 'Codex 已授权，自动推送未启用' : 'Codex 已授权，推送已跳过'
+      }
+      if (pushState === 'complete') return 'Codex 授权及推送已完成'
+      return 'Codex 已授权，等待推送'
+    }
     if (pipeline.state === 'supplier_processing') {
       const stage = pipeline.supplier_stage_total ? `${pipeline.supplier_stage || 0}/${pipeline.supplier_stage_total} ` : ''
       return `${stage}${pipeline.supplier_stage_name || pipeline.supplier_status || '供应商处理中'}`
@@ -620,13 +789,14 @@ function PipelineProgress({ account }: { account: KakaoAccount }) {
             {index > 0 ? (
               <div className={cn(
                 'absolute right-1/2 top-[6px] h-px w-full',
-                steps[index - 1].state === 'complete' ? 'bg-emerald-500/60' : 'bg-[var(--border)]',
+                ['complete', 'skipped'].includes(steps[index - 1].state) ? 'bg-emerald-500/60' : 'bg-[var(--border)]',
               )} />
             ) : null}
             <span className={cn(
               'relative z-10 h-3 w-3 rounded-full ring-4 ring-[var(--bg-surface)]',
               step.state === 'complete' && 'bg-emerald-500',
               step.state === 'active' && 'bg-[var(--accent)]',
+              step.state === 'skipped' && 'bg-slate-400',
               step.state === 'paused' && 'bg-amber-500',
               step.state === 'error' && 'bg-red-500',
               step.state === 'waiting' && 'bg-[var(--border)]',
@@ -635,6 +805,7 @@ function PipelineProgress({ account }: { account: KakaoAccount }) {
               'text-[11px]',
               step.state === 'complete' && 'text-emerald-500',
               step.state === 'active' && 'font-medium text-[var(--accent)]',
+              step.state === 'skipped' && 'text-[var(--text-muted)]',
               step.state === 'paused' && 'font-medium text-amber-500',
               step.state === 'error' && 'font-medium text-red-500',
               step.state === 'waiting' && 'text-[var(--text-muted)]',
@@ -644,8 +815,10 @@ function PipelineProgress({ account }: { account: KakaoAccount }) {
       </div>
       <p className={cn(
         'mt-2 text-center text-xs leading-5',
-        ATTENTION_PIPELINE_STATES.has(pipeline.state)
+        ATTENTION_PIPELINE_STATES.has(pipeline.state) || codexState === 'error' || pushState === 'error'
           ? 'text-red-500'
+          : codexState === 'paused' || pushState === 'paused'
+            ? 'text-amber-500'
           : 'text-[var(--text-secondary)]',
       )} title={stateText}>{stateText}</p>
     </div>
@@ -1378,27 +1551,30 @@ export default function KakaoPipeline() {
   }
 
   const authorizeCodex = async (account: KakaoAccount) => {
+    if (!pipelinePlusComplete(account)) {
+      setToast({ type: 'error', text: '请先完成 Plus 确认，再启动 Codex 授权' })
+      return
+    }
     if (activeRequests.current.has(account.id)) return
     activeRequests.current.add(account.id)
     setOperations(current => ({ ...current, [account.id]: '启动 Codex 授权' }))
     try {
-      const result = await apiFetch('/accounts/codex-oauth/authorize', {
+      const result = await apiFetch(`/kakao-pipeline/accounts/${account.id}/codex`, {
         method: 'POST',
-        body: JSON.stringify({
-          platform: 'chatgpt',
-          ids: [account.id],
-          select_all: false,
-          concurrency: 1,
-          params: {
-            browser_mode: 'headless',
-            keep_browser_open: 'false',
-          },
-        }),
+        body: JSON.stringify({}),
       })
-      if (!result?.task_id) throw new Error('Codex 授权任务创建失败')
-      setToast({ type: 'success', text: `${account.email} 的 Codex 授权任务已启动` })
+      const action = result?.post_actions?.codex || result?.codex || result
+      const status = normalizePostActionStatus(action?.status)
+      setToast({
+        type: 'success',
+        text: ['success', 'succeeded', 'skipped'].includes(status)
+          ? `${account.email} 已完成 Codex 授权`
+          : `${account.email} 的 Codex 授权任务已启动`,
+      })
+      await loadAccounts(false)
     } catch (error) {
       setToast({ type: 'error', text: parseError(error) })
+      await loadAccounts(false)
     } finally {
       activeRequests.current.delete(account.id)
       setOperations(current => {
@@ -1410,7 +1586,10 @@ export default function KakaoPipeline() {
   }
 
   const pushAccount = async (account: KakaoAccount) => {
-    const target = pushTargets.find(item => item.is_default) || pushTargets[0]
+    const linkedTargetKey = String(account.pipeline.post_actions?.push?.target_key || '').trim()
+    const target = pushTargets.find(item => item.key === linkedTargetKey)
+      || pushTargets.find(item => item.is_default)
+      || pushTargets[0]
     if (!target) {
       setToast({ type: 'error', text: '请先到设置中配置并启用推送目标' })
       return
@@ -1446,14 +1625,40 @@ export default function KakaoPipeline() {
 
   const renderActions = (account: KakaoAccount) => {
     const pipeline = account.pipeline
+    const { plusComplete, codexSettled, codexState, pushState } = getPostActionPresentation(account)
     const busy = operations[account.id]
     const supplierReady = Boolean(settings?.supplier.has_cdk)
     const scannerKind = settings?.default_scanner_kind || 'scanner'
     const selectedScanner = settings?.[scannerKind]
     const scannerReady = Boolean(selectedScanner?.has_cdk)
+    const hasPushTarget = pushTargets.length > 0
+    const codexReady = plusComplete && codexState !== 'active'
+    const codexTitle = !plusComplete
+      ? '请先完成 Plus 确认'
+      : codexState === 'active'
+        ? 'Codex 授权任务正在执行'
+        : '启动或重试 Codex 授权'
+    const pushReady = hasPushTarget && codexSettled && pushState !== 'active'
+    const pushTitle = !codexSettled
+      ? '请先完成 Codex 授权'
+      : !hasPushTarget
+        ? '请先到设置中配置并启用推送目标'
+        : pushState === 'active'
+          ? '推送任务正在执行'
+          : '推送到默认目标'
 
     const checkPlus = () => {
-      void run(account.id, '检测 Plus', `/kakao-pipeline/accounts/${account.id}/plus/check`)
+      const advancePipeline = pipeline.state !== 'completed' && ADVANCE_PLUS_PIPELINE_STATES.has(pipeline.state)
+      void run(
+        account.id,
+        '检测 Plus',
+        `/kakao-pipeline/accounts/${account.id}/plus/check`,
+        advancePipeline ? { advance_pipeline: true } : {},
+      )
+    }
+
+    const refreshAccountStatus = () => {
+      void run(account.id, '刷新账号状态', `/kakao-pipeline/accounts/${account.id}/plus/check`)
     }
 
     const forceReset = () => {
@@ -1482,7 +1687,10 @@ export default function KakaoPipeline() {
             onCheckPlus={checkPlus}
             onAuthorizeCodex={() => void authorizeCodex(account)}
             onPush={() => void pushAccount(account)}
-            pushReady={pushTargets.length > 0}
+            codexReady={codexReady}
+            codexTitle={codexTitle}
+            pushReady={pushReady}
+            pushTitle={pushTitle}
             actionDisabled
           />
         </div>
@@ -1548,22 +1756,17 @@ export default function KakaoPipeline() {
             <RefreshCw className="mr-1.5 h-3.5 w-3.5" /> 查询扫码
           </Button>
         )}
-        {['scanner_succeeded', 'scanner_accepted_untracked', 'scanner_recovery_unconfirmed', 'scanner_submit_unconfirmed', 'plus_pending', 'plus_unconfirmed', 'plus_check_failed'].includes(pipeline.state) ? (
+        {ADVANCE_PLUS_PIPELINE_STATES.has(pipeline.state) && pipeline.state !== 'plus_checking' ? (
           <Button
             variant="outline"
             size="sm"
-            onClick={() => run(
-              account.id,
-              '检测 Plus',
-              `/kakao-pipeline/accounts/${account.id}/plus/check`,
-              { advance_pipeline: true },
-            )}
+            onClick={checkPlus}
           >
             <Check className="mr-1.5 h-3.5 w-3.5" /> 检测 Plus
           </Button>
         ) : null}
-        {pipeline.state === 'completed' || accountIsPlus(account) ? (
-          <Button variant="outline" size="sm" onClick={checkPlus}>
+        {pipeline.state === 'completed' || (accountIsPlus(account) && !ADVANCE_PLUS_PIPELINE_STATES.has(pipeline.state)) ? (
+          <Button variant="outline" size="sm" onClick={refreshAccountStatus}>
             <Check className="mr-1.5 h-3.5 w-3.5" /> 刷新账号状态
           </Button>
         ) : null}
@@ -1574,7 +1777,10 @@ export default function KakaoPipeline() {
           onCheckPlus={checkPlus}
           onAuthorizeCodex={() => void authorizeCodex(account)}
           onPush={() => void pushAccount(account)}
-          pushReady={pushTargets.length > 0}
+          codexReady={codexReady}
+          codexTitle={codexTitle}
+          pushReady={pushReady}
+          pushTitle={pushTitle}
           onShowLog={pipeline.state !== 'idle' ? () => toggleDetail(account.id) : undefined}
         />
       </div>
@@ -1582,10 +1788,14 @@ export default function KakaoPipeline() {
   }
 
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE))
-  const activeCount = accounts.filter(account => ACTIVE_PIPELINE_STATES.has(account.pipeline.state)).length
+  const activeCount = accounts.filter(account => (
+    ACTIVE_PIPELINE_STATES.has(account.pipeline.state) || postActionsAreActive(account)
+  )).length
   const readyCount = accounts.filter(account => account.pipeline.state === 'link_ready').length
-  const errorCount = accounts.filter(account => ATTENTION_PIPELINE_STATES.has(account.pipeline.state)).length
-  const completedCount = accounts.filter(account => account.pipeline.state === 'completed' || accountIsPlus(account)).length
+  const errorCount = accounts.filter(account => (
+    ATTENTION_PIPELINE_STATES.has(account.pipeline.state) || postActionsHaveError(account)
+  )).length
+  const completedCount = accounts.filter(pipelineFlowComplete).length
   const expandedAccount = expanded === null ? null : accounts.find(account => account.id === expanded) || null
 
   return (
@@ -1623,7 +1833,7 @@ export default function KakaoPipeline() {
             </div>
             <div>
               <h1 className="text-lg font-semibold text-[var(--text-primary)]">Kakao 流水线</h1>
-              <p className="mt-0.5 text-sm text-[var(--text-muted)]">按账号完成提链、扫码与 Plus 复检。</p>
+              <p className="mt-0.5 text-sm text-[var(--text-muted)]">按账号完成提链、扫码、Plus 复检、Codex 授权与推送。</p>
             </div>
           </div>
         </div>
@@ -1731,9 +1941,9 @@ export default function KakaoPipeline() {
               ) : accounts.map(account => (
                     <tr key={account.id} className={cn(
                       'align-top transition-colors hover:bg-[var(--bg-hover)]',
-                      ATTENTION_PIPELINE_STATES.has(account.pipeline.state)
+                      ATTENTION_PIPELINE_STATES.has(account.pipeline.state) || postActionsHaveError(account)
                         ? 'bg-red-500/[0.025]'
-                        : account.pipeline.state === 'completed'
+                        : pipelineFlowComplete(account)
                           ? 'bg-emerald-500/[0.025]'
                           : '',
                     )}>

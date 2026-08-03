@@ -3,8 +3,17 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
+import pytest
+from sqlmodel import select
+
 from core.base_platform import Account
-from core.db import KakaoPipelineModel, save_account
+from core.db import (
+    AccountCodexAuthModel,
+    AccountPushDeliveryModel,
+    KakaoPipelineModel,
+    TaskModel,
+    save_account,
+)
 from features.kakao_pipeline.client import CustomerApiClient, CustomerApiProblem
 from features.kakao_pipeline.service import KakaoPipelineService
 from features.kakao_pipeline.workstation_client import WorkstationScannerClient
@@ -642,6 +651,60 @@ def test_546789_duplicate_compensation_switches_to_untracked_plus_confirmation(m
     assert completed["completion_source"] == "duplicate_submission_untracked"
     assert completed["scanner_recovery_check_count"] == 1
     assert completed["scanner_recovery_next_check_at"] is None
+    assert completed["post_actions"]["codex"]["status"] == "waiting"
+
+
+def test_page_plus_check_persists_arm_before_untracked_delegation(monkeypatch):
+    account_id = _create_account("page-untracked-arm@test.com")
+    service = KakaoPipelineService()
+
+    from sqlmodel import Session
+
+    from core.db import engine
+
+    now = datetime.now(timezone.utc)
+    with Session(engine) as session:
+        session.add(
+            KakaoPipelineModel(
+                account_id=account_id,
+                state="scanner_accepted_untracked",
+                scanner_status="DUPLICATE_ACCEPTED",
+                scanner_recovery_started_at=now,
+                scanner_recovery_next_check_at=now,
+                scanner_recovery_deadline_at=now + timedelta(minutes=30),
+                codex_post_action_armed=False,
+            )
+        )
+        session.commit()
+
+    monkeypatch.setattr(
+        "features.kakao_pipeline.service.PlatformRuntime.execute_action",
+        lambda *_args, **_kwargs: SimpleNamespace(ok=True, error=""),
+    )
+    monkeypatch.setattr(
+        service.accounts,
+        "get_account",
+        lambda _account_id: {
+            "account_view": {
+                "status": {"checked_at": "2099-01-01T00:00:00Z"},
+                "subscription": {"plan": "plus", "state": "subscribed"},
+            }
+        },
+    )
+
+    completed = service.check_plus(
+        account_id,
+        advance_pipeline=True,
+        enable_post_actions=True,
+    )
+
+    assert completed["state"] == "completed"
+    assert completed["post_actions"]["codex"]["status"] == "pending"
+    with Session(engine) as session:
+        pipeline = session.exec(
+            select(KakaoPipelineModel).where(KakaoPipelineModel.account_id == account_id)
+        ).one()
+        assert pipeline.codex_post_action_armed is True
 
 
 def test_untracked_plus_confirmation_stops_only_at_persisted_30_minute_deadline(monkeypatch):
@@ -1237,11 +1300,81 @@ def test_normal_plus_confirmation_completes_only_with_fresh_query_result(monkeyp
         },
     )
 
-    result = service.check_plus(account_id, advance_pipeline=True)
+    result = service.check_plus(
+        account_id,
+        advance_pipeline=True,
+        enable_post_actions=True,
+    )
 
     assert result["state"] == "completed"
     assert result["completion_source"] == "normal_scanner"
     assert result["plus_next_check_at"] is None
+    assert result["post_actions"]["codex"]["status"] == "pending"
+    codex_task_id = result["post_actions"]["codex"]["task_id"]
+    assert codex_task_id
+
+    with Session(engine) as session:
+        pipeline = session.exec(
+            select(KakaoPipelineModel).where(KakaoPipelineModel.account_id == account_id)
+        ).one()
+        task = session.get(TaskModel, codex_task_id)
+        assert pipeline.state == "completed"
+        assert pipeline.codex_post_action_armed is True
+        assert pipeline.codex_task_id == codex_task_id
+        assert task is not None
+        assert task.get_payload()["source"] == "kakao_pipeline"
+        assert task.get_payload()["auto_push_after_oauth"] is False
+
+
+def test_default_workflow_owned_plus_completion_does_not_start_page_codex(monkeypatch):
+    account_id = _create_account("workflow-owned-plus@test.com")
+    service = KakaoPipelineService()
+
+    from sqlmodel import Session
+
+    from core.db import engine
+
+    with Session(engine) as session:
+        session.add(
+            KakaoPipelineModel(
+                account_id=account_id,
+                state="scanner_succeeded",
+                scanner_status="COMPLETED",
+                codex_post_action_armed=False,
+            )
+        )
+        session.commit()
+
+    monkeypatch.setattr(
+        "features.kakao_pipeline.service.PlatformRuntime.execute_action",
+        lambda *_args, **_kwargs: SimpleNamespace(ok=True, error=""),
+    )
+    monkeypatch.setattr(
+        service.accounts,
+        "get_account",
+        lambda _account_id: {
+            "account_view": {
+                "status": {"checked_at": "2099-01-01T00:00:00Z"},
+                "subscription": {"plan": "plus", "state": "subscribed"},
+            }
+        },
+    )
+
+    result = service.check_plus(
+        account_id,
+        advance_pipeline=True,
+        enable_post_actions=False,
+    )
+
+    assert result["state"] == "completed"
+    assert result["post_actions"]["codex"]["status"] == "waiting"
+    assert result["post_actions"]["codex"]["task_id"] is None
+    with Session(engine) as session:
+        pipeline = session.exec(
+            select(KakaoPipelineModel).where(KakaoPipelineModel.account_id == account_id)
+        ).one()
+        assert pipeline.codex_post_action_armed is False
+        assert pipeline.codex_task_id == ""
 
 
 def test_completed_pipeline_cannot_regress_during_account_refresh(monkeypatch):
@@ -1628,3 +1761,619 @@ def test_kakao_account_list_exposes_phone_and_codex_status_without_secrets(monke
         "phone_number_masked": "+86****1234",
     }
     assert "must-not-leak" not in str(payload)
+
+
+def test_kakao_account_list_requires_complete_codex_token_pair():
+    from sqlmodel import Session
+
+    from core.db import engine
+
+    account_id = _create_account("strict-codex-status@test.com")
+    with Session(engine) as session:
+        session.add(
+            AccountCodexAuthModel(
+                account_id=account_id,
+                has_access_token=True,
+                has_refresh_token=False,
+            )
+        )
+        session.commit()
+
+    service = KakaoPipelineService()
+    incomplete = service.list_accounts()["items"][0]["pipeline"]["post_actions"]["codex"]
+    assert incomplete["authorized"] is False
+
+    with Session(engine) as session:
+        auth = session.get(AccountCodexAuthModel, account_id)
+        assert auth is not None
+        auth.has_refresh_token = True
+        session.add(auth)
+        session.commit()
+
+    complete = service.list_accounts()["items"][0]["pipeline"]["post_actions"]["codex"]
+    assert complete["authorized"] is True
+
+
+def test_succeeded_codex_task_without_matching_account_result_is_not_authorized():
+    from sqlmodel import Session
+
+    from core.db import engine
+
+    account_id = _create_account("missing-codex-result@test.com")
+    task = TaskModel(
+        id="codex-missing-account-result",
+        type="codex_oauth_batch",
+        platform="chatgpt",
+        status="succeeded",
+    )
+    task.set_result({"data": {"accounts": [{"account_id": account_id + 1, "ok": True}]}})
+    with Session(engine) as session:
+        session.add(
+            KakaoPipelineModel(
+                account_id=account_id,
+                state="completed",
+                plus_status="plus",
+                final_result="plus",
+                completed_at=datetime.now(timezone.utc),
+                codex_post_action_armed=True,
+                codex_task_id=task.id,
+                codex_attempt_count=1,
+            )
+        )
+        session.add(
+            AccountCodexAuthModel(
+                account_id=account_id,
+                has_access_token=True,
+                has_refresh_token=True,
+            )
+        )
+        session.add(task)
+        session.commit()
+
+    codex = KakaoPipelineService().get_account_pipeline(account_id)["post_actions"]["codex"]
+
+    assert codex["authorized"] is True
+    assert codex["status"] == "failed"
+    assert "complete credentials" in codex["error"]
+
+
+def test_kakao_post_action_errors_are_redacted_before_api_serialization():
+    from sqlmodel import Session
+
+    from core.db import engine
+
+    account_id = _create_account("redacted-task-error@test.com")
+    secret_error = (
+        "token endpoint failed for private.user@example.com +8613800138000: "
+        "https://proxy-user:proxy-pass@example.com/callback?code=oauth-code&state=oauth-state "
+        "Authorization: Bearer bearer-secret access_token='access-secret' "
+        'refresh_token="refresh-secret" password=hunter2'
+    )
+    task = TaskModel(
+        id="codex-secret-error",
+        type="codex_oauth_batch",
+        platform="chatgpt",
+        status="failed",
+        error=secret_error,
+    )
+    task.set_result(
+        {
+            "data": {
+                "accounts": [
+                    {"account_id": account_id, "ok": False, "error": secret_error},
+                ]
+            }
+        }
+    )
+    with Session(engine) as session:
+        session.add(
+            KakaoPipelineModel(
+                account_id=account_id,
+                state="completed",
+                plus_status="plus",
+                final_result="plus",
+                completed_at=datetime.now(timezone.utc),
+                codex_post_action_armed=True,
+                codex_task_id=task.id,
+                codex_attempt_count=1,
+            )
+        )
+        session.add(task)
+        session.commit()
+
+    error = KakaoPipelineService().get_account_pipeline(account_id)["post_actions"]["codex"]["error"]
+
+    assert "***" in error
+    for secret in (
+        "private.user@example.com",
+        "+8613800138000",
+        "proxy-user",
+        "proxy-pass",
+        "oauth-code",
+        "oauth-state",
+        "bearer-secret",
+        "access-secret",
+        "refresh-secret",
+        "hunter2",
+    ):
+        assert secret not in error
+
+
+def test_old_delivery_does_not_complete_a_new_failed_linked_push():
+    from sqlmodel import Session
+
+    from core.db import engine
+
+    account_id = _create_account("stale-push-delivery@test.com")
+    now = datetime.now(timezone.utc)
+    push_task = TaskModel(
+        id="new-linked-push",
+        type="account_push",
+        platform="chatgpt",
+        status="failed",
+        error="new push failed",
+        started_at=now,
+        finished_at=now,
+    )
+    with Session(engine) as session:
+        session.add(
+            KakaoPipelineModel(
+                account_id=account_id,
+                state="completed",
+                plus_status="plus",
+                final_result="plus",
+                completed_at=now - timedelta(minutes=2),
+                codex_post_action_armed=True,
+                codex_skipped_at=now - timedelta(minutes=1),
+                codex_push_task_id=push_task.id,
+                codex_push_attempt_count=1,
+            )
+        )
+        session.add(
+            AccountCodexAuthModel(
+                account_id=account_id,
+                has_access_token=True,
+                has_refresh_token=True,
+            )
+        )
+        session.add(push_task)
+        session.add(
+            AccountPushDeliveryModel(
+                account_id=account_id,
+                target_key="nvtokens",
+                target_label="NexusVault",
+                status="success",
+                last_attempt_at=now - timedelta(minutes=5),
+                pushed_at=now - timedelta(minutes=5),
+                updated_at=now - timedelta(minutes=5),
+            )
+        )
+        session.commit()
+
+    service = KakaoPipelineService()
+    stale = service.get_account_pipeline(account_id)["post_actions"]["push"]
+    assert stale["status"] == "failed"
+    assert stale["error"] == "new push failed"
+
+    with Session(engine) as session:
+        delivery = session.exec(
+            select(AccountPushDeliveryModel).where(
+                AccountPushDeliveryModel.account_id == account_id
+            )
+        ).one()
+        delivery.last_attempt_at = now + timedelta(seconds=1)
+        delivery.pushed_at = now + timedelta(seconds=1)
+        delivery.updated_at = now + timedelta(seconds=1)
+        session.add(delivery)
+        session.commit()
+
+    retried = service.get_account_pipeline(account_id)["post_actions"]["push"]
+    assert retried["status"] == "success"
+
+
+def test_current_delivery_after_plus_and_auth_skips_duplicate_linked_push(monkeypatch):
+    from sqlmodel import Session
+
+    from core.db import engine
+
+    account_id = _create_account("current-delivery@test.com")
+    now = datetime.now(timezone.utc)
+    with Session(engine) as session:
+        session.add(
+            KakaoPipelineModel(
+                account_id=account_id,
+                state="completed",
+                plus_status="plus",
+                final_result="plus",
+                completed_at=now - timedelta(minutes=5),
+                codex_post_action_armed=True,
+                codex_skipped_at=now - timedelta(minutes=4),
+                codex_push_task_id="missing-linked-push",
+                codex_push_attempt_count=1,
+                codex_push_enqueue_error="automatic enqueue failed",
+            )
+        )
+        session.add(
+            AccountCodexAuthModel(
+                account_id=account_id,
+                has_access_token=True,
+                has_refresh_token=True,
+                last_refresh=now - timedelta(minutes=10),
+            )
+        )
+        session.add(
+            AccountPushDeliveryModel(
+                account_id=account_id,
+                target_key="nvtokens",
+                target_label="NexusVault",
+                status="success",
+                pushed_at=now - timedelta(minutes=1),
+                last_attempt_at=now - timedelta(minutes=1),
+                updated_at=now - timedelta(minutes=1),
+            )
+        )
+        session.commit()
+
+    monkeypatch.setattr(
+        "features.kakao_pipeline.service.get_nvtokens_auto_push_state",
+        lambda: {"enabled": True, "reason": ""},
+    )
+    monkeypatch.setattr(
+        "features.kakao_pipeline.service.enqueue_nvtokens_push_after_codex_oauth",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must not enqueue")),
+    )
+
+    result = KakaoPipelineService().advance_background(
+        account_id,
+        expected_state="codex_post_action",
+    )
+
+    assert result["post_actions"]["push"]["status"] == "success"
+    assert result["post_actions"]["push"]["task_id"] is None
+    with Session(engine) as session:
+        pipeline = session.exec(
+            select(KakaoPipelineModel).where(KakaoPipelineModel.account_id == account_id)
+        ).one()
+        assert pipeline.codex_push_skip_reason == "already_delivered"
+        assert pipeline.codex_push_task_id == ""
+        assert pipeline.codex_push_enqueue_error == ""
+
+
+def test_manual_current_delivery_overrides_an_automatic_push_skip(monkeypatch):
+    from sqlmodel import Session
+
+    from core.db import engine
+
+    account_id = _create_account("manual-after-disabled@test.com")
+    now = datetime.now(timezone.utc)
+    with Session(engine) as session:
+        session.add(
+            KakaoPipelineModel(
+                account_id=account_id,
+                state="completed",
+                plus_status="plus",
+                final_result="plus",
+                completed_at=now - timedelta(minutes=5),
+                codex_post_action_armed=True,
+                codex_skipped_at=now - timedelta(minutes=4),
+                codex_push_skip_reason="auto_push_disabled",
+                codex_post_action_done_at=now - timedelta(minutes=3),
+            )
+        )
+        session.add(
+            AccountCodexAuthModel(
+                account_id=account_id,
+                has_access_token=True,
+                has_refresh_token=True,
+                last_refresh=now - timedelta(minutes=10),
+            )
+        )
+        session.add(
+            AccountPushDeliveryModel(
+                account_id=account_id,
+                target_key="nvtokens",
+                target_label="NexusVault",
+                status="success",
+                pushed_at=now - timedelta(minutes=1),
+                last_attempt_at=now - timedelta(minutes=1),
+                updated_at=now - timedelta(minutes=1),
+            )
+        )
+        session.commit()
+
+    monkeypatch.setattr(
+        "features.kakao_pipeline.service.get_nvtokens_auto_push_state",
+        lambda: {"enabled": False, "reason": "auto_push_disabled"},
+    )
+
+    push = KakaoPipelineService().get_account_pipeline(account_id)["post_actions"]["push"]
+
+    assert push["status"] == "success"
+    assert push["pushed_at"] is not None
+
+
+@pytest.mark.parametrize(
+    ("completed_delta", "refresh_delta", "delivery_delta"),
+    [
+        (timedelta(minutes=1), timedelta(minutes=10), timedelta(minutes=5)),
+        (timedelta(minutes=10), timedelta(minutes=1), timedelta(minutes=5)),
+    ],
+)
+def test_delivery_older_than_plus_or_current_auth_does_not_skip_push(
+    monkeypatch,
+    completed_delta,
+    refresh_delta,
+    delivery_delta,
+):
+    from sqlmodel import Session
+
+    from core.db import engine
+
+    account_id = _create_account(f"stale-current-delivery-{completed_delta.seconds}@test.com")
+    now = datetime.now(timezone.utc)
+    with Session(engine) as session:
+        session.add(
+            KakaoPipelineModel(
+                account_id=account_id,
+                state="completed",
+                plus_status="plus",
+                final_result="plus",
+                completed_at=now - completed_delta,
+                codex_post_action_armed=True,
+                codex_skipped_at=now - timedelta(seconds=30),
+            )
+        )
+        session.add(
+            AccountCodexAuthModel(
+                account_id=account_id,
+                has_access_token=True,
+                has_refresh_token=True,
+                last_refresh=now - refresh_delta,
+            )
+        )
+        session.add(
+            AccountPushDeliveryModel(
+                account_id=account_id,
+                target_key="nvtokens",
+                target_label="NexusVault",
+                status="success",
+                pushed_at=now - delivery_delta,
+                last_attempt_at=now - delivery_delta,
+                updated_at=now - delivery_delta,
+            )
+        )
+        session.commit()
+
+    calls = []
+    monkeypatch.setattr(
+        "features.kakao_pipeline.service.get_nvtokens_auto_push_state",
+        lambda: {"enabled": True, "reason": ""},
+    )
+
+    def enqueue(account_id: int, **kwargs):
+        calls.append((account_id, kwargs))
+        return {"enqueued": False, "reason": "enqueue_failed", "error": "temporary failure"}
+
+    monkeypatch.setattr(
+        "features.kakao_pipeline.service.enqueue_nvtokens_push_after_codex_oauth",
+        enqueue,
+    )
+
+    result = KakaoPipelineService().advance_background(
+        account_id,
+        expected_state="codex_post_action",
+    )
+
+    assert calls and calls[0][1]["source"] == "kakao_pipeline"
+    assert result["post_actions"]["push"]["status"] == "failed"
+    with Session(engine) as session:
+        pipeline = session.exec(
+            select(KakaoPipelineModel).where(KakaoPipelineModel.account_id == account_id)
+        ).one()
+        assert pipeline.codex_push_skip_reason == ""
+
+
+def test_kakao_codex_endpoint_rejects_non_plus_account(client):
+    account_id = _create_account("codex-gate@test.com")
+
+    response = client.post(f"/api/kakao-pipeline/accounts/{account_id}/codex")
+
+    assert response.status_code == 400
+    assert "Plus" in response.text
+
+
+def test_kakao_page_routes_persistently_enable_post_actions(client, monkeypatch):
+    import api.kakao_pipeline as kakao_api
+
+    calls: list[tuple[str, int, bool | None]] = []
+
+    def start(
+        account_id: int,
+        supplier_setting_id: int | None = None,
+        payment_method: str = "kakao_pay",
+        *,
+        enable_post_actions: bool = False,
+    ):
+        calls.append(("extract", account_id, enable_post_actions))
+        return {"account_id": account_id, "state": "supplier_processing"}
+
+    def check(
+        account_id: int,
+        *,
+        advance_pipeline: bool = False,
+        enable_post_actions: bool | None = None,
+    ):
+        calls.append(("plus", account_id, enable_post_actions))
+        return {"account_id": account_id, "state": "plus_checking"}
+
+    monkeypatch.setattr(kakao_api.service, "start_extraction", start)
+    monkeypatch.setattr(kakao_api.service, "check_plus", check)
+
+    extracted = client.post(
+        "/api/kakao-pipeline/accounts/77/extract",
+        json={"payment_method": "kakao_pay"},
+    )
+    checked = client.post(
+        "/api/kakao-pipeline/accounts/77/plus/check",
+        json={"advance_pipeline": True},
+    )
+
+    assert extracted.status_code == 200
+    assert checked.status_code == 200
+    assert calls == [("extract", 77, True), ("plus", 77, True)]
+
+
+def test_kakao_codex_start_is_idempotent_while_task_is_active():
+    from sqlmodel import Session
+
+    from core.db import engine
+
+    account_id = _create_account("codex-idempotent@test.com")
+    with Session(engine) as session:
+        session.add(
+            KakaoPipelineModel(
+                account_id=account_id,
+                state="completed",
+                plus_status="plus",
+                final_result="plus",
+                completed_at=datetime.now(timezone.utc),
+            )
+        )
+        session.commit()
+
+    service = KakaoPipelineService()
+    first = service.start_codex(account_id)
+    second = service.start_codex(account_id)
+
+    assert first["state"] == "completed"
+    assert first["post_actions"]["codex"]["status"] == "pending"
+    assert second["post_actions"]["codex"]["task_id"] == first["post_actions"]["codex"]["task_id"]
+    with Session(engine) as session:
+        pipeline = session.exec(
+            select(KakaoPipelineModel).where(KakaoPipelineModel.account_id == account_id)
+        ).one()
+        assert pipeline.codex_attempt_count == 1
+
+
+def test_existing_valid_codex_auth_is_skipped_without_browser_task():
+    from sqlmodel import Session
+
+    from core.db import engine
+
+    account_id = _create_account("codex-existing@test.com")
+    with Session(engine) as session:
+        session.add(
+            KakaoPipelineModel(
+                account_id=account_id,
+                state="completed",
+                plus_status="plus",
+                final_result="plus",
+                completed_at=datetime.now(timezone.utc),
+            )
+        )
+        session.add(
+            AccountCodexAuthModel(
+                account_id=account_id,
+                has_access_token=True,
+                has_refresh_token=True,
+            )
+        )
+        session.commit()
+
+    result = KakaoPipelineService().start_codex(account_id)
+
+    assert result["post_actions"]["codex"] == {
+        "status": "skipped",
+        "task_id": None,
+        "authorized": True,
+        "error": "",
+        "attempt_count": 0,
+    }
+    assert result["post_actions"]["push"]["status"] == "skipped"
+    with Session(engine) as session:
+        pipeline = session.exec(
+            select(KakaoPipelineModel).where(KakaoPipelineModel.account_id == account_id)
+        ).one()
+        assert pipeline.codex_post_action_armed is True
+        assert pipeline.codex_skipped_at is not None
+        assert pipeline.codex_task_id == ""
+
+
+def test_kakao_codex_manual_retry_uses_a_new_deterministic_task_id():
+    from sqlmodel import Session
+
+    from core.db import engine
+
+    account_id = _create_account("codex-retry@test.com")
+    with Session(engine) as session:
+        session.add(
+            KakaoPipelineModel(
+                account_id=account_id,
+                state="completed",
+                plus_status="plus",
+                final_result="plus",
+                completed_at=datetime.now(timezone.utc),
+            )
+        )
+        session.commit()
+
+    service = KakaoPipelineService()
+    first = service.start_codex(account_id)
+    first_id = first["post_actions"]["codex"]["task_id"]
+    with Session(engine) as session:
+        task = session.get(TaskModel, first_id)
+        assert task is not None
+        task.status = "failed"
+        task.error = "oauth failed"
+        task.finished_at = datetime.now(timezone.utc)
+        session.add(task)
+        session.commit()
+
+    retried = service.start_codex(account_id)
+
+    second_id = retried["post_actions"]["codex"]["task_id"]
+    assert retried["post_actions"]["codex"]["status"] == "pending"
+    assert second_id != first_id
+    assert second_id.endswith("_2")
+
+
+def test_kakao_reset_protects_and_force_cancels_active_codex_task():
+    from sqlmodel import Session
+
+    from core.db import engine
+
+    account_id = _create_account("codex-reset@test.com")
+    with Session(engine) as session:
+        session.add(
+            KakaoPipelineModel(
+                account_id=account_id,
+                state="completed",
+                plus_status="plus",
+                final_result="plus",
+                completed_at=datetime.now(timezone.utc),
+            )
+        )
+        session.add(
+            AccountCodexAuthModel(
+                account_id=account_id,
+                has_access_token=True,
+                has_refresh_token=False,
+            )
+        )
+        session.commit()
+
+    service = KakaoPipelineService()
+    started = service.start_codex(account_id)
+    task_id = started["post_actions"]["codex"]["task_id"]
+
+    with pytest.raises(ValueError, match="Codex authorization"):
+        service.reset(account_id)
+
+    reset = service.reset(account_id, force=True)
+
+    assert reset["state"] == "idle"
+    with Session(engine) as session:
+        task = session.get(TaskModel, task_id)
+        auth = session.get(AccountCodexAuthModel, account_id)
+        assert task is not None and task.status == "cancelled"
+        assert auth is not None and auth.has_access_token is True

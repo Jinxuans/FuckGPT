@@ -7,7 +7,7 @@ import re
 import threading
 from datetime import datetime, timedelta, timezone
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 
 from sqlalchemy import or_
 from sqlmodel import Session, select
@@ -19,7 +19,13 @@ from application.account_recovery import (
     execute_runtime_action_with_worker_proxy,
 )
 from application.accounts import AccountsService
+from application.tasks import (
+    create_codex_oauth_batch_task,
+    enqueue_nvtokens_push_after_codex_oauth,
+    get_nvtokens_auto_push_state,
+)
 from core.db import AccountModel, KakaoPipelineModel, ProviderSettingModel, engine
+from core.db import AccountCodexAuthModel, AccountPushDeliveryModel, TaskModel
 from core.platform_accounts import build_platform_account
 from core.proxy_resolution import (
     PROXY_MODE_DIRECT,
@@ -85,7 +91,16 @@ BACKGROUND_POLL_STATES = {
     "scanner_succeeded",
     "plus_checking",
     "plus_pending",
+    "codex_post_action",
 }
+
+CODEX_POST_ACTION_STATE = "codex_post_action"
+REMOTE_BACKGROUND_POLL_STATES = BACKGROUND_POLL_STATES - {CODEX_POST_ACTION_STATE}
+TASK_PENDING_STATUSES = {"pending", "claimed"}
+TASK_RUNNING_STATUSES = {"running", "cancel_requested"}
+TASK_ACTIVE_STATUSES = TASK_PENDING_STATUSES | TASK_RUNNING_STATUSES
+TASK_FAILED_STATUSES = {"failed", "cancelled", "interrupted"}
+MAX_CODEX_INTERRUPTED_RETRIES = 1
 
 TERMINAL_REMOTE_FAILURES = {"FAILED", "CANCELLED", "EXPIRED", "REJECTED"}
 I7_SCANNER_SUCCESS_STATUSES = {"SUCCESS", "SUCCEEDED", "COMPLETED", "CONFIRMED"}
@@ -288,6 +303,147 @@ def _set_error(model: KakaoPipelineModel, state: str, code: str, message: str) -
     model.last_error_message = str(message or "未知错误")[:1000]
     model.updated_at = _utcnow()
     _append_event(model, model.last_error_message, level="error", detail={"code": model.last_error_code})
+
+
+def _has_valid_codex_auth(auth: AccountCodexAuthModel | None) -> bool:
+    return bool(auth and auth.has_access_token and auth.has_refresh_token)
+
+
+def _task_account_result(task: TaskModel | None, account_id: int) -> dict:
+    if task is None:
+        return {}
+    result = task.get_result()
+    data = result.get("data") if isinstance(result.get("data"), dict) else {}
+    accounts = data.get("accounts") if isinstance(data.get("accounts"), list) else []
+    return next(
+        (
+            item
+            for item in accounts
+            if isinstance(item, dict) and int(item.get("account_id") or 0) == int(account_id)
+        ),
+        {},
+    )
+
+
+_ERROR_URL_RE = re.compile(r"(?i)\b(?:https?|socks4|socks5)://[^\s<>\"']+")
+_ERROR_BEARER_RE = re.compile(r"(?i)\bBearer\s+[^\s,;]+")
+_ERROR_SECRET_ASSIGNMENT_RE = re.compile(
+    r"""(?ix)
+    (?P<prefix>
+        [\"']?
+        (?:
+            access[_-]?token|refresh[_-]?token|id[_-]?token|session[_-]?token|
+            client[_-]?secret|api[_-]?key|authorization|password|passwd|
+            proxy[_-]?password|cookie
+        )
+        [\"']?\s*[:=]\s*
+    )
+    (?:
+        \"(?:\\.|[^\"])*\"|
+        '(?:\\.|[^'])*'|
+        [^\s,;}\]]+
+    )
+    """
+)
+_ERROR_EMAIL_RE = re.compile(r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b")
+_ERROR_PHONE_RE = re.compile(r"(?<![\w])\+?(?:\d[\s().-]?){8,15}(?![\w])")
+
+
+def _redact_error_url(match: re.Match[str]) -> str:
+    raw = match.group(0)
+    suffix = ""
+    while raw and raw[-1] in ".,;!)]}":
+        suffix = raw[-1] + suffix
+        raw = raw[:-1]
+    try:
+        parsed = urlsplit(raw)
+        hostname = parsed.hostname or ""
+        if not hostname:
+            return "[redacted-url]" + suffix
+        safe_host = f"[{hostname}]" if ":" in hostname and not hostname.startswith("[") else hostname
+        try:
+            port = parsed.port
+        except ValueError:
+            port = None
+        netloc = f"{safe_host}:{port}" if port else safe_host
+        safe_url = urlunsplit(
+            (
+                parsed.scheme,
+                netloc,
+                parsed.path,
+                "***" if parsed.query else "",
+                "***" if parsed.fragment else "",
+            )
+        )
+        return safe_url + suffix
+    except Exception:
+        return "[redacted-url]" + suffix
+
+
+def _redact_sensitive_error(value: object) -> str:
+    text = str(value or "")
+    if not text:
+        return ""
+    text = _ERROR_URL_RE.sub(_redact_error_url, text)
+    text = _ERROR_BEARER_RE.sub("Bearer ***", text)
+    text = _ERROR_SECRET_ASSIGNMENT_RE.sub(lambda match: f"{match.group('prefix')}***", text)
+    text = _ERROR_EMAIL_RE.sub("***@***", text)
+    text = _ERROR_PHONE_RE.sub("***", text)
+    return text[:1000]
+
+
+def _safe_task_error(task: TaskModel | None, account_id: int = 0) -> str:
+    account_result = _task_account_result(task, account_id) if account_id else {}
+    return _redact_sensitive_error(
+        (account_result or {}).get("error") or (task.error if task else "") or ""
+    )
+
+
+def _delivery_covers_codex_auth(
+    delivery: AccountPushDeliveryModel | None,
+    auth: AccountCodexAuthModel | None,
+    *,
+    not_before: datetime | None = None,
+) -> bool:
+    if (
+        delivery is None
+        or auth is None
+        or delivery.status != "success"
+        or delivery.pushed_at is None
+    ):
+        return False
+    credential_at = auth.last_refresh or auth.created_at
+    if credential_at is None:
+        return False
+    required_at = _as_utc(credential_at)
+    if not_before is not None:
+        required_at = max(required_at, _as_utc(not_before))
+    return _as_utc(delivery.pushed_at) >= required_at
+
+
+def _codex_auth_was_saved_for_task(
+    auth: AccountCodexAuthModel | None,
+    task: TaskModel | None,
+) -> bool:
+    """Distinguish credentials saved by this task from older valid tokens."""
+    if not _has_valid_codex_auth(auth) or task is None or auth.last_refresh is None:
+        return False
+    task_started_at = task.started_at or task.created_at
+    return _as_utc(auth.last_refresh) >= _as_utc(task_started_at)
+
+
+def _push_task_account_ok(task: TaskModel | None, account_id: int) -> bool:
+    if task is None:
+        return False
+    result = task.get_result()
+    data = result.get("data") if isinstance(result.get("data"), dict) else {}
+    items = data.get("results") if isinstance(data.get("results"), list) else []
+    return any(
+        isinstance(item, dict)
+        and int(item.get("account_id") or 0) == int(account_id)
+        and bool(item.get("ok"))
+        for item in items
+    )
 
 
 def _problem_from_payload(data: dict, default_code: str, default_message: str) -> tuple[str, str]:
@@ -865,7 +1021,230 @@ class KakaoPipelineService:
         ), flags
 
     @staticmethod
-    def _serialize_pipeline(model: KakaoPipelineModel | None, *, detail: bool = False) -> dict:
+    def _load_post_actions_context(
+        account_ids: list[int],
+        pipelines: dict[int, KakaoPipelineModel],
+    ) -> dict[str, Any]:
+        normalized_ids = sorted({int(item) for item in account_ids if int(item or 0) > 0})
+        task_ids = sorted(
+            {
+                task_id
+                for pipeline in pipelines.values()
+                for task_id in (pipeline.codex_task_id, pipeline.codex_push_task_id)
+                if task_id
+            }
+        )
+        auth_by_account: dict[int, AccountCodexAuthModel] = {}
+        task_by_id: dict[str, TaskModel] = {}
+        delivery_by_account: dict[int, AccountPushDeliveryModel] = {}
+        if normalized_ids:
+            with Session(engine) as session:
+                auth_rows = session.exec(
+                    select(AccountCodexAuthModel).where(
+                        AccountCodexAuthModel.account_id.in_(normalized_ids)
+                    )
+                ).all()
+                auth_by_account = {int(item.account_id): item for item in auth_rows}
+                if task_ids:
+                    task_rows = session.exec(
+                        select(TaskModel).where(TaskModel.id.in_(task_ids))
+                    ).all()
+                    task_by_id = {str(item.id): item for item in task_rows}
+                delivery_rows = session.exec(
+                    select(AccountPushDeliveryModel)
+                    .where(AccountPushDeliveryModel.account_id.in_(normalized_ids))
+                    .where(AccountPushDeliveryModel.target_key == "nvtokens")
+                ).all()
+                delivery_by_account = {int(item.account_id): item for item in delivery_rows}
+        return {
+            "push_setting": get_nvtokens_auto_push_state(),
+            "auth_by_account": auth_by_account,
+            "task_by_id": task_by_id,
+            "delivery_by_account": delivery_by_account,
+        }
+
+    @staticmethod
+    def _serialize_post_actions(
+        model: KakaoPipelineModel | None,
+        *,
+        account_id: int = 0,
+        context: dict[str, Any] | None = None,
+    ) -> dict:
+        push_setting = (
+            dict(context.get("push_setting") or {})
+            if context is not None
+            else get_nvtokens_auto_push_state()
+        )
+        push_enabled = bool(push_setting.get("enabled"))
+        if model is None:
+            if context is not None:
+                authorized = _has_valid_codex_auth(
+                    (context.get("auth_by_account") or {}).get(int(account_id or 0))
+                )
+            elif int(account_id or 0) > 0:
+                with Session(engine) as session:
+                    authorized = _has_valid_codex_auth(
+                        session.get(AccountCodexAuthModel, int(account_id))
+                    )
+            else:
+                authorized = False
+            return {
+                "codex": {
+                    "status": "waiting",
+                    "task_id": None,
+                    "authorized": authorized,
+                    "error": "",
+                },
+                "push": {
+                    "status": "waiting" if push_enabled else "skipped",
+                    "task_id": None,
+                    "enabled": push_enabled,
+                    "error": "",
+                    "target_key": "nvtokens",
+                },
+            }
+
+        account_id = int(model.account_id)
+        if context is not None:
+            auth = (context.get("auth_by_account") or {}).get(account_id)
+            tasks = context.get("task_by_id") or {}
+            codex_task = tasks.get(model.codex_task_id) if model.codex_task_id else None
+            push_task = tasks.get(model.codex_push_task_id) if model.codex_push_task_id else None
+            delivery = (context.get("delivery_by_account") or {}).get(account_id)
+        else:
+            with Session(engine) as session:
+                auth = session.get(AccountCodexAuthModel, account_id)
+                codex_task = session.get(TaskModel, model.codex_task_id) if model.codex_task_id else None
+                push_task = session.get(TaskModel, model.codex_push_task_id) if model.codex_push_task_id else None
+                delivery = session.exec(
+                    select(AccountPushDeliveryModel)
+                    .where(AccountPushDeliveryModel.account_id == account_id)
+                    .where(AccountPushDeliveryModel.target_key == "nvtokens")
+                    .order_by(AccountPushDeliveryModel.updated_at.desc())
+                ).first()
+
+        authorized = _has_valid_codex_auth(auth)
+        codex_task_status = _text(codex_task.status) if codex_task else ""
+        codex_result = _task_account_result(codex_task, account_id)
+        codex_error = ""
+        if model.codex_skipped_at and authorized:
+            codex_status = "skipped"
+        elif codex_task_status == "interrupted" and _codex_auth_was_saved_for_task(auth, codex_task):
+            codex_status = "skipped"
+        elif codex_task_status in TASK_PENDING_STATUSES:
+            codex_status = "pending"
+        elif codex_task_status in TASK_RUNNING_STATUSES:
+            codex_status = "running"
+        elif codex_task_status == "succeeded":
+            if codex_result.get("ok") and _codex_auth_was_saved_for_task(auth, codex_task):
+                codex_status = "success"
+            else:
+                codex_status = "failed"
+                codex_error = _safe_task_error(codex_task, account_id) or "Codex authorization did not save complete credentials"
+        elif codex_task_status in {"interrupted", "cancelled"}:
+            codex_status = "paused"
+            codex_error = _safe_task_error(codex_task, account_id) or "Codex authorization paused"
+        elif codex_task_status == "failed":
+            codex_status = "failed"
+            codex_error = _safe_task_error(codex_task, account_id) or "Codex authorization failed"
+        elif model.codex_enqueue_error:
+            codex_status = "failed"
+            codex_error = _redact_sensitive_error(model.codex_enqueue_error)
+        else:
+            codex_status = "waiting"
+
+        push_task_status = _text(push_task.status) if push_task else ""
+        unlinked_current_delivery = bool(
+            push_task is None
+            and authorized
+            and _delivery_covers_codex_auth(
+                delivery,
+                auth,
+                not_before=model.completed_at,
+            )
+        )
+        push_error = ""
+        if push_task_status in TASK_PENDING_STATUSES:
+            push_status = "pending"
+        elif push_task_status in TASK_RUNNING_STATUSES:
+            push_status = "running"
+        elif push_task_status == "succeeded":
+            if _push_task_account_ok(push_task, account_id):
+                push_status = "success"
+            else:
+                push_status = "failed"
+                push_error = _safe_task_error(push_task, account_id) or "NexusVault push result is incomplete"
+        elif push_task_status in TASK_FAILED_STATUSES:
+            # A later generic manual push is the supported retry path.  It may
+            # override a failed linked task, but an older delivery must never
+            # complete a new linked attempt.
+            task_started_at = push_task.started_at or push_task.created_at
+            delivery_updated_at = (
+                (delivery.last_attempt_at or delivery.updated_at)
+                if delivery
+                else None
+            )
+            manual_retry_succeeded = bool(
+                delivery
+                and _delivery_covers_codex_auth(delivery, auth)
+                and delivery_updated_at
+                and task_started_at
+                and _as_utc(delivery_updated_at) >= _as_utc(task_started_at)
+            )
+            if manual_retry_succeeded:
+                push_status = "success"
+            elif push_task_status in {"interrupted", "cancelled"}:
+                push_status = "paused"
+                push_error = _safe_task_error(push_task, account_id) or "NexusVault push paused"
+            else:
+                push_status = "failed"
+                push_error = _safe_task_error(push_task, account_id) or _redact_sensitive_error(
+                    (delivery.last_error if delivery else "") or "NexusVault push failed"
+                )
+        elif unlinked_current_delivery:
+            # A manual/generic push may finish after automatic enqueue was
+            # skipped or failed.  With no real linked task, that delivery is
+            # the authoritative fifth-stage result.
+            push_status = "success"
+        elif model.codex_push_skip_reason == "already_delivered":
+            push_status = "success"
+        elif model.codex_push_skip_reason:
+            push_status = "skipped"
+        elif model.codex_push_enqueue_error:
+            push_status = "failed"
+            push_error = _redact_sensitive_error(model.codex_push_enqueue_error)
+        elif not push_enabled:
+            push_status = "skipped"
+        else:
+            push_status = "waiting"
+
+        return {
+            "codex": {
+                "status": codex_status,
+                "task_id": model.codex_task_id or None,
+                "authorized": authorized,
+                "error": codex_error,
+                "attempt_count": int(model.codex_attempt_count or 0),
+            },
+            "push": {
+                "status": push_status,
+                "task_id": model.codex_push_task_id or None,
+                "enabled": push_enabled,
+                "error": push_error,
+                "target_key": "nvtokens",
+                "attempt_count": int(model.codex_push_attempt_count or 0),
+                "pushed_at": delivery.pushed_at.isoformat() if delivery and delivery.pushed_at else None,
+            },
+        }
+
+    @staticmethod
+    def _serialize_pipeline(
+        model: KakaoPipelineModel | None,
+        *,
+        detail: bool = False,
+        account_id: int = 0,
+        post_actions_context: dict[str, Any] | None = None,
+    ) -> dict:
         if model is None:
             return {
                 "state": "idle",
@@ -876,6 +1255,11 @@ class KakaoPipelineService:
                 "last_error_code": "",
                 "last_error_message": "",
                 "latest_event_at": None,
+                "post_actions": KakaoPipelineService._serialize_post_actions(
+                    None,
+                    account_id=account_id,
+                    context=post_actions_context,
+                ),
             }
         supplier = model.get_supplier_response()
         scanner = model.get_scanner_response()
@@ -930,6 +1314,10 @@ class KakaoPipelineService:
             "updated_at": model.updated_at.isoformat() if model.updated_at else None,
             "latest_event_at": _text(latest_event.get("time")) or None,
             "completed_at": model.completed_at.isoformat() if model.completed_at else None,
+            "post_actions": KakaoPipelineService._serialize_post_actions(
+                model,
+                context=post_actions_context,
+            ),
         }
         if detail:
             payload.update(
@@ -953,6 +1341,7 @@ class KakaoPipelineService:
                     select(KakaoPipelineModel).where(KakaoPipelineModel.account_id.in_(account_ids))
                 ).all()
                 pipelines = {int(item.account_id): item for item in rows}
+        post_actions_context = self._load_post_actions_context(account_ids, pipelines)
         items = []
         for account in result.get("items", []):
             account_id = int(account.get("id") or 0)
@@ -976,18 +1365,411 @@ class KakaoPipelineService:
                             "phone_number_masked": _text(security.get("phone_number_masked")),
                         },
                     },
-                    "pipeline": self._serialize_pipeline(pipelines.get(account_id)),
+                    "pipeline": self._serialize_pipeline(
+                        pipelines.get(account_id),
+                        account_id=account_id,
+                        post_actions_context=post_actions_context,
+                    ),
                 }
             )
         return {**result, "items": items}
+
+    @staticmethod
+    def _post_action_run_key(pipeline: KakaoPipelineModel) -> str:
+        anchor = pipeline.completed_at or pipeline.created_at or _utcnow()
+        stamp = int(_as_utc(anchor).timestamp() * 1_000_000)
+        return f"{int(pipeline.account_id)}_{int(pipeline.id or 0)}_{stamp}"
+
+    @classmethod
+    def _codex_post_action_task_id(cls, pipeline: KakaoPipelineModel, attempt: int) -> str:
+        return f"kakao_codex_{cls._post_action_run_key(pipeline)}_{max(int(attempt), 1)}"
+
+    @classmethod
+    def _push_post_action_task_id(cls, pipeline: KakaoPipelineModel, attempt: int) -> str:
+        return f"kakao_push_{cls._post_action_run_key(pipeline)}_{max(int(attempt), 1)}"
+
+    @staticmethod
+    def _post_actions_need_background(session: Session, pipeline: KakaoPipelineModel) -> bool:
+        if (
+            pipeline.state != "completed"
+            or pipeline.final_result != "plus"
+            or not bool(pipeline.codex_post_action_armed)
+        ):
+            return False
+
+        auth = session.get(AccountCodexAuthModel, int(pipeline.account_id))
+        authorized = _has_valid_codex_auth(auth)
+        codex_task = session.get(TaskModel, pipeline.codex_task_id) if pipeline.codex_task_id else None
+        if pipeline.codex_skipped_at and authorized:
+            codex_ready = True
+        elif not pipeline.codex_task_id or codex_task is None:
+            return True
+        elif codex_task.status in TASK_ACTIVE_STATUSES:
+            return True
+        elif codex_task.status == "interrupted":
+            if _codex_auth_was_saved_for_task(auth, codex_task):
+                return True
+            return bool(
+                codex_task.started_at is None
+                and int(pipeline.codex_interrupted_retry_count or 0) < MAX_CODEX_INTERRUPTED_RETRIES
+            )
+        elif codex_task.status == "succeeded":
+            codex_ready = bool(
+                _task_account_result(codex_task, int(pipeline.account_id)).get("ok")
+                and _codex_auth_was_saved_for_task(auth, codex_task)
+            )
+        else:
+            codex_ready = False
+        if not codex_ready:
+            return False
+
+        if pipeline.codex_push_skip_reason:
+            return False
+        if not pipeline.codex_push_task_id:
+            return True
+        push_task = session.get(TaskModel, pipeline.codex_push_task_id)
+        return push_task is None or push_task.status in TASK_ACTIVE_STATUSES
+
+    def _ensure_kakao_push_if_ready(self, account_id: int) -> dict:
+        """Create the linked fifth-stage push only after verified Codex auth."""
+        with _account_lock(account_id):
+            candidate_task_id = ""
+            with Session(engine) as session:
+                pipeline = self._pipeline_for_account(session, account_id)
+                if (
+                    pipeline is None
+                    or pipeline.state != "completed"
+                    or pipeline.final_result != "plus"
+                    or not pipeline.codex_post_action_armed
+                ):
+                    return self._serialize_pipeline(pipeline, detail=True)
+
+                auth = session.get(AccountCodexAuthModel, int(account_id))
+                if not _has_valid_codex_auth(auth):
+                    return self._serialize_pipeline(pipeline, detail=True)
+
+                codex_task = session.get(TaskModel, pipeline.codex_task_id) if pipeline.codex_task_id else None
+                if pipeline.codex_skipped_at:
+                    codex_ready = True
+                elif codex_task and codex_task.status == "succeeded":
+                    codex_ready = bool(
+                        _task_account_result(codex_task, account_id).get("ok")
+                        and _codex_auth_was_saved_for_task(auth, codex_task)
+                    )
+                elif (
+                    codex_task
+                    and codex_task.status == "interrupted"
+                    and _codex_auth_was_saved_for_task(auth, codex_task)
+                ):
+                    # OAuth credentials may have been committed immediately
+                    # before process shutdown.  Valid paired tokens make a
+                    # browser retry both unnecessary and potentially harmful.
+                    pipeline.codex_skipped_at = _utcnow()
+                    pipeline.codex_enqueue_error = ""
+                    pipeline.updated_at = _utcnow()
+                    _append_event(pipeline, "Codex credentials survived the interrupted task; browser retry skipped")
+                    session.add(pipeline)
+                    session.commit()
+                    codex_ready = True
+                else:
+                    codex_ready = False
+                if not codex_ready:
+                    return self._serialize_pipeline(pipeline, detail=True)
+
+                linked = (
+                    session.get(TaskModel, pipeline.codex_push_task_id)
+                    if pipeline.codex_push_task_id
+                    else None
+                )
+                if linked is not None:
+                    return self._serialize_pipeline(pipeline, detail=True)
+
+                # A manual/generic delivery can win after automatic enqueue
+                # was disabled, failed, or crashed before its task row was
+                # committed.  Adopt it before considering another enqueue.
+                delivery = session.exec(
+                    select(AccountPushDeliveryModel)
+                    .where(AccountPushDeliveryModel.account_id == int(account_id))
+                    .where(AccountPushDeliveryModel.target_key == "nvtokens")
+                    .where(AccountPushDeliveryModel.status == "success")
+                    .order_by(AccountPushDeliveryModel.pushed_at.desc())
+                ).first()
+                if _delivery_covers_codex_auth(
+                    delivery,
+                    auth,
+                    not_before=pipeline.completed_at,
+                ):
+                    pipeline.codex_push_task_id = ""
+                    pipeline.codex_push_skip_reason = "already_delivered"
+                    pipeline.codex_push_enqueue_error = ""
+                    pipeline.codex_post_action_done_at = _utcnow()
+                    pipeline.updated_at = _utcnow()
+                    _append_event(pipeline, "NexusVault already received the current Codex credentials")
+                    session.add(pipeline)
+                    session.commit()
+                    return self._serialize_pipeline(pipeline, detail=True)
+
+                if pipeline.codex_push_skip_reason:
+                    return self._serialize_pipeline(pipeline, detail=True)
+                if pipeline.codex_push_task_id:
+                    candidate_task_id = pipeline.codex_push_task_id
+                else:
+                    push_setting = get_nvtokens_auto_push_state()
+                    if not push_setting.get("enabled"):
+                        pipeline.codex_push_skip_reason = str(
+                            push_setting.get("reason") or "auto_push_disabled"
+                        )[:120]
+                        pipeline.codex_push_enqueue_error = ""
+                        pipeline.codex_post_action_done_at = _utcnow()
+                        pipeline.updated_at = _utcnow()
+                        _append_event(pipeline, "NexusVault automatic push is disabled; push stage skipped")
+                        session.add(pipeline)
+                        session.commit()
+                        return self._serialize_pipeline(pipeline, detail=True)
+
+                    pipeline.codex_push_attempt_count = int(pipeline.codex_push_attempt_count or 0) + 1
+                    candidate_task_id = self._push_post_action_task_id(
+                        pipeline,
+                        pipeline.codex_push_attempt_count,
+                    )
+                    # Persist the link before task creation.  A process crash
+                    # between these commits is repaired with the same ID.
+                    pipeline.codex_push_task_id = candidate_task_id
+                    pipeline.codex_push_enqueue_error = ""
+                    pipeline.codex_post_action_done_at = None
+                    pipeline.updated_at = _utcnow()
+                    session.add(pipeline)
+                    session.commit()
+
+            outcome = enqueue_nvtokens_push_after_codex_oauth(
+                account_id,
+                platform="chatgpt",
+                task_id=candidate_task_id,
+                source="kakao_pipeline",
+            )
+            with Session(engine) as session:
+                pipeline = self._pipeline_for_account(session, account_id)
+                assert pipeline is not None
+                if outcome.get("enqueued"):
+                    pipeline.codex_push_task_id = str(outcome.get("task_id") or candidate_task_id)
+                    pipeline.codex_push_enqueue_error = ""
+                    pipeline.codex_post_action_done_at = None
+                    _append_event(pipeline, "NexusVault background push task created")
+                elif outcome.get("reason") != "enqueue_failed":
+                    pipeline.codex_push_task_id = ""
+                    pipeline.codex_push_skip_reason = str(
+                        outcome.get("reason") or "auto_push_disabled"
+                    )[:120]
+                    pipeline.codex_push_enqueue_error = ""
+                    pipeline.codex_post_action_done_at = _utcnow()
+                    _append_event(pipeline, "NexusVault automatic push is unavailable; push stage skipped")
+                else:
+                    pipeline.codex_push_enqueue_error = _redact_sensitive_error(
+                        outcome.get("error") or "Failed to create NexusVault push task"
+                    )
+                    _append_event(pipeline, pipeline.codex_push_enqueue_error, level="warning")
+                pipeline.updated_at = _utcnow()
+                session.add(pipeline)
+                session.commit()
+            if outcome.get("enqueued"):
+                from services.task_runtime import task_runtime
+
+                task_runtime.wake_up()
+            return self.get_account_pipeline(account_id)
+
+    def start_codex(self, account_id: int, *, automatic: bool = False, repair: bool = False) -> dict:
+        """Start/retry the Kakao page's single-account Codex stage."""
+        with _account_lock(account_id):
+            with Session(engine) as session:
+                pipeline = self._pipeline_for_account(session, account_id)
+                pipeline_plus = bool(
+                    pipeline and pipeline.state == "completed" and pipeline.final_result == "plus"
+                )
+            if not pipeline_plus and not self._account_is_plus(account_id):
+                raise ValueError("Codex authorization can only start after the account is Plus")
+
+            candidate_task_id = ""
+            with Session(engine) as session:
+                pipeline = self._pipeline_for_account(session, account_id, create=True)
+                assert pipeline is not None
+                if not pipeline_plus:
+                    pipeline.state = "completed"
+                    pipeline.plus_status = "plus"
+                    pipeline.final_result = "plus"
+                    pipeline.completion_source = pipeline.completion_source or "existing_account_plus"
+                    pipeline.completed_at = pipeline.completed_at or _utcnow()
+                pipeline.codex_post_action_armed = True
+
+                auth = session.get(AccountCodexAuthModel, int(account_id))
+                linked = session.get(TaskModel, pipeline.codex_task_id) if pipeline.codex_task_id else None
+                existing_auth_can_skip = bool(
+                    _has_valid_codex_auth(auth)
+                    and (
+                        linked is None
+                        or (
+                            linked.status == "interrupted"
+                            and _codex_auth_was_saved_for_task(auth, linked)
+                        )
+                    )
+                )
+                if existing_auth_can_skip:
+                    pipeline.codex_skipped_at = pipeline.codex_skipped_at or _utcnow()
+                    pipeline.codex_enqueue_error = ""
+                    pipeline.updated_at = _utcnow()
+                    _append_event(pipeline, "Existing valid Codex authorization found; browser authorization skipped")
+                    session.add(pipeline)
+                    session.commit()
+                    return self._ensure_kakao_push_if_ready(account_id)
+
+                if linked and linked.status in TASK_ACTIVE_STATUSES:
+                    session.add(pipeline)
+                    session.commit()
+                    return self._serialize_pipeline(pipeline, detail=True)
+                if linked and linked.status == "succeeded":
+                    linked_ok = bool(
+                        _task_account_result(linked, account_id).get("ok")
+                        and _codex_auth_was_saved_for_task(auth, linked)
+                    )
+                    session.add(pipeline)
+                    session.commit()
+                    if linked_ok:
+                        return self._ensure_kakao_push_if_ready(account_id)
+                    if automatic:
+                        return self._serialize_pipeline(pipeline, detail=True)
+
+                missing_linked_task = bool(pipeline.codex_task_id and linked is None)
+                interrupted_retry = bool(linked and linked.status == "interrupted")
+                if linked and linked.status in {"failed", "cancelled"} and automatic:
+                    session.add(pipeline)
+                    session.commit()
+                    return self._serialize_pipeline(pipeline, detail=True)
+                if interrupted_retry and automatic:
+                    if (
+                        not repair
+                        or linked.started_at is not None
+                        or int(pipeline.codex_interrupted_retry_count or 0) >= MAX_CODEX_INTERRUPTED_RETRIES
+                    ):
+                        session.add(pipeline)
+                        session.commit()
+                        return self._serialize_pipeline(pipeline, detail=True)
+                    pipeline.codex_interrupted_retry_count = int(
+                        pipeline.codex_interrupted_retry_count or 0
+                    ) + 1
+
+                if missing_linked_task:
+                    # Crash repair uses the link that was committed before the
+                    # missing task row; no attempt/ID change is needed.
+                    candidate_task_id = pipeline.codex_task_id
+                else:
+                    pipeline.codex_attempt_count = int(pipeline.codex_attempt_count or 0) + 1
+                    candidate_task_id = self._codex_post_action_task_id(
+                        pipeline,
+                        pipeline.codex_attempt_count,
+                    )
+                    pipeline.codex_task_id = candidate_task_id
+                pipeline.codex_skipped_at = None
+                pipeline.codex_enqueue_error = ""
+                pipeline.codex_push_task_id = ""
+                pipeline.codex_push_attempt_count = 0
+                pipeline.codex_push_skip_reason = ""
+                pipeline.codex_push_enqueue_error = ""
+                pipeline.codex_post_action_done_at = None
+                pipeline.updated_at = _utcnow()
+                session.add(pipeline)
+                session.commit()
+
+            try:
+                task = create_codex_oauth_batch_task(
+                    platform="chatgpt",
+                    account_ids=[int(account_id)],
+                    concurrency=1,
+                    auto_push_after_oauth=False,
+                    task_id=candidate_task_id,
+                    source="kakao_pipeline",
+                )
+            except Exception as exc:  # noqa: BLE001
+                with Session(engine) as session:
+                    pipeline = self._pipeline_for_account(session, account_id)
+                    assert pipeline is not None
+                    pipeline.codex_enqueue_error = _redact_sensitive_error(exc)
+                    pipeline.updated_at = _utcnow()
+                    _append_event(pipeline, pipeline.codex_enqueue_error, level="warning")
+                    session.add(pipeline)
+                    session.commit()
+                return self.get_account_pipeline(account_id)
+
+            with Session(engine) as session:
+                pipeline = self._pipeline_for_account(session, account_id)
+                assert pipeline is not None
+                pipeline.codex_task_id = str(task.get("id") or candidate_task_id)
+                pipeline.codex_enqueue_error = ""
+                pipeline.updated_at = _utcnow()
+                _append_event(pipeline, "Codex authorization task created")
+                session.add(pipeline)
+                session.commit()
+            from services.task_runtime import task_runtime
+
+            task_runtime.wake_up()
+            return self.get_account_pipeline(account_id)
+
+    def reconcile_codex_post_actions(self, account_id: int) -> dict:
+        """Repair and advance an armed Kakao Codex/push post-action chain."""
+        with _account_lock(account_id):
+            with Session(engine) as session:
+                pipeline = self._pipeline_for_account(session, account_id)
+                if pipeline is None:
+                    return self._serialize_pipeline(pipeline, detail=True)
+                if not self._post_actions_need_background(session, pipeline):
+                    if (
+                        pipeline.codex_post_action_armed
+                        and pipeline.codex_post_action_done_at is None
+                    ):
+                        pipeline.codex_post_action_done_at = _utcnow()
+                        pipeline.updated_at = _utcnow()
+                        session.add(pipeline)
+                        session.commit()
+                    return self._serialize_pipeline(pipeline, detail=True)
+                task = session.get(TaskModel, pipeline.codex_task_id) if pipeline.codex_task_id else None
+                auth = session.get(AccountCodexAuthModel, int(account_id))
+                codex_ready = bool(
+                    (pipeline.codex_skipped_at and _has_valid_codex_auth(auth))
+                    or (
+                        task
+                        and task.status == "succeeded"
+                        and _task_account_result(task, account_id).get("ok")
+                        and _codex_auth_was_saved_for_task(auth, task)
+                    )
+                    or (
+                        task
+                        and task.status == "interrupted"
+                        and _codex_auth_was_saved_for_task(auth, task)
+                    )
+                )
+
+            if codex_ready:
+                result = self._ensure_kakao_push_if_ready(account_id)
+            else:
+                result = self.start_codex(account_id, automatic=True, repair=True)
+
+            with Session(engine) as session:
+                pipeline = self._pipeline_for_account(session, account_id)
+                if pipeline is not None and self._post_actions_need_background(session, pipeline):
+                    result = {**result, "_background_state": CODEX_POST_ACTION_STATE}
+                elif pipeline is not None and pipeline.codex_post_action_done_at is None:
+                    pipeline.codex_post_action_done_at = _utcnow()
+                    pipeline.updated_at = _utcnow()
+                    session.add(pipeline)
+                    session.commit()
+            return result
 
     def list_background_work(self, *, limit: int = 100) -> list[dict]:
         """Return persisted work that can safely resume without a browser page."""
         with Session(engine) as session:
             now = _utcnow()
-            rows = session.exec(
+            bounded_limit = min(max(int(limit), 1), 500)
+            remote_rows = session.exec(
                 select(KakaoPipelineModel)
-                .where(KakaoPipelineModel.state.in_(BACKGROUND_POLL_STATES))
+                .where(KakaoPipelineModel.state.in_(REMOTE_BACKGROUND_POLL_STATES))
                 .where(
                     or_(
                         KakaoPipelineModel.state != "plus_pending",
@@ -1003,15 +1785,34 @@ class KakaoPipelineService:
                     )
                 )
                 .order_by(KakaoPipelineModel.updated_at, KakaoPipelineModel.id)
-                .limit(min(max(int(limit), 1), 500))
+                .limit(bounded_limit)
             ).all()
-            return [
+            work = [
                 {
                     "account_id": int(row.account_id),
                     "state": _text(row.state),
                 }
-                for row in rows
+                for row in remote_rows
             ]
+            remaining = bounded_limit - len(work)
+            if remaining > 0:
+                post_rows = session.exec(
+                    select(KakaoPipelineModel)
+                    .where(KakaoPipelineModel.state == "completed")
+                    .where(KakaoPipelineModel.final_result == "plus")
+                    .where(KakaoPipelineModel.codex_post_action_armed == True)  # noqa: E712
+                    .where(KakaoPipelineModel.codex_post_action_done_at.is_(None))
+                    .order_by(KakaoPipelineModel.updated_at, KakaoPipelineModel.id)
+                    .limit(remaining)
+                ).all()
+                work.extend(
+                    {
+                        "account_id": int(row.account_id),
+                        "state": CODEX_POST_ACTION_STATE,
+                    }
+                    for row in post_rows
+                )
+            return work
 
     def advance_background(self, account_id: int, *, expected_state: str = "") -> dict:
         """Advance one resumable state while sharing the manual-action account lock."""
@@ -1021,9 +1822,17 @@ class KakaoPipelineService:
                 if pipeline is None:
                     return self._serialize_pipeline(None)
                 state = _text(pipeline.state)
+                if _text(expected_state) == CODEX_POST_ACTION_STATE:
+                    if (
+                        state != "completed"
+                        or pipeline.final_result != "plus"
+                        or not pipeline.codex_post_action_armed
+                    ):
+                        return self._serialize_pipeline(pipeline)
+                    return self.reconcile_codex_post_actions(account_id)
                 if expected_state and state != _text(expected_state):
                     return self._serialize_pipeline(pipeline)
-                if state not in BACKGROUND_POLL_STATES:
+                if state not in REMOTE_BACKGROUND_POLL_STATES:
                     return self._serialize_pipeline(pipeline)
 
             if state == "supplier_processing":
@@ -1122,7 +1931,29 @@ class KakaoPipelineService:
                 raise ValueError("账号还没有 Kakao 操作记录")
             return self._serialize_pipeline(model, detail=True)
 
-    def start_extraction(self, account_id: int, supplier_setting_id: int | None = None, payment_method: str = "kakao_pay") -> dict:
+    def set_codex_post_actions_enabled(self, account_id: int, enabled: bool) -> dict:
+        """Persist which surface owns the optional Codex/push tail."""
+        with _account_lock(account_id):
+            with Session(engine) as session:
+                pipeline = self._pipeline_for_account(session, account_id)
+                if pipeline is None:
+                    raise ValueError("Kakao pipeline does not exist")
+                if pipeline.state != "completed":
+                    pipeline.codex_post_action_armed = bool(enabled)
+                    pipeline.codex_post_action_done_at = None
+                    pipeline.updated_at = _utcnow()
+                    session.add(pipeline)
+                    session.commit()
+                return self._serialize_pipeline(pipeline, detail=True)
+
+    def start_extraction(
+        self,
+        account_id: int,
+        supplier_setting_id: int | None = None,
+        payment_method: str = "kakao_pay",
+        *,
+        enable_post_actions: bool = False,
+    ) -> dict:
         with _account_lock(account_id):
             if self._account_is_plus(account_id):
                 raise ValueError("当前账号已经是 Plus，无需再次提链扫码")
@@ -1185,6 +2016,17 @@ class KakaoPipelineService:
                 pipeline.plus_next_check_at = None
                 pipeline.plus_check_deadline_at = None
                 pipeline.plus_check_paused_at = None
+                pipeline.codex_post_action_armed = bool(enable_post_actions)
+                pipeline.codex_task_id = ""
+                pipeline.codex_attempt_count = 0
+                pipeline.codex_interrupted_retry_count = 0
+                pipeline.codex_skipped_at = None
+                pipeline.codex_enqueue_error = ""
+                pipeline.codex_push_task_id = ""
+                pipeline.codex_push_attempt_count = 0
+                pipeline.codex_push_skip_reason = ""
+                pipeline.codex_push_enqueue_error = ""
+                pipeline.codex_post_action_done_at = None
                 pipeline.last_error_code = ""
                 pipeline.last_error_message = ""
                 pipeline.completed_at = None
@@ -1915,7 +2757,13 @@ class KakaoPipelineService:
         pipeline.updated_at = _utcnow()
         _append_event(pipeline, pipeline.last_error_message, level="warning")
 
-    def check_plus(self, account_id: int, *, advance_pipeline: bool = False) -> dict:
+    def check_plus(
+        self,
+        account_id: int,
+        *,
+        advance_pipeline: bool = False,
+        enable_post_actions: bool | None = None,
+    ) -> dict:
         with _account_lock(account_id):
             check_started_at = _utcnow()
             with Session(engine) as session:
@@ -1924,11 +2772,16 @@ class KakaoPipelineService:
                 preserve_completed = pipeline.state == "completed"
                 if preserve_completed:
                     advance_pipeline = False
+                elif enable_post_actions is not None:
+                    pipeline.codex_post_action_armed = bool(enable_post_actions)
+                    pipeline.codex_post_action_done_at = None
                 if advance_pipeline and pipeline.state in {
                     "scanner_accepted_untracked",
                     "scanner_recovery_unconfirmed",
                     "scanner_submit_unconfirmed",
                 }:
+                    session.add(pipeline)
+                    session.commit()
                     return self.check_untracked_plus(account_id)
                 if advance_pipeline and pipeline.state not in {
                     "scanner_succeeded",
@@ -2040,6 +2893,8 @@ class KakaoPipelineService:
                         pipeline.state = "completed"
                         pipeline.completed_at = _utcnow()
                         pipeline.completion_source = "normal_scanner"
+                        if pipeline.codex_post_action_armed:
+                            pipeline.codex_post_action_done_at = None
                         pipeline.plus_next_check_at = None
                         pipeline.plus_check_paused_at = None
                         pipeline.last_error_code = ""
@@ -2082,6 +2937,8 @@ class KakaoPipelineService:
                 )
                 session.add(pipeline)
                 session.commit()
+                if advance_pipeline and is_plus and pipeline.codex_post_action_armed:
+                    return self.start_codex(account_id, automatic=True)
                 return self._serialize_pipeline(pipeline, detail=True)
 
     def check_untracked_plus(self, account_id: int) -> dict:
@@ -2173,6 +3030,8 @@ class KakaoPipelineService:
                 if is_plus:
                     pipeline.state = "completed"
                     pipeline.completed_at = _utcnow()
+                    if pipeline.codex_post_action_armed:
+                        pipeline.codex_post_action_done_at = None
                     pipeline.scanner_recovery_next_check_at = None
                     duplicate_confirmed = pipeline.scanner_status == "DUPLICATE_ACCEPTED"
                     pipeline.completion_source = (
@@ -2217,6 +3076,8 @@ class KakaoPipelineService:
                         )
                 session.add(pipeline)
                 session.commit()
+                if is_plus and pipeline.codex_post_action_armed:
+                    return self.start_codex(account_id, automatic=True)
                 return self._serialize_pipeline(pipeline, detail=True)
 
     def reset(self, account_id: int, *, force: bool = False) -> dict:
@@ -2225,8 +3086,24 @@ class KakaoPipelineService:
                 pipeline = self._pipeline_for_account(session, account_id)
                 if pipeline is None:
                     return self._serialize_pipeline(None)
+                linked_task_ids = [
+                    task_id
+                    for task_id in (pipeline.codex_task_id, pipeline.codex_push_task_id)
+                    if task_id
+                ]
+                linked_active = any(
+                    task is not None and task.status in TASK_ACTIVE_STATUSES
+                    for task in (session.get(TaskModel, task_id) for task_id in linked_task_ids)
+                )
+                if linked_active and not force:
+                    raise ValueError("Codex authorization or NexusVault push is still running")
                 if pipeline.state in ACTIVE_STATES and not force:
                     raise ValueError("任务进行中，不能重置")
+                if force:
+                    from application.tasks import request_cancel
+
+                    for task_id in linked_task_ids:
+                        request_cancel(task_id)
                 session.delete(pipeline)
                 session.commit()
                 return self._serialize_pipeline(None)

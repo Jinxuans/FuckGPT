@@ -143,6 +143,7 @@ def start_extraction(account_id: int, body: ExtractRequest, response: Response):
             account_id,
             supplier_setting_id=body.supplier_setting_id,
             payment_method=body.payment_method,
+            enable_post_actions=True,
         )
     except Exception as exc:  # noqa: BLE001
         _raise_problem(exc)
@@ -186,7 +187,17 @@ def check_plus(account_id: int, response: Response, body: PlusCheckRequest | Non
         return service.check_plus(
             account_id,
             advance_pipeline=bool(body and body.advance_pipeline),
+            enable_post_actions=True if body and body.advance_pipeline else None,
         )
+    except Exception as exc:  # noqa: BLE001
+        _raise_problem(exc)
+
+
+@router.post("/accounts/{account_id}/codex")
+def start_codex(account_id: int, response: Response):
+    response.headers["Cache-Control"] = "no-store"
+    try:
+        return service.start_codex(account_id)
     except Exception as exc:  # noqa: BLE001
         _raise_problem(exc)
 

@@ -450,6 +450,8 @@ def enqueue_nvtokens_push_after_codex_oauth(
     account_id: int,
     *,
     platform: str = "chatgpt",
+    task_id: str = "",
+    source: str = "codex_oauth",
 ) -> dict[str, Any]:
     """Best-effort enqueue for the optional OAuth post-action.
 
@@ -457,40 +459,62 @@ def enqueue_nvtokens_push_after_codex_oauth(
     a completed OAuth flow can never be changed into a failed authorization.
     """
     try:
-        from infrastructure.provider_settings_repository import ProviderSettingsRepository
-
         normalized_account_id = int(account_id or 0)
         if normalized_account_id <= 0:
             return {"enqueued": False, "reason": "invalid_account"}
 
-        settings = ProviderSettingsRepository()
-        setting = settings.get_by_key("push", "nvtokens")
-        if not setting or not bool(setting.enabled):
-            return {"enqueued": False, "reason": "target_disabled"}
-
-        runtime = settings.resolve_runtime_settings("push", "nvtokens")
-        auto_push = str(runtime.get("nvtokens_auto_push_after_codex_oauth") or "").strip().lower()
-        if auto_push not in {"1", "true", "yes", "on", "是", "开启", "启用"}:
-            return {"enqueued": False, "reason": "auto_push_disabled"}
-        from providers.push.nvtokens import NVTokensPushProvider
-
-        if NVTokensPushProvider.from_config(runtime).configuration_error():
-            return {"enqueued": False, "reason": "target_not_configured"}
+        state = get_nvtokens_auto_push_state()
+        if not state.get("enabled"):
+            return {"enqueued": False, "reason": str(state.get("reason") or "target_disabled")}
 
         task = create_account_push_task(
             platform=platform or "chatgpt",
             account_ids=[normalized_account_id],
             target_key="nvtokens",
             payload_format="codex",
-            source="codex_oauth",
+            source=str(source or "codex_oauth"),
+            task_id=str(task_id or ""),
         )
         return {"enqueued": True, "task_id": task["id"]}
     except Exception as exc:  # noqa: BLE001 - OAuth success must remain isolated.
         return {"enqueued": False, "reason": "enqueue_failed", "error": str(exc)}
 
 
-def _log_codex_auto_push_enqueue(account_id: int, logger: "TaskLogger", *, platform: str = "chatgpt") -> None:
-    outcome = enqueue_nvtokens_push_after_codex_oauth(account_id, platform=platform)
+def get_nvtokens_auto_push_state() -> dict[str, Any]:
+    """Return the safe, effective NexusVault OAuth auto-push setting."""
+    try:
+        from infrastructure.provider_settings_repository import ProviderSettingsRepository
+
+        settings = ProviderSettingsRepository()
+        setting = settings.get_by_key("push", "nvtokens")
+        if not setting or not bool(setting.enabled):
+            return {"enabled": False, "reason": "target_disabled"}
+        runtime = settings.resolve_runtime_settings("push", "nvtokens")
+        auto_push = str(runtime.get("nvtokens_auto_push_after_codex_oauth") or "").strip().lower()
+        if auto_push not in {"1", "true", "yes", "on", "是", "开启", "启用"}:
+            return {"enabled": False, "reason": "auto_push_disabled"}
+
+        from providers.push.nvtokens import NVTokensPushProvider
+
+        if NVTokensPushProvider.from_config(runtime).configuration_error():
+            return {"enabled": False, "reason": "target_not_configured"}
+        return {"enabled": True, "reason": ""}
+    except Exception as exc:  # noqa: BLE001 - status reads must remain safe.
+        return {"enabled": False, "reason": "settings_unavailable", "error": str(exc)}
+
+
+def _log_codex_auto_push_enqueue(
+    account_id: int,
+    logger: "TaskLogger",
+    *,
+    platform: str = "chatgpt",
+    task_id: str = "",
+) -> dict[str, Any]:
+    outcome = enqueue_nvtokens_push_after_codex_oauth(
+        account_id,
+        platform=platform,
+        task_id=task_id,
+    )
     if outcome.get("enqueued"):
         logger.log(f"账号 {account_id}: 已创建 NexusVault 后台推送任务")
     elif outcome.get("error"):
@@ -498,6 +522,7 @@ def _log_codex_auto_push_enqueue(account_id: int, logger: "TaskLogger", *, platf
             f"账号 {account_id}: NexusVault 自动推送任务创建失败，不影响 Codex OAuth: {outcome['error']}",
             level="warning",
         )
+    return outcome
 
 
 def get_task(task_id: str) -> Optional[dict[str, Any]]:
@@ -2073,15 +2098,20 @@ def _execute_codex_oauth_batch_task(payload: dict[str, Any], logger: TaskLogger)
                 params=params,
                 scope_id=task_id,
             )
-            if auto_push_after_oauth:
-                _log_codex_auto_push_enqueue(account_id, logger, platform=platform)
-            return {
+            item = {
                 "account_id": account_id,
                 "email": email,
                 "ok": True,
                 "data": result.data,
                 "quota_refresh": quota_refresh,
             }
+            if auto_push_after_oauth:
+                item["auto_push"] = _log_codex_auto_push_enqueue(
+                    account_id,
+                    logger,
+                    platform=platform,
+                )
+            return item
         except Exception as exc:
             error = str(exc)
             logger.record_error(error)

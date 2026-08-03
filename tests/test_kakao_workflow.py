@@ -32,6 +32,7 @@ class _FakeKakaoService:
         self.submit_calls: list[dict[str, Any]] = []
         self.advance_calls: list[int] = []
         self.check_calls: list[dict[str, Any]] = []
+        self.post_action_calls: list[dict[str, Any]] = []
 
     def get_account_pipeline(self, account_id: int) -> dict[str, Any]:
         if self.pipeline is None:
@@ -46,12 +47,15 @@ class _FakeKakaoService:
         account_id: int,
         supplier_setting_id: int | None = None,
         payment_method: str = "kakao_pay",
+        *,
+        enable_post_actions: bool = False,
     ) -> dict[str, Any]:
         self.start_calls.append(
             {
                 "account_id": account_id,
                 "supplier_setting_id": supplier_setting_id,
                 "payment_method": payment_method,
+                "enable_post_actions": enable_post_actions,
             }
         )
         self.pipeline = self.start_result or {
@@ -86,30 +90,48 @@ class _FakeKakaoService:
         self.advance_calls.append(account_id)
         return self.advance_result or self.get_account_pipeline(account_id)
 
-    def check_plus(self, account_id: int, *, advance_pipeline: bool = False) -> dict[str, Any]:
-        self.check_calls.append({"account_id": account_id, "advance_pipeline": advance_pipeline})
+    def check_plus(
+        self,
+        account_id: int,
+        *,
+        advance_pipeline: bool = False,
+        enable_post_actions: bool | None = None,
+    ) -> dict[str, Any]:
+        self.check_calls.append(
+            {
+                "account_id": account_id,
+                "advance_pipeline": advance_pipeline,
+                "enable_post_actions": enable_post_actions,
+            }
+        )
         self.pipeline = self.check_result or self.get_account_pipeline(account_id)
+        return self.pipeline
+
+    def set_codex_post_actions_enabled(self, account_id: int, enabled: bool) -> dict[str, Any]:
+        self.post_action_calls.append({"account_id": account_id, "enabled": enabled})
+        current = self.get_account_pipeline(account_id)
+        self.pipeline = {**current, "codex_post_action_armed": bool(enabled)}
         return self.pipeline
 
 
 def test_kakao_adapter_succeeds_when_pipeline_is_completed_plus():
-    adapter = KakaoUpgradeAdapter(
-        _FakeKakaoService(
-            {
-                "account_id": 7,
-                "state": "completed",
-                "plus_status": "plus",
-                "final_result": "plus",
-                "completion_source": "normal_scanner",
-            }
-        )
+    service = _FakeKakaoService(
+        {
+            "account_id": 7,
+            "state": "completed",
+            "plus_status": "plus",
+            "final_result": "plus",
+            "completion_source": "normal_scanner",
+        }
     )
+    adapter = KakaoUpgradeAdapter(service)
 
     transition = adapter.start(inputs={"account_id": 7}, idempotency_key="wf_kakao", attempt=1)
 
     assert transition.status == STEP_SUCCEEDED
     assert transition.output["account_id"] == 7
     assert transition.output["completion_source"] == "normal_scanner"
+    assert service.post_action_calls == []
 
 
 def test_kakao_adapter_starts_missing_pipeline_and_waits():
@@ -133,7 +155,12 @@ def test_kakao_adapter_starts_missing_pipeline_and_waits():
     assert transition.status == STEP_WAITING_EXTERNAL
     assert transition.external_ref == "kakao:8"
     assert service.start_calls == [
-        {"account_id": 8, "supplier_setting_id": 12, "payment_method": "kakao_pay"}
+        {
+            "account_id": 8,
+            "supplier_setting_id": 12,
+            "payment_method": "kakao_pay",
+            "enable_post_actions": False,
+        }
     ]
 
 
@@ -154,6 +181,7 @@ def test_kakao_adapter_does_not_restart_existing_active_pipeline():
     assert transition.output["scanner_order_id"] == "scanner-1"
     assert service.start_calls == []
     assert service.submit_calls == []
+    assert service.post_action_calls == [{"account_id": 9, "enabled": False}]
 
 
 def test_kakao_adapter_auto_submits_scanner_when_link_is_ready():
@@ -232,7 +260,14 @@ def test_kakao_adapter_manual_retry_checks_paused_plus_state():
     transition = adapter.start(inputs={"account_id": 12}, idempotency_key="wf_kakao", attempt=2)
 
     assert transition.status == STEP_SUCCEEDED
-    assert service.check_calls == [{"account_id": 12, "advance_pipeline": True}]
+    assert service.check_calls == [
+        {
+            "account_id": 12,
+            "advance_pipeline": True,
+            "enable_post_actions": False,
+        }
+    ]
+    assert service.post_action_calls == [{"account_id": 12, "enabled": False}]
 
 
 def test_kakao_adapter_does_not_restart_final_supplier_failure():
@@ -259,6 +294,7 @@ def test_kakao_adapter_does_not_restart_final_supplier_failure():
     assert transition.error["code"] == "approve_blocked"
     assert transition.output["supplier_order_id"] == "supplier-final-1"
     assert service.start_calls == []
+    assert service.post_action_calls == [{"account_id": 13, "enabled": False}]
 
 
 def test_kakao_adapter_allows_manual_restart_for_retryable_supplier_failure():
@@ -289,8 +325,14 @@ def test_kakao_adapter_allows_manual_restart_for_retryable_supplier_failure():
     assert transition.status == STEP_WAITING_EXTERNAL
     assert transition.output["supplier_order_id"] == "supplier-new"
     assert service.start_calls == [
-        {"account_id": 14, "supplier_setting_id": 5, "payment_method": "kakao_pay"}
+        {
+            "account_id": 14,
+            "supplier_setting_id": 5,
+            "payment_method": "kakao_pay",
+            "enable_post_actions": False,
+        }
     ]
+    assert service.post_action_calls == [{"account_id": 14, "enabled": False}]
 
 
 def test_kakao_workflow_components_register_adapter_and_template():

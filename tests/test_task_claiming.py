@@ -409,6 +409,39 @@ def test_codex_oauth_auto_push_can_start_before_batch_finishes():
     assert second_claimed_push["scope"] == "chatgpt:account_push:nvtokens:102"
 
 
+def test_kakao_linked_push_holds_the_account_key():
+    push = create_task(
+        task_type=TASK_TYPE_ACCOUNT_PUSH,
+        platform="chatgpt",
+        payload={
+            "platform": "chatgpt",
+            "account_ids": [101],
+            "target_key": "nvtokens",
+            "payload_format": "codex",
+            "source": "kakao_pipeline",
+        },
+        progress_total=1,
+    )
+    oauth = create_task(
+        task_type=TASK_TYPE_CODEX_OAUTH_BATCH,
+        platform="chatgpt",
+        payload={"platform": "chatgpt", "account_ids": [101]},
+        progress_total=1,
+    )
+
+    claimed_push = claim_next_runnable_task()
+    assert claimed_push["id"] == push["id"]
+    assert claimed_push["account_keys"] == ["account:101"]
+
+    blocked = claim_next_runnable_task(
+        running_scope_counts={claimed_push["scope"]: 1},
+        busy_account_keys=set(claimed_push["account_keys"]),
+        max_parallel_per_scope=1,
+    )
+    assert blocked is None
+    assert get_task(oauth["id"])["status"] == "pending"
+
+
 def test_runtime_hard_caps_each_live_task_type_at_ten_without_a_global_cap(monkeypatch):
     monkeypatch.setenv("TASK_MAX_PARALLEL_PER_TYPE", "99")
     assert TaskRuntime().max_parallel_per_type == 10

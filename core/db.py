@@ -543,6 +543,22 @@ class KakaoPipelineModel(SQLModel, table=True):
     plus_next_check_at: Optional[datetime] = None
     plus_check_deadline_at: Optional[datetime] = None
     plus_check_paused_at: Optional[datetime] = None
+
+    # Kakao page-local post actions.  ``codex_post_action_armed`` is
+    # deliberately opt-in so upgrading an existing database cannot enqueue an
+    # OAuth browser task for every legacy completed pipeline.
+    codex_post_action_armed: bool = False
+    codex_task_id: str = ""
+    codex_attempt_count: int = 0
+    codex_interrupted_retry_count: int = 0
+    codex_skipped_at: Optional[datetime] = None
+    codex_enqueue_error: str = ""
+    codex_push_task_id: str = ""
+    codex_push_attempt_count: int = 0
+    codex_push_skip_reason: str = ""
+    codex_push_enqueue_error: str = ""
+    codex_post_action_done_at: Optional[datetime] = None
+
     last_error_code: str = ""
     last_error_message: str = ""
     events_json: str = "[]"
@@ -875,6 +891,17 @@ def init_db():
     _ensure_column("kakao_pipelines", "plus_next_check_at", "DATETIME")
     _ensure_column("kakao_pipelines", "plus_check_deadline_at", "DATETIME")
     _ensure_column("kakao_pipelines", "plus_check_paused_at", "DATETIME")
+    _ensure_column("kakao_pipelines", "codex_post_action_armed", "BOOLEAN DEFAULT 0")
+    _ensure_column("kakao_pipelines", "codex_task_id", "TEXT DEFAULT ''")
+    _ensure_column("kakao_pipelines", "codex_attempt_count", "INTEGER DEFAULT 0")
+    _ensure_column("kakao_pipelines", "codex_interrupted_retry_count", "INTEGER DEFAULT 0")
+    _ensure_column("kakao_pipelines", "codex_skipped_at", "DATETIME")
+    _ensure_column("kakao_pipelines", "codex_enqueue_error", "TEXT DEFAULT ''")
+    _ensure_column("kakao_pipelines", "codex_push_task_id", "TEXT DEFAULT ''")
+    _ensure_column("kakao_pipelines", "codex_push_attempt_count", "INTEGER DEFAULT 0")
+    _ensure_column("kakao_pipelines", "codex_push_skip_reason", "TEXT DEFAULT ''")
+    _ensure_column("kakao_pipelines", "codex_push_enqueue_error", "TEXT DEFAULT ''")
+    _ensure_column("kakao_pipelines", "codex_post_action_done_at", "DATETIME")
     _ensure_column("workflow_runs", "batch_id", "TEXT DEFAULT ''")
     _ensure_column("workflow_runs", "batch_item_index", "INTEGER DEFAULT 0")
     _ensure_column("workflow_runs", "metadata_json", "TEXT DEFAULT '{}'")

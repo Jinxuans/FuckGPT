@@ -8,7 +8,7 @@ import features.kakao_pipeline.reconciler as reconciler_module
 from sqlmodel import Session, select
 
 from core.base_platform import Account
-from core.db import KakaoPipelineModel, engine, save_account
+from core.db import AccountCodexAuthModel, KakaoPipelineModel, TaskModel, engine, save_account
 from features.kakao_pipeline.reconciler import KakaoPipelineReconciler
 from features.kakao_pipeline.service import KakaoPipelineService
 
@@ -246,3 +246,354 @@ def test_untracked_plus_is_discovered_only_when_persisted_next_check_is_due():
     assert service.list_background_work() == [
         {"account_id": account_id, "state": "scanner_accepted_untracked"}
     ]
+
+
+def test_only_explicitly_armed_completed_pipeline_gets_codex_background_work():
+    legacy_id = _create_account("legacy-completed@test.com")
+    armed_id = _create_account("armed-completed@test.com")
+    with Session(engine) as session:
+        session.add(
+            KakaoPipelineModel(
+                account_id=legacy_id,
+                state="completed",
+                final_result="plus",
+                completed_at=datetime.now(timezone.utc),
+            )
+        )
+        session.add(
+            KakaoPipelineModel(
+                account_id=armed_id,
+                state="completed",
+                final_result="plus",
+                completed_at=datetime.now(timezone.utc),
+                codex_post_action_armed=True,
+            )
+        )
+        session.commit()
+
+    work = KakaoPipelineService().list_background_work()
+
+    assert work == [{"account_id": armed_id, "state": "codex_post_action"}]
+
+
+def test_reconciler_requeues_never_started_interrupted_codex_once():
+    account_id = _create_account("interrupted-codex@test.com")
+    old_task_id = "old-never-started-codex"
+    with Session(engine) as session:
+        session.add(
+            KakaoPipelineModel(
+                account_id=account_id,
+                state="completed",
+                plus_status="plus",
+                final_result="plus",
+                completed_at=datetime.now(timezone.utc),
+                codex_post_action_armed=True,
+                codex_task_id=old_task_id,
+                codex_attempt_count=1,
+            )
+        )
+        session.add(
+            TaskModel(
+                id=old_task_id,
+                type="codex_oauth_batch",
+                platform="chatgpt",
+                status="interrupted",
+            )
+        )
+        session.commit()
+
+    result = KakaoPipelineService().advance_background(
+        account_id,
+        expected_state="codex_post_action",
+    )
+
+    assert result["state"] == "completed"
+    assert result["post_actions"]["codex"]["status"] == "pending"
+    new_task_id = result["post_actions"]["codex"]["task_id"]
+    assert new_task_id != old_task_id
+    assert new_task_id.endswith("_2")
+    with Session(engine) as session:
+        pipeline = session.exec(
+            select(KakaoPipelineModel).where(KakaoPipelineModel.account_id == account_id)
+        ).one()
+        assert pipeline.codex_interrupted_retry_count == 1
+        assert session.get(TaskModel, new_task_id).status == "pending"
+
+
+def test_reconciler_does_not_auto_retry_started_interrupted_codex():
+    account_id = _create_account("started-interrupted-codex@test.com")
+    task_id = "started-interrupted-codex"
+    started_at = datetime.now(timezone.utc) - timedelta(minutes=1)
+    with Session(engine) as session:
+        session.add(
+            KakaoPipelineModel(
+                account_id=account_id,
+                state="completed",
+                plus_status="plus",
+                final_result="plus",
+                completed_at=started_at,
+                codex_post_action_armed=True,
+                codex_task_id=task_id,
+                codex_attempt_count=1,
+            )
+        )
+        session.add(
+            TaskModel(
+                id=task_id,
+                type="codex_oauth_batch",
+                platform="chatgpt",
+                status="interrupted",
+                started_at=started_at,
+            )
+        )
+        session.commit()
+
+    service = KakaoPipelineService()
+    result = service.advance_background(account_id, expected_state="codex_post_action")
+
+    assert result["post_actions"]["codex"]["status"] == "paused"
+    assert result["post_actions"]["codex"]["task_id"] == task_id
+    assert service.list_background_work() == []
+
+
+def test_interrupted_codex_does_not_reuse_credentials_from_an_older_attempt(monkeypatch):
+    account_id = _create_account("stale-auth-interrupted@test.com")
+    now = datetime.now(timezone.utc)
+    task_id = "interrupted-with-stale-auth"
+    with Session(engine) as session:
+        session.add(
+            KakaoPipelineModel(
+                account_id=account_id,
+                state="completed",
+                plus_status="plus",
+                final_result="plus",
+                completed_at=now - timedelta(minutes=3),
+                codex_post_action_armed=True,
+                codex_task_id=task_id,
+                codex_attempt_count=2,
+            )
+        )
+        session.add(
+            TaskModel(
+                id=task_id,
+                type="codex_oauth_batch",
+                platform="chatgpt",
+                status="interrupted",
+                created_at=now - timedelta(minutes=2),
+                started_at=now - timedelta(minutes=1),
+            )
+        )
+        session.add(
+            AccountCodexAuthModel(
+                account_id=account_id,
+                has_access_token=True,
+                has_refresh_token=True,
+                last_refresh=now - timedelta(minutes=10),
+            )
+        )
+        session.commit()
+
+    monkeypatch.setattr(
+        "features.kakao_pipeline.service.get_nvtokens_auto_push_state",
+        lambda: {"enabled": True, "reason": ""},
+    )
+    service = KakaoPipelineService()
+    result = service.advance_background(account_id, expected_state="codex_post_action")
+
+    assert result["post_actions"]["codex"]["authorized"] is True
+    assert result["post_actions"]["codex"]["status"] == "paused"
+    assert result["post_actions"]["push"]["status"] == "waiting"
+    assert service.list_background_work() == []
+
+
+def test_interrupted_codex_recovers_credentials_saved_by_that_attempt(monkeypatch):
+    account_id = _create_account("fresh-auth-interrupted@test.com")
+    now = datetime.now(timezone.utc)
+    task_id = "interrupted-with-fresh-auth"
+    with Session(engine) as session:
+        session.add(
+            KakaoPipelineModel(
+                account_id=account_id,
+                state="completed",
+                plus_status="plus",
+                final_result="plus",
+                completed_at=now - timedelta(minutes=3),
+                codex_post_action_armed=True,
+                codex_task_id=task_id,
+                codex_attempt_count=1,
+            )
+        )
+        session.add(
+            TaskModel(
+                id=task_id,
+                type="codex_oauth_batch",
+                platform="chatgpt",
+                status="interrupted",
+                created_at=now - timedelta(minutes=2),
+                started_at=now - timedelta(minutes=1),
+            )
+        )
+        session.add(
+            AccountCodexAuthModel(
+                account_id=account_id,
+                has_access_token=True,
+                has_refresh_token=True,
+                last_refresh=now,
+            )
+        )
+        session.commit()
+
+    monkeypatch.setattr(
+        "features.kakao_pipeline.service.get_nvtokens_auto_push_state",
+        lambda: {"enabled": False, "reason": "auto_push_disabled"},
+    )
+
+    result = KakaoPipelineService().advance_background(
+        account_id,
+        expected_state="codex_post_action",
+    )
+
+    assert result["post_actions"]["codex"]["status"] == "skipped"
+    assert result["post_actions"]["push"]["status"] == "skipped"
+    with Session(engine) as session:
+        pipeline = session.exec(
+            select(KakaoPipelineModel).where(KakaoPipelineModel.account_id == account_id)
+        ).one()
+        assert pipeline.codex_skipped_at is not None
+
+
+def test_succeeded_codex_with_only_old_credentials_stops_as_failed(monkeypatch):
+    account_id = _create_account("succeeded-with-stale-auth@test.com")
+    now = datetime.now(timezone.utc)
+    task_id = "succeeded-with-stale-auth"
+    task = TaskModel(
+        id=task_id,
+        type="codex_oauth_batch",
+        platform="chatgpt",
+        status="succeeded",
+        created_at=now - timedelta(minutes=2),
+        started_at=now - timedelta(minutes=1),
+    )
+    task.set_result({"data": {"accounts": [{"account_id": account_id, "ok": True}]}})
+    with Session(engine) as session:
+        session.add(
+            KakaoPipelineModel(
+                account_id=account_id,
+                state="completed",
+                plus_status="plus",
+                final_result="plus",
+                completed_at=now - timedelta(minutes=3),
+                codex_post_action_armed=True,
+                codex_task_id=task_id,
+                codex_attempt_count=1,
+            )
+        )
+        session.add(task)
+        session.add(
+            AccountCodexAuthModel(
+                account_id=account_id,
+                has_access_token=True,
+                has_refresh_token=True,
+                last_refresh=now - timedelta(minutes=10),
+            )
+        )
+        session.commit()
+
+    monkeypatch.setattr(
+        "features.kakao_pipeline.service.get_nvtokens_auto_push_state",
+        lambda: {"enabled": True, "reason": ""},
+    )
+    service = KakaoPipelineService()
+    result = service.advance_background(account_id, expected_state="codex_post_action")
+
+    assert result["post_actions"]["codex"]["status"] == "failed"
+    assert result["post_actions"]["push"]["status"] == "waiting"
+    assert service.list_background_work() == []
+
+
+def test_reconciler_enqueues_linked_push_after_verified_codex(monkeypatch):
+    from application.tasks import create_account_push_task
+
+    account_id = _create_account("verified-codex-push@test.com")
+    codex_task_id = "verified-codex-task"
+    codex_task = TaskModel(
+        id=codex_task_id,
+        type="codex_oauth_batch",
+        platform="chatgpt",
+        status="succeeded",
+    )
+    codex_task.set_result(
+        {
+            "data": {
+                "accounts": [
+                    {"account_id": account_id, "ok": True},
+                ]
+            }
+        }
+    )
+    with Session(engine) as session:
+        session.add(
+            KakaoPipelineModel(
+                account_id=account_id,
+                state="completed",
+                plus_status="plus",
+                final_result="plus",
+                completed_at=datetime.now(timezone.utc),
+                codex_post_action_armed=True,
+                codex_task_id=codex_task_id,
+                codex_attempt_count=1,
+            )
+        )
+        session.add(codex_task)
+        session.add(
+            AccountCodexAuthModel(
+                account_id=account_id,
+                has_access_token=True,
+                has_refresh_token=True,
+                last_refresh=datetime.now(timezone.utc),
+            )
+        )
+        session.commit()
+
+    monkeypatch.setattr(
+        "features.kakao_pipeline.service.get_nvtokens_auto_push_state",
+        lambda: {"enabled": True, "reason": ""},
+    )
+
+    def enqueue(current_account_id: int, *, platform: str, task_id: str, source: str):
+        assert source == "kakao_pipeline"
+        task = create_account_push_task(
+            platform=platform,
+            account_ids=[current_account_id],
+            target_key="nvtokens",
+            payload_format="codex",
+            source=source,
+            task_id=task_id,
+        )
+        return {"enqueued": True, "task_id": task["id"]}
+
+    monkeypatch.setattr(
+        "features.kakao_pipeline.service.enqueue_nvtokens_push_after_codex_oauth",
+        enqueue,
+    )
+
+    result = KakaoPipelineService().advance_background(
+        account_id,
+        expected_state="codex_post_action",
+    )
+
+    push = result["post_actions"]["push"]
+    assert result["state"] == "completed"
+    assert result["post_actions"]["codex"]["status"] == "success"
+    assert push["status"] == "pending"
+    assert push["enabled"] is True
+    assert push["task_id"].startswith("kakao_push_")
+    with Session(engine) as session:
+        pipeline = session.exec(
+            select(KakaoPipelineModel).where(KakaoPipelineModel.account_id == account_id)
+        ).one()
+        push_task = session.get(TaskModel, push["task_id"])
+        assert pipeline.state == "completed"
+        assert pipeline.codex_push_task_id == push["task_id"]
+        assert push_task.get_payload()["target_key"] == "nvtokens"
+        assert push_task.get_payload()["source"] == "kakao_pipeline"

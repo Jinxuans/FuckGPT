@@ -95,6 +95,8 @@ class KakaoUpgradeAdapter(StepAdapter):
 
         existing = self._get_pipeline(account_id)
         if existing:
+            if not self._pipeline_is_complete(existing):
+                existing = self.service.set_codex_post_actions_enabled(account_id, False)
             return self._advance_or_map(existing, inputs=inputs, attempt=attempt)
 
         if self.service._account_is_plus(account_id):  # type: ignore[attr-defined]  # same feature boundary
@@ -108,6 +110,7 @@ class KakaoUpgradeAdapter(StepAdapter):
                 account_id,
                 supplier_setting_id=self._optional_int(inputs.get("supplier_setting_id")),
                 payment_method=_text(inputs.get("payment_method")) or "kakao_pay",
+                enable_post_actions=False,
             )
         except Exception as exc:  # noqa: BLE001 - persisted Kakao state is the source of truth.
             pipeline = self._get_pipeline(account_id)
@@ -121,6 +124,9 @@ class KakaoUpgradeAdapter(StepAdapter):
         if account_id <= 0:
             return StepTransition.failed("Kakao 升级步骤缺少 account_id", code="kakao_account_missing")
         try:
+            existing = self._get_pipeline(account_id)
+            if existing and not self._pipeline_is_complete(existing):
+                self.service.set_codex_post_actions_enabled(account_id, False)
             pipeline = self.service.advance_background(account_id)
         except Exception:
             pipeline = self._get_pipeline(account_id)
@@ -143,6 +149,7 @@ class KakaoUpgradeAdapter(StepAdapter):
                     account_id,
                     supplier_setting_id=self._optional_int(inputs.get("supplier_setting_id")),
                     payment_method=_text(inputs.get("payment_method")) or "kakao_pay",
+                    enable_post_actions=False,
                 )
             except Exception:
                 latest = self._get_pipeline(account_id)
@@ -188,7 +195,11 @@ class KakaoUpgradeAdapter(StepAdapter):
         if state in {"scanner_succeeded", "plus_check_failed", "plus_unconfirmed", "scanner_recovery_unconfirmed", "scanner_submit_unconfirmed"}:
             if attempt > 1:
                 try:
-                    pipeline = self.service.check_plus(account_id, advance_pipeline=True)
+                    pipeline = self.service.check_plus(
+                        account_id,
+                        advance_pipeline=True,
+                        enable_post_actions=False,
+                    )
                 except Exception:
                     pipeline = self._get_pipeline(account_id) or pipeline
                 return self._map_pipeline(pipeline)
@@ -249,6 +260,14 @@ class KakaoUpgradeAdapter(StepAdapter):
         if "approve" in code or "approve" in message:
             return "blocked" in code or "blocked" in message or "未通过" in message or "不通过" in message
         return False
+
+    @staticmethod
+    def _pipeline_is_complete(pipeline: dict[str, Any]) -> bool:
+        return (
+            _text(pipeline.get("state")) == "completed"
+            or _text(pipeline.get("final_result")) == "plus"
+            or _text(pipeline.get("plus_status")) == "plus"
+        )
 
     @staticmethod
     def _optional_int(value: Any) -> int | None:
