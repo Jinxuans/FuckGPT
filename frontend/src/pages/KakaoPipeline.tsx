@@ -41,10 +41,18 @@ type KakaoSetting = {
 }
 
 type ScannerKind = 'scanner' | 'scanner_546789'
+type AccountProxyMode = 'direct' | 'proxy_service' | 'manual'
+
+type AccountProxySetting = {
+  mode: AccountProxyMode
+  value: string
+  preview: string
+}
 
 type KakaoSettings = Record<SettingKind, KakaoSetting> & {
   default_scanner_kind: ScannerKind
   auto_upload_after_extract: boolean
+  account_proxy: AccountProxySetting
 }
 
 type Pipeline = {
@@ -804,6 +812,11 @@ function SettingsPanel({
   const [activeKind, setActiveKind] = useState<SettingKind>('supplier')
   const [feedback, setFeedback] = useState<Record<SettingKind, string>>({ supplier: '', scanner: '', scanner_546789: '' })
   const [checkResults, setCheckResults] = useState<Record<SettingKind, CdkCheckResult[]>>({ supplier: [], scanner: [], scanner_546789: [] })
+  const [accountProxy, setAccountProxy] = useState({
+    mode: settings.account_proxy.mode,
+    value: settings.account_proxy.value,
+  })
+  const [accountProxyFeedback, setAccountProxyFeedback] = useState('')
 
   useEffect(() => {
     setDrafts({
@@ -822,6 +835,10 @@ function SettingsPanel({
         base_url: settings.scanner_546789.base_url,
         cdk_keys: settings.scanner_546789.cdk_keys.join('\n'),
       },
+    })
+    setAccountProxy({
+      mode: settings.account_proxy.mode,
+      value: settings.account_proxy.value,
     })
   }, [settings])
 
@@ -855,6 +872,23 @@ function SettingsPanel({
       await onSaved()
     } catch (error) {
       setFeedback(current => ({ ...current, [settings.default_scanner_kind]: parseError(error) }))
+    } finally {
+      setBusy('')
+    }
+  }
+
+  const saveAccountProxy = async () => {
+    setBusy('save-account-proxy')
+    setAccountProxyFeedback('')
+    try {
+      await apiFetch('/kakao-pipeline/settings/options/account-proxy', {
+        method: 'PUT',
+        body: JSON.stringify(accountProxy),
+      })
+      setAccountProxyFeedback('账号检查与重登代理已保存')
+      await onSaved()
+    } catch (error) {
+      setAccountProxyFeedback(parseError(error))
     } finally {
       setBusy('')
     }
@@ -941,8 +975,8 @@ function SettingsPanel({
     <div className="mb-5 border border-[var(--border)] bg-[var(--bg-surface)]">
       <div className="flex items-center justify-between border-b border-[var(--border)] px-4 py-3">
         <div>
-          <h2 className="text-sm font-semibold text-[var(--text-primary)]">Kakao 接口配置</h2>
-          <p className="mt-0.5 text-xs text-[var(--text-muted)]">每行一个 CDK，配置在本机明文显示；确认用完后会自动从池中删除。</p>
+          <h2 className="text-sm font-semibold text-[var(--text-primary)]">Kakao 流水线配置</h2>
+          <p className="mt-0.5 text-xs text-[var(--text-muted)]">配置供应商、CDK，以及 Plus 检查和自动重登使用的网络。</p>
         </div>
         <div className="flex flex-wrap items-center justify-end gap-3">
           <label className="flex items-center gap-2 text-xs text-[var(--text-secondary)]">
@@ -970,6 +1004,49 @@ function SettingsPanel({
             <X className="h-4 w-4" />
           </Button>
         </div>
+      </div>
+      <div className="flex flex-wrap items-end gap-3 border-b border-[var(--border)] bg-[var(--bg-hover)]/30 px-4 py-3">
+        <label className="block min-w-44">
+          <span className="mb-1 block text-xs text-[var(--text-secondary)]">Plus 检查与自动重登代理</span>
+          <select
+            className="control-surface control-surface-compact w-full"
+            value={accountProxy.mode}
+            disabled={Boolean(busy)}
+            onChange={event => setAccountProxy(current => ({
+              ...current,
+              mode: event.target.value as AccountProxyMode,
+            }))}
+          >
+            <option value="direct">直连</option>
+            <option value="proxy_service">代理服务</option>
+            <option value="manual">手动代理</option>
+          </select>
+        </label>
+        {accountProxy.mode === 'manual' ? (
+          <label className="block min-w-64 flex-1">
+            <span className="mb-1 block text-xs text-[var(--text-secondary)]">代理 URL</span>
+            <input
+              className="control-surface control-surface-compact control-surface-mono w-full"
+              value={accountProxy.value}
+              placeholder="http://127.0.0.1:7897"
+              spellCheck={false}
+              disabled={Boolean(busy)}
+              onChange={event => setAccountProxy(current => ({ ...current, value: event.target.value }))}
+            />
+          </label>
+        ) : null}
+        <Button size="sm" disabled={Boolean(busy)} onClick={saveAccountProxy}>
+          {busy === 'save-account-proxy' ? <LoaderCircle className="mr-1.5 h-3.5 w-3.5 animate-spin" /> : null}
+          保存账号网络
+        </Button>
+        {accountProxyFeedback ? (
+          <span className={cn(
+            'w-full text-xs',
+            accountProxyFeedback.includes('已保存') ? 'text-emerald-500' : 'text-red-500',
+          )}>
+            {accountProxyFeedback}
+          </span>
+        ) : null}
       </div>
       <div className="grid lg:grid-cols-[220px_minmax(0,1fr)]">
         <nav className="flex gap-1 overflow-x-auto border-b border-[var(--border)] p-2 lg:flex-col lg:border-b-0 lg:border-r" aria-label="接口类型">
@@ -1541,7 +1618,7 @@ export default function KakaoPipeline() {
             <RefreshCw className="mr-1.5 h-3.5 w-3.5" /> 刷新账号
           </Button>
           <Button variant={settingsOpen ? 'default' : 'outline'} size="sm" onClick={() => setSettingsOpen(value => !value)}>
-            <Settings2 className="mr-1.5 h-3.5 w-3.5" /> 配置供应商
+            <Settings2 className="mr-1.5 h-3.5 w-3.5" /> 流水线配置
           </Button>
         </div>
       </header>
@@ -1569,6 +1646,16 @@ export default function KakaoPipeline() {
           <div className="flex items-center gap-2">
             <span className="text-[var(--text-muted)]">提链后</span>
             <span className="font-medium text-[var(--text-primary)]">{settings.auto_upload_after_extract ? '自动上传扫码' : '人工确认上传'}</span>
+          </div>
+          <div className="flex items-center gap-2">
+            <span className="text-[var(--text-muted)]">账号网络</span>
+            <span className="font-medium text-[var(--text-primary)]">
+              {settings.account_proxy.mode === 'proxy_service'
+                ? '代理服务'
+                : settings.account_proxy.mode === 'manual'
+                  ? `手动代理 ${settings.account_proxy.preview}`
+                  : '直连'}
+            </span>
           </div>
         </div>
       )}

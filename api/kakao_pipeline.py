@@ -44,6 +44,11 @@ class AutoUploadRequest(BaseModel):
     enabled: bool
 
 
+class AccountProxyRequest(BaseModel):
+    mode: str = "direct"
+    value: str = ""
+
+
 def _raise_problem(exc: Exception) -> None:
     if isinstance(exc, CustomerApiProblem):
         status_code = 502 if exc.status_code >= 500 else 400
@@ -97,6 +102,15 @@ def set_auto_upload(body: AutoUploadRequest, response: Response):
     response.headers["Cache-Control"] = "no-store"
     try:
         return service.set_auto_upload(body.enabled)
+    except Exception as exc:  # noqa: BLE001
+        _raise_problem(exc)
+
+
+@router.put("/settings/options/account-proxy")
+def set_account_proxy(body: AccountProxyRequest, response: Response):
+    response.headers["Cache-Control"] = "no-store"
+    try:
+        return service.set_account_proxy(body.mode, body.value)
     except Exception as exc:  # noqa: BLE001
         _raise_problem(exc)
 

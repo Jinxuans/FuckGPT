@@ -295,6 +295,32 @@ def test_kakao_settings_support_visible_multiline_cdk_pool(client):
     assert listed.status_code == 200
     assert listed.json()["supplier"]["cdk_keys"] == ["supplier-cdk-one", "supplier-cdk-two"]
     assert listed.json()["scanner"]["base_url"] == "https://customer.i7wap.xyz"
+    assert listed.json()["account_proxy"] == {"mode": "direct", "value": "", "preview": ""}
+
+    missing_proxy = client.put(
+        "/api/kakao-pipeline/settings/options/account-proxy",
+        json={"mode": "manual", "value": ""},
+    )
+    assert missing_proxy.status_code == 400
+
+    account_proxy = client.put(
+        "/api/kakao-pipeline/settings/options/account-proxy",
+        json={"mode": "manual", "value": "http://proxy-user:proxy-pass@127.0.0.1:7897"},
+    )
+    assert account_proxy.status_code == 200
+    assert account_proxy.json()["account_proxy"] == {
+        "mode": "manual",
+        "value": "http://proxy-user:proxy-pass@127.0.0.1:7897",
+        "preview": "http://***:***@127.0.0.1:7897",
+    }
+    assert client.get("/api/kakao-pipeline/settings").json()["account_proxy"]["mode"] == "manual"
+
+    proxy_service = client.put(
+        "/api/kakao-pipeline/settings/options/account-proxy",
+        json={"mode": "proxy_service", "value": "http://ignored.example:8080"},
+    )
+    assert proxy_service.status_code == 200
+    assert proxy_service.json()["account_proxy"] == {"mode": "proxy_service", "value": "", "preview": ""}
 
     migrated = client.put(
         "/api/kakao-pipeline/settings/scanner",
@@ -1012,6 +1038,135 @@ def test_pipeline_plus_query_failure_uses_same_persisted_ladder(monkeypatch):
     assert timedelta(seconds=4) <= next_check - started <= timedelta(seconds=6)
     assert next_check <= deadline
     assert service.list_background_work() == []
+
+
+def test_pipeline_plus_check_relogins_invalid_account_before_rechecking(monkeypatch):
+    account_id = _create_account("invalid-plus-relogin@test.com")
+    service = KakaoPipelineService()
+    service.set_account_proxy("manual", "http://127.0.0.1:7897")
+
+    from sqlmodel import Session
+
+    from core.db import engine
+
+    with Session(engine) as session:
+        session.add(KakaoPipelineModel(account_id=account_id, state="scanner_succeeded"))
+        session.commit()
+
+    actions = []
+
+    def execute_action(_runtime, command, **_kwargs):
+        actions.append((command.action_id, dict(command.params)))
+        if command.action_id == "relogin":
+            return SimpleNamespace(ok=True, data={"checked_at": "2099-01-01T00:00:00Z"}, error="")
+        if sum(action_id == "query_state" for action_id, _params in actions) == 1:
+            return SimpleNamespace(ok=True, data={"valid": False}, error="")
+        return SimpleNamespace(ok=True, data={"valid": True, "plan": "plus"}, error="")
+
+    monkeypatch.setattr(
+        "features.kakao_pipeline.service.PlatformRuntime.execute_action",
+        execute_action,
+    )
+    monkeypatch.setattr(
+        service.accounts,
+        "get_account",
+        lambda _account_id: {
+            "account_view": {
+                "status": {"checked_at": "2099-01-01T00:00:00Z"},
+                "subscription": {"plan": "plus", "state": "subscribed"},
+            }
+        },
+    )
+
+    result = service.check_plus(account_id, advance_pipeline=True)
+
+    assert [action_id for action_id, _params in actions] == ["query_state", "relogin", "query_state"]
+    assert all(params["platform_proxy_mode"] == "manual" for _action_id, params in actions)
+    assert all(params["platform_proxy_value"] == "http://127.0.0.1:7897" for _action_id, params in actions)
+    assert result["state"] == "completed"
+    assert result["final_result"] == "plus"
+    messages = [item["message"] for item in result["events"]]
+    assert any("登录已失效" in message for message in messages)
+    assert any("重新登录成功" in message for message in messages)
+
+
+def test_pipeline_plus_check_pauses_when_invalid_account_relogin_fails(monkeypatch):
+    account_id = _create_account("invalid-plus-relogin-failed@test.com")
+    service = KakaoPipelineService()
+
+    from sqlmodel import Session
+
+    from core.db import engine
+
+    with Session(engine) as session:
+        session.add(KakaoPipelineModel(account_id=account_id, state="scanner_succeeded"))
+        session.commit()
+
+    actions = []
+
+    def execute_action(_runtime, command, **_kwargs):
+        actions.append(command.action_id)
+        if command.action_id == "query_state":
+            return SimpleNamespace(ok=True, data={"valid": False}, error="")
+        return SimpleNamespace(
+            ok=False,
+            data={"failure_code": "credentials_invalid"},
+            error="重新登录失败 [credentials_invalid]: 密码错误",
+        )
+
+    monkeypatch.setattr(
+        "features.kakao_pipeline.service.PlatformRuntime.execute_action",
+        execute_action,
+    )
+
+    result = service.check_plus(account_id, advance_pipeline=True)
+
+    assert actions == ["query_state", "relogin"]
+    assert result["state"] == "plus_unconfirmed"
+    assert result["last_error_code"] == "plus_relogin_failed"
+    assert "密码错误" in result["last_error_message"]
+    assert result["plus_next_check_at"] is None
+    assert service.list_background_work() == []
+
+
+def test_pipeline_plus_check_does_not_relogin_indeterminate_account_state(monkeypatch):
+    account_id = _create_account("unknown-plus-state@test.com")
+    service = KakaoPipelineService()
+
+    from sqlmodel import Session
+
+    from core.db import engine
+
+    with Session(engine) as session:
+        session.add(KakaoPipelineModel(account_id=account_id, state="scanner_succeeded"))
+        session.commit()
+
+    actions = []
+
+    def execute_action(_runtime, command, **_kwargs):
+        actions.append(command.action_id)
+        return SimpleNamespace(ok=True, data={"valid": None, "last_error": "rate limited"}, error="")
+
+    monkeypatch.setattr(
+        "features.kakao_pipeline.service.PlatformRuntime.execute_action",
+        execute_action,
+    )
+    monkeypatch.setattr(
+        service.accounts,
+        "get_account",
+        lambda _account_id: {
+            "account_view": {
+                "status": {"checked_at": "2099-01-01T00:00:00Z"},
+                "subscription": {"plan": "free", "state": "free"},
+            }
+        },
+    )
+
+    result = service.check_plus(account_id, advance_pipeline=True)
+
+    assert actions == ["query_state"]
+    assert result["state"] == "plus_pending"
+    assert result["plus_check_count"] == 1
 
 
 def test_pipeline_plus_check_uses_random_interval_from_sixth_check(monkeypatch):

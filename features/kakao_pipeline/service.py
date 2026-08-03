@@ -15,8 +15,15 @@ from sqlmodel import Session, select
 from application.accounts import AccountsService
 from core.db import AccountModel, KakaoPipelineModel, ProviderSettingModel, engine
 from core.platform_accounts import build_platform_account
+from core.proxy_resolution import (
+    PROXY_MODE_DIRECT,
+    PROXY_MODE_MANUAL,
+    PROXY_MODE_PROXY_SERVICE,
+    mask_proxy_url,
+    normalize_proxy_mode,
+)
 from domain.accounts import AccountQuery
-from domain.actions import ActionExecutionCommand
+from domain.actions import ActionExecutionCommand, ActionExecutionResult
 from infrastructure.platform_runtime import PlatformRuntime
 from infrastructure.provider_settings_repository import ProviderSettingsRepository
 
@@ -26,6 +33,7 @@ from .workstation_client import WorkstationScannerClient
 
 KAKAO_PROVIDER_TYPE = "kakao_pipeline"
 SCANNER_KINDS = ("scanner", "scanner_546789")
+ACCOUNT_PROXY_MODES = {PROXY_MODE_DIRECT, PROXY_MODE_MANUAL, PROXY_MODE_PROXY_SERVICE}
 SCANNER_BASE_URL = "https://customer.i7wap.xyz"
 LEGACY_SCANNER_BASE_URLS = {"https://upi.i7wap.xyz"}
 SETTING_DEFAULTS = {
@@ -423,6 +431,7 @@ class KakaoPipelineService:
             }
         result["default_scanner_kind"] = self._default_scanner_kind()
         result["auto_upload_after_extract"] = self._auto_upload_after_extract()
+        result["account_proxy"] = self._account_proxy_options()
         return result
 
     def _default_scanner_kind(self) -> str:
@@ -484,6 +493,70 @@ class KakaoPipelineService:
                 metadata=metadata,
             )
         return {"ok": True, "auto_upload_after_extract": bool(enabled), "settings": self.list_settings()}
+
+    def _account_proxy_options(self) -> dict[str, str]:
+        for kind in SCANNER_KINDS:
+            item = self.settings.get_by_key(KAKAO_PROVIDER_TYPE, kind)
+            if item is None:
+                continue
+            metadata = item.get_metadata()
+            if "account_proxy_mode" not in metadata:
+                continue
+            mode = normalize_proxy_mode(
+                _text(metadata.get("account_proxy_mode")),
+                default=PROXY_MODE_DIRECT,
+            )
+            if mode not in ACCOUNT_PROXY_MODES:
+                mode = PROXY_MODE_DIRECT
+            value = _text(metadata.get("account_proxy_value")) if mode == PROXY_MODE_MANUAL else ""
+            return {
+                "mode": mode,
+                "value": value,
+                "preview": mask_proxy_url(value),
+            }
+        return {"mode": PROXY_MODE_DIRECT, "value": "", "preview": ""}
+
+    def set_account_proxy(self, mode: str, value: str = "") -> dict:
+        requested_mode = _text(mode).lower()
+        if requested_mode not in ACCOUNT_PROXY_MODES:
+            raise ValueError("未知账号检查代理模式")
+        proxy_value = _text(value)
+        if requested_mode == PROXY_MODE_MANUAL:
+            if not proxy_value:
+                raise ValueError("手动代理模式需要填写代理 URL")
+            parsed = urlsplit(proxy_value)
+            if parsed.scheme.lower() not in {"http", "https", "socks4", "socks5", "socks5h"} or not parsed.hostname:
+                raise ValueError("手动代理 URL 格式无效")
+        else:
+            proxy_value = ""
+
+        self.settings.definitions.ensure_seeded()
+        selected = self._default_scanner_kind()
+        for kind in SCANNER_KINDS:
+            item, current = self._setting_payload(kind)
+            if item is None and kind != selected:
+                continue
+            metadata = item.get_metadata() if item else {}
+            metadata.update(
+                {
+                    "temporary_feature": True,
+                    "account_proxy_mode": requested_mode,
+                    "account_proxy_value": proxy_value,
+                }
+            )
+            self.settings.save(
+                setting_id=int(item.id or 0) if item else None,
+                provider_type=KAKAO_PROVIDER_TYPE,
+                provider_key=kind,
+                display_name=current["display_name"],
+                auth_mode="apikey",
+                enabled=True,
+                is_default=True,
+                config={"base_url": current["base_url"]},
+                auth={"cdk_keys": current["cdk_keys"]},
+                metadata=metadata,
+            )
+        return {"ok": True, "account_proxy": self._account_proxy_options(), "settings": self.list_settings()}
 
     def _maybe_auto_submit_scanner(self, account_id: int, result: dict) -> dict:
         if result.get("state") != "link_ready" or not self._auto_upload_after_extract():
@@ -681,6 +754,89 @@ class KakaoPipelineService:
         return plan_state == "subscribed" or any(
             token in plan for token in ("plus", "pro", "team", "business", "enterprise")
         )
+
+    @staticmethod
+    def _append_account_pipeline_event(account_id: int, message: str, *, level: str = "info") -> None:
+        with Session(engine) as session:
+            pipeline = session.exec(
+                select(KakaoPipelineModel).where(KakaoPipelineModel.account_id == int(account_id))
+            ).first()
+            if pipeline is None:
+                return
+            pipeline.updated_at = _utcnow()
+            _append_event(pipeline, message, level=level)
+            session.add(pipeline)
+            session.commit()
+
+    def _query_account_state_with_relogin(
+        self,
+        account_id: int,
+    ) -> tuple[ActionExecutionResult, dict[str, bool]]:
+        """Query ChatGPT state and repair an explicitly invalid login once.
+
+        Transport failures and indeterminate checks must not launch a browser.
+        A failed login recovery is marked so callers can pause the pipeline
+        instead of repeatedly starting browser workers on the short Plus poll
+        interval.
+        """
+        runtime = PlatformRuntime()
+
+        def execute(action_id: str, params: dict[str, Any]) -> ActionExecutionResult:
+            return runtime.execute_action(
+                ActionExecutionCommand(
+                    platform="chatgpt",
+                    account_id=int(account_id),
+                    action_id=action_id,
+                    params=params,
+                )
+            )
+
+        proxy_options = self._account_proxy_options()
+        query_params = {
+            "platform_proxy_mode": proxy_options["mode"],
+            "platform_proxy_value": proxy_options["value"],
+        }
+        result = execute("query_state", query_params)
+        result_data = result.data if isinstance(getattr(result, "data", None), dict) else {}
+        if not result.ok or result_data.get("valid") is not False:
+            return result, {"attempted": False, "relogin_ok": False, "recovery_failed": False}
+
+        self._append_account_pipeline_event(
+            account_id,
+            "Plus 检测发现账号登录已失效，开始自动重新登录",
+            level="warning",
+        )
+        relogin = execute(
+            "relogin",
+            {
+                "browser_mode": "headless",
+                "keep_browser_open": "false",
+                **query_params,
+            },
+        )
+        if not relogin.ok:
+            error = str(relogin.error or "自动重新登录失败")
+            self._append_account_pipeline_event(
+                account_id,
+                f"账号自动重新登录失败: {error}",
+                level="error",
+            )
+            return (
+                ActionExecutionResult(ok=False, data=relogin.data, error=f"账号失效且{error}"),
+                {"attempted": True, "relogin_ok": False, "recovery_failed": True},
+            )
+
+        self._append_account_pipeline_event(account_id, "账号自动重新登录成功，重新检测 Plus")
+        refreshed = execute("query_state", query_params)
+        refreshed_data = refreshed.data if isinstance(getattr(refreshed, "data", None), dict) else {}
+        if refreshed.ok and refreshed_data.get("valid") is False:
+            error = "自动重新登录后账号仍为失效状态"
+            self._append_account_pipeline_event(account_id, error, level="error")
+            return (
+                ActionExecutionResult(ok=False, data=refreshed.data, error=error),
+                {"attempted": True, "relogin_ok": True, "recovery_failed": True},
+            )
+        return refreshed, {"attempted": True, "relogin_ok": True, "recovery_failed": False}
 
     @staticmethod
     def _serialize_pipeline(model: KakaoPipelineModel | None, *, detail: bool = False) -> dict:
@@ -1777,14 +1933,7 @@ class KakaoPipelineService:
                 )
                 session.add(pipeline)
                 session.commit()
-            result = PlatformRuntime().execute_action(
-                ActionExecutionCommand(
-                    platform="chatgpt",
-                    account_id=int(account_id),
-                    action_id="query_state",
-                    params={"platform_proxy_mode": "direct"},
-                )
-            )
+            result, auth_recovery = self._query_account_state_with_relogin(account_id)
             if not result.ok:
                 with Session(engine) as session:
                     pipeline = self._pipeline_for_account(session, account_id)
@@ -1797,7 +1946,13 @@ class KakaoPipelineService:
                         return self._serialize_pipeline(pipeline, detail=True)
                     pipeline.plus_status = "error"
                     if advance_pipeline:
-                        if manual_paused_check:
+                        if auth_recovery["recovery_failed"]:
+                            self._pause_plus_confirmation(
+                                pipeline,
+                                result.error or "账号失效且自动重新登录失败，Plus 确认已暂停",
+                            )
+                            pipeline.last_error_code = "plus_relogin_failed"
+                        elif manual_paused_check:
                             pipeline.state = "plus_unconfirmed"
                             pipeline.last_error_code = "plus_check_failed"
                             pipeline.last_error_message = (result.error or "Plus 检测失败")[:1000]
@@ -1928,14 +2083,7 @@ class KakaoPipelineService:
                 session.add(pipeline)
                 session.commit()
 
-            result = PlatformRuntime().execute_action(
-                ActionExecutionCommand(
-                    platform="chatgpt",
-                    account_id=int(account_id),
-                    action_id="query_state",
-                    params={"platform_proxy_mode": "direct"},
-                )
-            )
+            result, auth_recovery = self._query_account_state_with_relogin(account_id)
             if not result.ok:
                 with Session(engine) as session:
                     pipeline = self._pipeline_for_account(session, account_id)
@@ -1945,7 +2093,13 @@ class KakaoPipelineService:
                     pipeline.last_error_message = (result.error or "无单号 Plus 确认失败")[:1000]
                     pipeline.updated_at = _utcnow()
                     _append_event(pipeline, pipeline.last_error_message, level="warning")
-                    if was_unconfirmed:
+                    if auth_recovery["recovery_failed"]:
+                        self._pause_untracked_plus_confirmation(
+                            pipeline,
+                            result.error or "账号失效且自动重新登录失败，Plus 确认已暂停",
+                        )
+                        pipeline.last_error_code = "untracked_plus_relogin_failed"
+                    elif was_unconfirmed:
                         self._pause_untracked_plus_confirmation(
                             pipeline,
                             "本次人工检测失败，任务继续保持暂停",
