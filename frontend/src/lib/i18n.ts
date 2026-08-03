@@ -322,7 +322,7 @@ const ZH_MESSAGES = {
 
   "workflowStatus.pending": "排队中",
   "workflowStatus.ready": "就绪",
-  "workflowStatus.running": "执行中",
+  "workflowStatus.running": "推进中",
   "workflowStatus.waiting_external": "等待外部结果",
   "workflowStatus.retry_scheduled": "等待重试",
   "workflowStatus.needs_attention": "需要处理",
@@ -884,7 +884,7 @@ const EN_MESSAGES: Record<TranslationKey, string> = {
 
   "workflowStatus.pending": "Pending",
   "workflowStatus.ready": "Ready",
-  "workflowStatus.running": "Running",
+  "workflowStatus.running": "In Progress",
   "workflowStatus.waiting_external": "Waiting",
   "workflowStatus.retry_scheduled": "Retry Scheduled",
   "workflowStatus.needs_attention": "Needs Attention",
