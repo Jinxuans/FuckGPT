@@ -30,6 +30,12 @@ _FAILED_STATES = {
     "scanner_failed",
 }
 
+_NON_RESTARTABLE_SUPPLIER_ERROR_CODES = {
+    "approve_blocked",
+    "invalid_payment_url",
+    "zero_amount_not_verified",
+}
+
 
 def _text(value: Any) -> str:
     return str(value or "").strip()
@@ -131,7 +137,7 @@ class KakaoUpgradeAdapter(StepAdapter):
         state = _text(pipeline.get("state"))
         account_id = _int_or_zero(pipeline.get("account_id") or inputs.get("account_id"))
 
-        if attempt > 1 and state == "supplier_failed":
+        if attempt > 1 and state == "supplier_failed" and not self._supplier_failure_is_final(pipeline):
             try:
                 pipeline = self.service.start_extraction(
                     account_id,
@@ -209,20 +215,23 @@ class KakaoUpgradeAdapter(StepAdapter):
             return StepTransition.needs_attention(
                 _text(pipeline.get("last_error_message")) or self._attention_message(state),
                 code=_text(pipeline.get("last_error_code")) or f"kakao_{state}",
+                output=output,
             )
 
         if state in _FAILED_STATES:
             return StepTransition.needs_attention(
                 _text(pipeline.get("last_error_message")) or self._attention_message(state),
                 code=_text(pipeline.get("last_error_code")) or f"kakao_{state}",
+                output=output,
             )
 
         if state == "idle":
-            return StepTransition.needs_attention("Kakao 流水线尚未启动", code="kakao_pipeline_idle")
+            return StepTransition.needs_attention("Kakao 流水线尚未启动", code="kakao_pipeline_idle", output=output)
 
         return StepTransition.needs_attention(
             f"Kakao 流水线状态未识别: {state or 'unknown'}",
             code="kakao_state_unknown",
+            output=output,
         )
 
     def _get_pipeline(self, account_id: int) -> dict[str, Any] | None:
@@ -230,6 +239,16 @@ class KakaoUpgradeAdapter(StepAdapter):
             return self.service.get_account_pipeline(account_id)
         except ValueError:
             return None
+
+    @staticmethod
+    def _supplier_failure_is_final(pipeline: dict[str, Any]) -> bool:
+        code = _text(pipeline.get("last_error_code")).lower().replace("-", "_")
+        message = _text(pipeline.get("last_error_message")).lower()
+        if code in _NON_RESTARTABLE_SUPPLIER_ERROR_CODES:
+            return True
+        if "approve" in code or "approve" in message:
+            return "blocked" in code or "blocked" in message or "未通过" in message or "不通过" in message
+        return False
 
     @staticmethod
     def _optional_int(value: Any) -> int | None:

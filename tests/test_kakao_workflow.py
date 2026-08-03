@@ -235,6 +235,64 @@ def test_kakao_adapter_manual_retry_checks_paused_plus_state():
     assert service.check_calls == [{"account_id": 12, "advance_pipeline": True}]
 
 
+def test_kakao_adapter_does_not_restart_final_supplier_failure():
+    service = _FakeKakaoService(
+        {
+            "account_id": 13,
+            "state": "supplier_failed",
+            "supplier_status": "FAILED",
+            "supplier_order_id": "supplier-final-1",
+            "last_error_code": "approve_blocked",
+            "last_error_message": "OpenAI approve 未通过",
+        },
+        start_result={
+            "account_id": 13,
+            "state": "supplier_processing",
+            "supplier_order_id": "supplier-should-not-open",
+        },
+    )
+    adapter = KakaoUpgradeAdapter(service)
+
+    transition = adapter.resume(inputs={"account_id": 13}, external_ref="kakao:13", attempt=2)
+
+    assert transition.status == STEP_NEEDS_ATTENTION
+    assert transition.error["code"] == "approve_blocked"
+    assert transition.output["supplier_order_id"] == "supplier-final-1"
+    assert service.start_calls == []
+
+
+def test_kakao_adapter_allows_manual_restart_for_retryable_supplier_failure():
+    service = _FakeKakaoService(
+        {
+            "account_id": 14,
+            "state": "supplier_failed",
+            "supplier_status": "FAILED",
+            "supplier_order_id": "supplier-old",
+            "last_error_code": "temporary_supplier_failure",
+            "last_error_message": "供应商临时失败",
+        },
+        start_result={
+            "account_id": 14,
+            "state": "supplier_processing",
+            "supplier_status": "PENDING",
+            "supplier_order_id": "supplier-new",
+        },
+    )
+    adapter = KakaoUpgradeAdapter(service)
+
+    transition = adapter.resume(
+        inputs={"account_id": 14, "supplier_setting_id": 5, "payment_method": "kakao_pay"},
+        external_ref="kakao:14",
+        attempt=2,
+    )
+
+    assert transition.status == STEP_WAITING_EXTERNAL
+    assert transition.output["supplier_order_id"] == "supplier-new"
+    assert service.start_calls == [
+        {"account_id": 14, "supplier_setting_id": 5, "payment_method": "kakao_pay"}
+    ]
+
+
 def test_kakao_workflow_components_register_adapter_and_template():
     register_builtin_workflow_components()
     register_kakao_workflow_components()
