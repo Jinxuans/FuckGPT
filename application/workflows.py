@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import time
+import threading
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -16,6 +17,7 @@ from application.workflow_registry import (
 )
 from core.datetime_utils import ensure_utc_datetime, format_local_clock, serialize_datetime
 from core.db import (
+    WorkflowBatchModel,
     WorkflowDefinitionModel,
     WorkflowEventModel,
     WorkflowRunModel,
@@ -28,6 +30,7 @@ from domain.workflows import (
     RUN_FAILED,
     RUN_NEEDS_ATTENTION,
     RUN_PENDING,
+    RUN_PAUSED,
     RUN_RETRY_SCHEDULED,
     RUN_RUNNING,
     RUN_SUCCEEDED,
@@ -49,6 +52,15 @@ from domain.workflows import (
     parse_duration_seconds,
     resolve_value,
 )
+
+
+FAILURE_POLICY_FAIL = "fail"
+FAILURE_POLICY_NEEDS_ATTENTION = "needs_attention"
+FAILURE_POLICY_SKIP = "skip"
+FAILURE_POLICIES = {FAILURE_POLICY_FAIL, FAILURE_POLICY_NEEDS_ATTENTION, FAILURE_POLICY_SKIP}
+LIMIT_HELD_STEP_STATUSES = {STEP_RUNNING, STEP_WAITING_EXTERNAL}
+DEFAULT_STUCK_SECONDS = 30 * 60
+_workflow_claim_lock = threading.Lock()
 
 
 def _utcnow() -> datetime:
@@ -73,6 +85,21 @@ def _load_json(value: str) -> dict[str, Any]:
 def _due(value: datetime | str | None, now: datetime) -> bool:
     normalized = ensure_utc_datetime(value)
     return normalized is None or normalized <= now
+
+
+def _seconds_between(start: datetime | str | None, end: datetime | str | None) -> int:
+    start_dt = ensure_utc_datetime(start)
+    end_dt = ensure_utc_datetime(end) or _utcnow()
+    if not start_dt:
+        return 0
+    return max(int((end_dt - start_dt).total_seconds()), 0)
+
+
+def _duration_from_model(model: Any) -> int:
+    return _seconds_between(
+        getattr(model, "started_at", None) or getattr(model, "created_at", None),
+        getattr(model, "finished_at", None) or _utcnow(),
+    )
 
 
 def _event_line(event: WorkflowEventModel) -> str:
@@ -128,6 +155,7 @@ def _serialize_step(step: WorkflowStepRunModel) -> dict[str, Any]:
         "timeout_at": serialize_datetime(step.timeout_at),
         "started_at": serialize_datetime(step.started_at),
         "finished_at": serialize_datetime(step.finished_at),
+        "duration_seconds": _duration_from_model(step) if step.started_at else 0,
         "created_at": serialize_datetime(step.created_at),
         "updated_at": serialize_datetime(step.updated_at),
     }
@@ -141,12 +169,15 @@ def _serialize_run(
 ) -> dict[str, Any]:
     data = {
         "id": run.id,
+        "batch_id": run.batch_id,
+        "batch_item_index": int(run.batch_item_index or 0),
         "definition_key": run.definition_key,
         "definition_version": int(run.definition_version or 1),
         "name": run.name,
         "status": run.status,
         "terminal": run.status in RUN_TERMINAL,
         "input": run.get_input(),
+        "metadata": run.get_metadata(),
         "context": run.get_context(),
         "output": run.get_output(),
         "current_step_id": run.current_step_id,
@@ -162,6 +193,176 @@ def _serialize_run(
     if steps is not None:
         data["steps"] = [_serialize_step(item) for item in steps]
     return data
+
+
+def _status_counts(runs: list[WorkflowRunModel]) -> dict[str, int]:
+    counts = {
+        "total": len(runs),
+        "pending": 0,
+        "running": 0,
+        "waiting_external": 0,
+        "retry_scheduled": 0,
+        "needs_attention": 0,
+        "cancel_requested": 0,
+        "succeeded": 0,
+        "failed": 0,
+        "cancelled": 0,
+        "terminal": 0,
+        "active": 0,
+    }
+    for run in runs:
+        status = str(run.status or "")
+        if status in counts:
+            counts[status] += 1
+        if status in RUN_TERMINAL:
+            counts["terminal"] += 1
+        else:
+            counts["active"] += 1
+    return counts
+
+
+def _batch_status_from_counts(counts: dict[str, int]) -> str:
+    total = int(counts.get("total") or 0)
+    if total <= 0:
+        return RUN_PENDING
+    if int(counts.get("active") or 0) <= 0:
+        if int(counts.get("failed") or 0) > 0:
+            return RUN_FAILED
+        if int(counts.get("cancelled") or 0) > 0:
+            return RUN_CANCELLED
+        return RUN_SUCCEEDED
+    if int(counts.get("cancel_requested") or 0) > 0:
+        return RUN_CANCEL_REQUESTED
+    if int(counts.get("needs_attention") or 0) > 0:
+        return RUN_NEEDS_ATTENTION
+    if int(counts.get("running") or 0) > 0:
+        return RUN_RUNNING
+    if int(counts.get("waiting_external") or 0) > 0:
+        return RUN_WAITING_EXTERNAL
+    if int(counts.get("retry_scheduled") or 0) > 0:
+        return RUN_RETRY_SCHEDULED
+    return RUN_PENDING
+
+
+def _serialize_batch(
+    session: Session,
+    batch: WorkflowBatchModel,
+    *,
+    include_runs: bool = False,
+) -> dict[str, Any]:
+    runs = session.exec(
+        select(WorkflowRunModel)
+        .where(WorkflowRunModel.batch_id == batch.id)
+        .order_by(WorkflowRunModel.batch_item_index, WorkflowRunModel.created_at)
+    ).all()
+    counts = _status_counts(runs)
+    status = _batch_status_from_counts(counts)
+    if batch.status == RUN_PAUSED and status not in RUN_TERMINAL:
+        status = RUN_PAUSED
+    return {
+        "id": batch.id,
+        "definition_key": batch.definition_key,
+        "definition_version": int(batch.definition_version or 1),
+        "name": batch.name,
+        "status": status,
+        "terminal": status in RUN_TERMINAL,
+        "total": int(batch.total or counts.get("total") or 0),
+        "concurrency": int(batch.concurrency or 1),
+        "input": batch.get_input(),
+        "summary": counts,
+        "observability": _batch_observability(runs),
+        "created_at": serialize_datetime(batch.created_at),
+        "updated_at": serialize_datetime(batch.updated_at),
+        "runs": [_serialize_run(run, include_definition=False) for run in runs] if include_runs else None,
+    }
+
+
+def _step_summary(step: WorkflowStepRunModel, definition: dict[str, Any]) -> dict[str, Any]:
+    error = step.get_error()
+    stuck = _step_stuck_info(step, definition)
+    return {
+        "step_id": step.step_id,
+        "name": step.name,
+        "status": step.status,
+        "adapter_key": step.adapter_key,
+        "attempt": int(step.attempt or 0),
+        "max_attempts": int(step.max_attempts or 1),
+        "error_code": str(error.get("code") or ""),
+        "error_message": str(error.get("message") or ""),
+        "error_category": str(error.get("category") or ""),
+        "operator_hint": str(error.get("operator_hint") or ""),
+        "external_ref": step.external_ref,
+        "duration_seconds": _duration_from_model(step) if step.started_at else 0,
+        "stuck": bool(stuck["stuck"]),
+        "stuck_reason": str(stuck["stuck_reason"] or ""),
+    }
+
+
+def _run_summary(run: WorkflowRunModel, steps: list[WorkflowStepRunModel]) -> dict[str, Any]:
+    definition = run.get_definition()
+    by_status = {step.status for step in steps}
+    current = next((step for step in steps if step.step_id == run.current_step_id), None)
+    attention = next((step for step in steps if step.status in {STEP_NEEDS_ATTENTION, STEP_FAILED}), None)
+    register = next((step for step in steps if step.step_id == "register"), None)
+    register_output = register.get_output() if register else {}
+    account = register_output.get("account") if isinstance(register_output.get("account"), dict) else {}
+    account_id = int(register_output.get("account_id") or account.get("account_id") or 0)
+    email = str(account.get("email") or "")
+    current_step = attention or current or next((step for step in reversed(steps) if step.status != STEP_PENDING), None)
+    current_error = current_step.get_error() if current_step else {}
+    if run.status == RUN_SUCCEEDED:
+        display_status = "工作流已完成"
+        operator_action = "无需操作"
+    elif run.status == RUN_FAILED:
+        display_status = str(current_error.get("message") or run.error or "工作流失败")
+        operator_action = str(current_error.get("operator_hint") or "查看失败步骤后重试")
+    elif run.status == RUN_NEEDS_ATTENTION:
+        display_status = str(current_error.get("message") or "需要人工处理")
+        operator_action = str(current_error.get("operator_hint") or "处理后重试")
+    elif run.status == RUN_WAITING_EXTERNAL:
+        display_status = f"等待外部结果: {(current_step.name if current_step else run.current_step_id) or '-'}"
+        operator_action = "等待自动推进"
+    elif run.status == RUN_RETRY_SCHEDULED:
+        display_status = "等待自动重试"
+        operator_action = "可等待或人工重试"
+    elif run.status == RUN_RUNNING:
+        display_status = f"正在执行: {(current_step.name if current_step else run.current_step_id) or '-'}"
+        operator_action = "等待执行完成"
+    else:
+        display_status = "等待调度"
+        operator_action = "等待启动"
+    stuck = _run_stuck_info(run, steps)
+    return {
+        "run_id": run.id,
+        "batch_id": run.batch_id,
+        "batch_item_index": int(run.batch_item_index or 0),
+        "definition_key": run.definition_key,
+        "status": run.status,
+        "terminal": run.status in RUN_TERMINAL,
+        "account_id": account_id,
+        "email": email,
+        "current_stage": (current_step.step_id if current_step else run.current_step_id) or "",
+        "display_status": display_status,
+        "operator_action": operator_action,
+        "risk": "needs_attention" if STEP_NEEDS_ATTENTION in by_status else ("failed" if STEP_FAILED in by_status else "none"),
+        "duration_seconds": _duration_from_model(run),
+        "stuck": bool(stuck["stuck"]),
+        "stuck_reason": str(stuck["stuck_reason"] or ""),
+        "stuck_step_id": str(stuck["stuck_step_id"] or ""),
+        "steps": [_step_summary(step, definition) for step in steps],
+    }
+
+
+def _batch_observability(runs: list[WorkflowRunModel], summaries: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    durations = [_duration_from_model(run) for run in runs if run.started_at or run.created_at]
+    stuck_count = 0
+    if summaries is not None:
+        stuck_count = len([item for item in summaries if item.get("stuck")])
+    return {
+        "duration_seconds_avg": int(sum(durations) / len(durations)) if durations else 0,
+        "duration_seconds_max": max(durations or [0]),
+        "stuck": stuck_count,
+    }
 
 
 def _append_event_in_session(
@@ -204,6 +405,43 @@ def _step_order(definition: dict[str, Any]) -> dict[str, int]:
     return {str(item.get("id") or ""): index for index, item in enumerate(_step_defs(definition))}
 
 
+def _stuck_threshold_seconds(definition: dict[str, Any], step_id: str = "") -> int:
+    spec = _step_def_map(definition).get(step_id) if step_id else {}
+    raw = (spec or {}).get("stuck_after") or definition.get("stuck_after") or "30m"
+    return parse_duration_seconds(raw, default=DEFAULT_STUCK_SECONDS)
+
+
+def _step_stuck_info(step: WorkflowStepRunModel, definition: dict[str, Any]) -> dict[str, Any]:
+    if step.status not in {STEP_READY, STEP_RUNNING, STEP_WAITING_EXTERNAL, STEP_RETRY_SCHEDULED}:
+        return {"stuck": False, "stuck_reason": ""}
+    threshold = _stuck_threshold_seconds(definition, step.step_id)
+    if threshold <= 0:
+        return {"stuck": False, "stuck_reason": ""}
+    now = _utcnow()
+    if step.status == STEP_RUNNING:
+        age = _seconds_between(step.started_at or step.updated_at, now)
+        if age >= threshold:
+            return {"stuck": True, "stuck_reason": f"步骤执行超过 {threshold} 秒"}
+    if step.status in {STEP_READY, STEP_WAITING_EXTERNAL, STEP_RETRY_SCHEDULED}:
+        due_at = ensure_utc_datetime(step.next_run_at)
+        if due_at and due_at <= now and int((now - due_at).total_seconds()) >= threshold:
+            return {"stuck": True, "stuck_reason": f"步骤超过 {threshold} 秒未被继续调度"}
+    return {"stuck": False, "stuck_reason": ""}
+
+
+def _run_stuck_info(run: WorkflowRunModel, steps: list[WorkflowStepRunModel]) -> dict[str, Any]:
+    definition = run.get_definition()
+    for step in steps:
+        info = _step_stuck_info(step, definition)
+        if info["stuck"]:
+            return {
+                "stuck": True,
+                "stuck_reason": info["stuck_reason"],
+                "stuck_step_id": step.step_id,
+            }
+    return {"stuck": False, "stuck_reason": "", "stuck_step_id": ""}
+
+
 def _build_context(run: WorkflowRunModel, steps: list[WorkflowStepRunModel]) -> dict[str, Any]:
     context = run.get_context()
     if not isinstance(context, dict):
@@ -238,6 +476,46 @@ def _run_output_from_steps(steps: list[WorkflowStepRunModel]) -> dict[str, Any]:
     }
 
 
+def _normalize_positive_limit(value: Any, *, default: int = 0, maximum: int = 200) -> int:
+    try:
+        number = int(value or default)
+    except (TypeError, ValueError):
+        raise ValueError("并发限制必须是数字")
+    if number <= 0:
+        return 0
+    return min(number, maximum)
+
+
+def _normalize_workflow_limits(
+    raw_limits: Any,
+    *,
+    step_ids: set[str],
+    adapter_keys: set[str],
+) -> dict[str, dict[str, int]]:
+    if raw_limits in (None, ""):
+        return {"adapters": {}, "steps": {}}
+    if not isinstance(raw_limits, dict):
+        raise ValueError("limits 必须是对象")
+    normalized = {"adapters": {}, "steps": {}}
+    raw_adapters = raw_limits.get("adapters") if isinstance(raw_limits.get("adapters"), dict) else {}
+    raw_steps = raw_limits.get("steps") if isinstance(raw_limits.get("steps"), dict) else {}
+    for key, value in raw_adapters.items():
+        adapter_key = str(key).strip()
+        if adapter_key not in adapter_keys:
+            raise ValueError(f"adapter 限流引用了未注册 adapter: {adapter_key}")
+        limit = _normalize_positive_limit(value)
+        if limit:
+            normalized["adapters"][adapter_key] = limit
+    for key, value in raw_steps.items():
+        step_id = str(key).strip()
+        if step_id not in step_ids:
+            raise ValueError(f"步骤限流引用了不存在的步骤: {step_id}")
+        limit = _normalize_positive_limit(value)
+        if limit:
+            normalized["steps"][step_id] = limit
+    return normalized
+
+
 def validate_workflow_definition(definition: dict[str, Any]) -> dict[str, Any]:
     key = str(definition.get("key") or "").strip()
     version = max(int(definition.get("version") or 1), 1)
@@ -263,6 +541,11 @@ def validate_workflow_definition(definition: dict[str, Any]) -> dict[str, Any]:
         if adapter_key not in known_adapters:
             raise ValueError(f"步骤 {step_id} 使用了未注册 adapter: {adapter_key}")
         needs = [str(item).strip() for item in step.get("needs") or [] if str(item).strip()]
+        on_failure = str(step.get("on_failure") or FAILURE_POLICY_FAIL).strip()
+        if on_failure not in FAILURE_POLICIES:
+            raise ValueError(f"步骤 {step_id} 的 on_failure 不支持: {on_failure}")
+        step_concurrency = _normalize_positive_limit(step.get("concurrency"), default=0, maximum=200)
+        stuck_after = str(step.get("stuck_after") or "").strip()
         step.update(
             {
                 "id": step_id,
@@ -273,12 +556,17 @@ def validate_workflow_definition(definition: dict[str, Any]) -> dict[str, Any]:
                 "max_attempts": max(int(step.get("max_attempts") or 1), 1),
                 "retry_delay": step.get("retry_delay", "30s"),
                 "timeout": step.get("timeout", ""),
+                "concurrency": step_concurrency,
+                "on_failure": on_failure,
+                "stuck_after": stuck_after,
             }
         )
         if "if" in step and not isinstance(step.get("if"), (dict, bool)):
             raise ValueError(f"步骤 {step_id} 的 if 条件必须是对象或布尔值")
         parse_duration_seconds(step.get("retry_delay"), default=30)
         parse_duration_seconds(step.get("timeout"), default=0)
+        if stuck_after:
+            parse_duration_seconds(stuck_after, default=DEFAULT_STUCK_SECONDS)
         normalized_steps.append(step)
         seen.add(step_id)
 
@@ -305,6 +593,14 @@ def validate_workflow_definition(definition: dict[str, Any]) -> dict[str, Any]:
     for node in graph:
         visit(node)
 
+    stuck_after = str(definition.get("stuck_after") or "30m").strip()
+    parse_duration_seconds(stuck_after, default=DEFAULT_STUCK_SECONDS)
+    limits = _normalize_workflow_limits(
+        definition.get("limits"),
+        step_ids=seen,
+        adapter_keys=known_adapters,
+    )
+
     return {
         **definition,
         "key": key,
@@ -312,6 +608,8 @@ def validate_workflow_definition(definition: dict[str, Any]) -> dict[str, Any]:
         "name": str(definition.get("name") or key),
         "description": str(definition.get("description") or ""),
         "enabled": bool(definition.get("enabled", True)),
+        "stuck_after": stuck_after,
+        "limits": limits,
         "steps": normalized_steps,
     }
 
@@ -340,6 +638,10 @@ def sync_registered_workflow_definitions() -> None:
             model.updated_at = _utcnow()
             session.add(model)
         session.commit()
+
+
+def list_workflow_adapters() -> list[dict[str, str]]:
+    return [{"key": key} for key in sorted(list_step_adapters())]
 
 
 def list_workflow_definitions(*, include_disabled: bool = False) -> list[dict[str, Any]]:
@@ -492,10 +794,110 @@ def _finish_run(
     session.add(run)
 
 
+def _refresh_batch_status_in_session(session: Session, batch_id: str) -> None:
+    if not batch_id:
+        return
+    batch = session.get(WorkflowBatchModel, batch_id)
+    if not batch:
+        return
+    runs = session.exec(select(WorkflowRunModel).where(WorkflowRunModel.batch_id == batch_id)).all()
+    next_status = _batch_status_from_counts(_status_counts(runs))
+    if batch.status == RUN_PAUSED and next_status not in RUN_TERMINAL:
+        next_status = RUN_PAUSED
+    batch.status = next_status
+    batch.updated_at = _utcnow()
+    session.add(batch)
+
+
+def _batch_inflight_run_count(session: Session, batch_id: str, *, exclude_run_id: str = "") -> int:
+    if not batch_id:
+        return 0
+    rows = session.exec(
+        select(WorkflowStepRunModel.workflow_run_id)
+        .join(WorkflowRunModel, WorkflowRunModel.id == WorkflowStepRunModel.workflow_run_id)
+        .where(WorkflowRunModel.batch_id == batch_id)
+        .where(WorkflowStepRunModel.status.in_([STEP_RUNNING, STEP_WAITING_EXTERNAL, STEP_RETRY_SCHEDULED]))
+    ).all()
+    return len({str(run_id) for run_id in rows if str(run_id) != exclude_run_id})
+
+
+def _batch_can_claim_step(session: Session, run: WorkflowRunModel) -> bool:
+    if not run.batch_id:
+        return True
+    batch = session.get(WorkflowBatchModel, run.batch_id)
+    if not batch:
+        return True
+    if batch.status == RUN_PAUSED:
+        return False
+    concurrency = max(int(batch.concurrency or 1), 1)
+    return _batch_inflight_run_count(session, run.batch_id, exclude_run_id=run.id) < concurrency
+
+
+def _workflow_limits(definition: dict[str, Any]) -> dict[str, dict[str, int]]:
+    raw_limits = definition.get("limits") if isinstance(definition.get("limits"), dict) else {}
+    return {
+        "adapters": raw_limits.get("adapters") if isinstance(raw_limits.get("adapters"), dict) else {},
+        "steps": raw_limits.get("steps") if isinstance(raw_limits.get("steps"), dict) else {},
+    }
+
+
+def _inflight_adapter_count(session: Session, adapter_key: str, *, exclude_step_pk: str = "") -> int:
+    return int(
+        session.exec(
+            select(func.count())
+            .select_from(WorkflowStepRunModel)
+            .where(WorkflowStepRunModel.adapter_key == adapter_key)
+            .where(WorkflowStepRunModel.status.in_(list(LIMIT_HELD_STEP_STATUSES)))
+            .where(WorkflowStepRunModel.id != exclude_step_pk)
+        ).one()
+        or 0
+    )
+
+
+def _inflight_definition_step_count(
+    session: Session,
+    run: WorkflowRunModel,
+    step: WorkflowStepRunModel,
+) -> int:
+    return int(
+        session.exec(
+            select(func.count())
+            .select_from(WorkflowStepRunModel)
+            .join(WorkflowRunModel, WorkflowRunModel.id == WorkflowStepRunModel.workflow_run_id)
+            .where(WorkflowRunModel.definition_key == run.definition_key)
+            .where(WorkflowRunModel.definition_version == run.definition_version)
+            .where(WorkflowStepRunModel.step_id == step.step_id)
+            .where(WorkflowStepRunModel.status.in_(list(LIMIT_HELD_STEP_STATUSES)))
+            .where(WorkflowStepRunModel.id != step.id)
+        ).one()
+        or 0
+    )
+
+
+def _step_can_claim_by_limits(session: Session, run: WorkflowRunModel, step: WorkflowStepRunModel) -> bool:
+    definition = run.get_definition()
+    spec = _step_def_map(definition).get(step.step_id) or {}
+    limits = _workflow_limits(definition)
+    adapter_limit = _normalize_positive_limit(limits["adapters"].get(step.adapter_key), default=0, maximum=200)
+    if adapter_limit and _inflight_adapter_count(session, step.adapter_key, exclude_step_pk=step.id) >= adapter_limit:
+        return False
+    step_limit = _normalize_positive_limit(
+        spec.get("concurrency") or limits["steps"].get(step.step_id),
+        default=0,
+        maximum=200,
+    )
+    if step_limit and _inflight_definition_step_count(session, run, step) >= step_limit:
+        return False
+    return True
+
+
 def _refresh_run_status(session: Session, run: WorkflowRunModel) -> None:
     steps = _steps_for_run(session, run.id)
     statuses = [step.status for step in steps]
     now = _utcnow()
+
+    def sync_batch() -> None:
+        _refresh_batch_status_in_session(session, run.batch_id)
 
     if run.cancellation_requested_at:
         for step in steps:
@@ -503,6 +905,7 @@ def _refresh_run_status(session: Session, run: WorkflowRunModel) -> None:
                 run.status = RUN_CANCEL_REQUESTED
                 run.updated_at = now
                 _set_run_context(session, run, steps)
+                sync_batch()
                 return
             if step.status not in STEP_TERMINAL:
                 step.status = STEP_CANCELLED
@@ -513,6 +916,7 @@ def _refresh_run_status(session: Session, run: WorkflowRunModel) -> None:
                 step.updated_at = now
                 session.add(step)
         _finish_run(session, run, status=RUN_CANCELLED, error="工作流已取消", steps=steps)
+        sync_batch()
         return
 
     failed = next((step for step in steps if step.status == STEP_FAILED), None)
@@ -528,10 +932,12 @@ def _refresh_run_status(session: Session, run: WorkflowRunModel) -> None:
                 step.updated_at = now
                 session.add(step)
         _finish_run(session, run, status=RUN_FAILED, error=error, steps=steps)
+        sync_batch()
         return
 
     if all(status in {STEP_SUCCEEDED, STEP_SKIPPED} for status in statuses):
         _finish_run(session, run, status=RUN_SUCCEEDED, steps=steps)
+        sync_batch()
         return
 
     if any(status == STEP_NEEDS_ATTENTION for status in statuses):
@@ -548,6 +954,7 @@ def _refresh_run_status(session: Session, run: WorkflowRunModel) -> None:
     run.updated_at = now
     _set_run_context(session, run, steps)
     session.add(run)
+    sync_batch()
 
 
 def create_workflow_run(
@@ -556,6 +963,9 @@ def create_workflow_run(
     inputs: dict[str, Any] | None = None,
     version: int = 0,
     name: str = "",
+    batch_id: str = "",
+    batch_item_index: int = 0,
+    metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     with Session(engine) as session:
         definition_model = _get_definition_model(session, definition_key, version=version)
@@ -565,6 +975,8 @@ def create_workflow_run(
         run_id = f"wf_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}"
         run = WorkflowRunModel(
             id=run_id,
+            batch_id=str(batch_id or ""),
+            batch_item_index=max(int(batch_item_index or 0), 0),
             definition_key=definition_model.key,
             definition_version=int(definition_model.version or 1),
             name=str(name or definition_model.name),
@@ -573,6 +985,7 @@ def create_workflow_run(
             context_json=_dump_json({"workflow": {"inputs": inputs or {}}, "steps": {}}),
             output_json="{}",
             definition_json=_dump_json(definition),
+            metadata_json=_dump_json(metadata or {}),
             started_at=_utcnow(),
         )
         session.add(run)
@@ -605,12 +1018,83 @@ def create_workflow_run(
         return _serialize_run(run, steps=steps)
 
 
+def create_workflow_batch(
+    *,
+    definition_key: str,
+    items: list[dict[str, Any]],
+    version: int = 0,
+    name: str = "",
+    concurrency: int = 1,
+) -> dict[str, Any] | None:
+    normalized_items: list[dict[str, Any]] = []
+    for index, raw in enumerate(items or []):
+        item = raw if isinstance(raw, dict) else {}
+        item_input = item.get("input") if isinstance(item.get("input"), dict) else item
+        normalized_items.append(
+            {
+                "input": item_input if isinstance(item_input, dict) else {},
+                "name": str(item.get("name") or ""),
+                "metadata": item.get("metadata") if isinstance(item.get("metadata"), dict) else {},
+                "index": index + 1,
+            }
+        )
+    if not normalized_items:
+        raise ValueError("批量启动至少需要一个输入项")
+    if len(normalized_items) > 200:
+        raise ValueError("单次批量启动最多 200 个工作流")
+    concurrency = min(max(int(concurrency or 1), 1), 50)
+
+    with Session(engine) as session:
+        definition_model = _get_definition_model(session, definition_key, version=version)
+        if not definition_model:
+            return None
+        batch_id = f"wfb_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}"
+        batch = WorkflowBatchModel(
+            id=batch_id,
+            definition_key=definition_model.key,
+            definition_version=int(definition_model.version or 1),
+            name=str(name or f"{definition_model.name} 批量"),
+            status=RUN_PENDING,
+            total=len(normalized_items),
+            concurrency=concurrency,
+            input_json=_dump_json({"items": [item["input"] for item in normalized_items]}),
+        )
+        session.add(batch)
+        session.commit()
+
+    created_runs: list[dict[str, Any]] = []
+    for item in normalized_items:
+        run = create_workflow_run(
+            definition_key=definition_key,
+            version=version,
+            name=str(item["name"] or f"{name or definition_key} #{item['index']}"),
+            inputs=dict(item["input"]),
+            batch_id=batch_id,
+            batch_item_index=int(item["index"]),
+            metadata=dict(item["metadata"]),
+        )
+        if run:
+            created_runs.append(run)
+
+    with Session(engine) as session:
+        batch = session.get(WorkflowBatchModel, batch_id)
+        if not batch:
+            return None
+        batch.updated_at = _utcnow()
+        session.add(batch)
+        session.commit()
+        payload = _serialize_batch(session, batch, include_runs=True)
+        payload["runs"] = created_runs
+        return payload
+
+
 def list_workflow_runs(
     *,
     limit: int = 50,
     offset: int = 0,
     status: str = "",
     definition_key: str = "",
+    batch_id: str = "",
 ) -> dict[str, Any]:
     limit = min(max(int(limit or 50), 1), 100)
     offset = max(int(offset or 0), 0)
@@ -623,6 +1107,9 @@ def list_workflow_runs(
         if definition_key:
             query = query.where(WorkflowRunModel.definition_key == definition_key)
             count_query = count_query.where(WorkflowRunModel.definition_key == definition_key)
+        if batch_id:
+            query = query.where(WorkflowRunModel.batch_id == batch_id)
+            count_query = count_query.where(WorkflowRunModel.batch_id == batch_id)
         items = session.exec(
             query.order_by(WorkflowRunModel.created_at.desc(), WorkflowRunModel.id.desc())
             .offset(offset)
@@ -646,6 +1133,46 @@ def list_workflow_runs(
         }
 
 
+def list_workflow_batches(
+    *,
+    limit: int = 50,
+    offset: int = 0,
+    status: str = "",
+    definition_key: str = "",
+) -> dict[str, Any]:
+    limit = min(max(int(limit or 50), 1), 100)
+    offset = max(int(offset or 0), 0)
+    with Session(engine) as session:
+        query = select(WorkflowBatchModel)
+        count_query = select(func.count()).select_from(WorkflowBatchModel)
+        if status:
+            query = query.where(WorkflowBatchModel.status == status)
+            count_query = count_query.where(WorkflowBatchModel.status == status)
+        if definition_key:
+            query = query.where(WorkflowBatchModel.definition_key == definition_key)
+            count_query = count_query.where(WorkflowBatchModel.definition_key == definition_key)
+        items = session.exec(
+            query.order_by(WorkflowBatchModel.created_at.desc(), WorkflowBatchModel.id.desc())
+            .offset(offset)
+            .limit(limit)
+        ).all()
+        total = int(session.exec(count_query).one() or 0)
+        return {
+            "items": [_serialize_batch(session, item) for item in items],
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+        }
+
+
+def get_workflow_batch(batch_id: str, *, include_runs: bool = True) -> dict[str, Any] | None:
+    with Session(engine) as session:
+        batch = session.get(WorkflowBatchModel, batch_id)
+        if not batch:
+            return None
+        return _serialize_batch(session, batch, include_runs=include_runs)
+
+
 def get_workflow_run(run_id: str) -> dict[str, Any] | None:
     with Session(engine) as session:
         run = session.get(WorkflowRunModel, run_id)
@@ -655,6 +1182,54 @@ def get_workflow_run(run_id: str) -> dict[str, Any] | None:
         order = _step_order(definition)
         steps = sorted(_steps_for_run(session, run.id), key=lambda item: order.get(item.step_id, 0))
         return _serialize_run(run, steps=steps)
+
+
+def get_workflow_run_summary(run_id: str) -> dict[str, Any] | None:
+    with Session(engine) as session:
+        run = session.get(WorkflowRunModel, run_id)
+        if not run:
+            return None
+        definition = run.get_definition()
+        order = _step_order(definition)
+        steps = sorted(_steps_for_run(session, run.id), key=lambda item: order.get(item.step_id, 0))
+        return _run_summary(run, steps)
+
+
+def get_workflow_batch_summary(batch_id: str) -> dict[str, Any] | None:
+    with Session(engine) as session:
+        batch = session.get(WorkflowBatchModel, batch_id)
+        if not batch:
+            return None
+        runs = session.exec(
+            select(WorkflowRunModel)
+            .where(WorkflowRunModel.batch_id == batch.id)
+            .order_by(WorkflowRunModel.batch_item_index, WorkflowRunModel.created_at)
+        ).all()
+        summaries = []
+        for run in runs:
+            definition = run.get_definition()
+            order = _step_order(definition)
+            steps = sorted(_steps_for_run(session, run.id), key=lambda item: order.get(item.step_id, 0))
+            summaries.append(_run_summary(run, steps))
+        counts = _status_counts(runs)
+        status = _batch_status_from_counts(counts)
+        if batch.status == RUN_PAUSED and status not in RUN_TERMINAL:
+            status = RUN_PAUSED
+        return {
+            "id": batch.id,
+            "definition_key": batch.definition_key,
+            "definition_version": int(batch.definition_version or 1),
+            "name": batch.name,
+            "status": status,
+            "terminal": status in RUN_TERMINAL,
+            "total": int(batch.total or counts.get("total") or 0),
+            "concurrency": int(batch.concurrency or 1),
+            "summary": counts,
+            "observability": _batch_observability(runs, summaries),
+            "runs": summaries,
+            "created_at": serialize_datetime(batch.created_at),
+            "updated_at": serialize_datetime(batch.updated_at),
+        }
 
 
 def list_workflow_events(
@@ -737,6 +1312,10 @@ def _claim_next_due_step() -> dict[str, Any] | None:
                 _refresh_run_status(session, run)
                 session.commit()
                 return {"cancelled": True}
+            if not _batch_can_claim_step(session, run):
+                continue
+            if not _step_can_claim_by_limits(session, run, step):
+                continue
             if step.timeout_at and ensure_utc_datetime(step.timeout_at) and ensure_utc_datetime(step.timeout_at) <= now:
                 transition = StepTransition.failed("步骤执行超时", code="step_timeout", retryable=True)
                 _apply_step_transition_in_session(session, run, step, transition)
@@ -856,17 +1435,45 @@ def _apply_step_transition_in_session(
                 detail={"retry_at": serialize_datetime(step.next_run_at), "attempt": step.attempt},
             )
         else:
-            step.status = STEP_FAILED
-            step.finished_at = now
-            _append_event_in_session(
-                session,
-                run.id,
-                message or "步骤失败",
-                step_id=step.step_id,
-                event_type="state",
-                level="error",
-                detail=transition.error,
-            )
+            step_spec = _step_def_map(run.get_definition()).get(step.step_id) or {}
+            on_failure = str(step_spec.get("on_failure") or FAILURE_POLICY_FAIL)
+            if on_failure == FAILURE_POLICY_NEEDS_ATTENTION:
+                step.status = STEP_NEEDS_ATTENTION
+                step.finished_at = None
+                _append_event_in_session(
+                    session,
+                    run.id,
+                    message or "步骤失败，已转人工处理",
+                    step_id=step.step_id,
+                    event_type="state",
+                    level="warning",
+                    detail=transition.error,
+                )
+            elif on_failure == FAILURE_POLICY_SKIP:
+                step.status = STEP_SKIPPED
+                step.finished_at = now
+                _append_event_in_session(
+                    session,
+                    run.id,
+                    message or "步骤失败，按策略跳过",
+                    step_id=step.step_id,
+                    event_type="state",
+                    level="warning",
+                    detail=transition.error,
+                )
+                _promote_ready_steps(session, run)
+            else:
+                step.status = STEP_FAILED
+                step.finished_at = now
+                _append_event_in_session(
+                    session,
+                    run.id,
+                    message or "步骤失败",
+                    step_id=step.step_id,
+                    event_type="state",
+                    level="error",
+                    detail=transition.error,
+                )
         session.add(step)
         _refresh_run_status(session, run)
         return
@@ -938,7 +1545,8 @@ def apply_step_transition(run_id: str, step_id: str, transition: StepTransition)
 
 
 def run_due_workflow_once() -> bool:
-    claim = _claim_next_due_step()
+    with _workflow_claim_lock:
+        claim = _claim_next_due_step()
     if not claim:
         return False
     if claim.get("cancelled") or claim.get("timed_out"):
@@ -1128,3 +1736,97 @@ def update_workflow_step_input(run_id: str, step_id: str, inputs: dict[str, Any]
         _set_run_context(session, run, _steps_for_run(session, run.id))
         session.commit()
         return get_workflow_run(run.id)
+
+
+def pause_workflow_batch(batch_id: str) -> dict[str, Any] | None:
+    with Session(engine) as session:
+        batch = session.get(WorkflowBatchModel, batch_id)
+        if not batch:
+            return None
+        runs = session.exec(select(WorkflowRunModel).where(WorkflowRunModel.batch_id == batch_id)).all()
+        computed_status = _batch_status_from_counts(_status_counts(runs))
+        if computed_status in RUN_TERMINAL:
+            batch.status = computed_status
+            batch.updated_at = _utcnow()
+            session.add(batch)
+            session.commit()
+            return _serialize_batch(session, batch, include_runs=True)
+        batch.status = RUN_PAUSED
+        batch.updated_at = _utcnow()
+        session.add(batch)
+        for run in runs:
+            if run.status in RUN_TERMINAL:
+                continue
+            _append_event_in_session(session, run.id, "批次已暂停，后续步骤暂不调度", event_type="state", level="warning")
+        session.commit()
+        return _serialize_batch(session, batch, include_runs=True)
+
+
+def resume_workflow_batch(batch_id: str) -> dict[str, Any] | None:
+    with Session(engine) as session:
+        batch = session.get(WorkflowBatchModel, batch_id)
+        if not batch:
+            return None
+        runs = session.exec(select(WorkflowRunModel).where(WorkflowRunModel.batch_id == batch_id)).all()
+        batch.status = _batch_status_from_counts(_status_counts(runs))
+        batch.updated_at = _utcnow()
+        session.add(batch)
+        for run in runs:
+            if run.status in RUN_TERMINAL:
+                continue
+            _append_event_in_session(session, run.id, "批次已恢复，等待调度器继续执行", event_type="state")
+        session.commit()
+        return _serialize_batch(session, batch, include_runs=True)
+
+
+def cancel_workflow_batch(batch_id: str) -> dict[str, Any] | None:
+    with Session(engine) as session:
+        batch = session.get(WorkflowBatchModel, batch_id)
+        if not batch:
+            return None
+        batch.status = RUN_CANCEL_REQUESTED
+        batch.updated_at = _utcnow()
+        session.add(batch)
+        run_ids = [
+            run.id
+            for run in session.exec(select(WorkflowRunModel).where(WorkflowRunModel.batch_id == batch_id)).all()
+            if run.status not in RUN_TERMINAL
+        ]
+        session.commit()
+
+    for run_id in run_ids:
+        cancel_workflow_run(run_id)
+    return get_workflow_batch_summary(batch_id)
+
+
+def retry_failed_workflow_batch(batch_id: str) -> dict[str, Any] | None:
+    retry_targets: list[tuple[str, str]] = []
+    with Session(engine) as session:
+        batch = session.get(WorkflowBatchModel, batch_id)
+        if not batch:
+            return None
+        runs = session.exec(
+            select(WorkflowRunModel)
+            .where(WorkflowRunModel.batch_id == batch_id)
+            .order_by(WorkflowRunModel.batch_item_index, WorkflowRunModel.created_at)
+        ).all()
+        for run in runs:
+            if run.status not in {RUN_FAILED, RUN_NEEDS_ATTENTION, RUN_CANCELLED}:
+                continue
+            order = _step_order(run.get_definition())
+            steps = sorted(_steps_for_run(session, run.id), key=lambda item: order.get(item.step_id, 0))
+            target = next(
+                (step for step in steps if step.status in {STEP_FAILED, STEP_NEEDS_ATTENTION, STEP_CANCELLED}),
+                None,
+            )
+            if target:
+                retry_targets.append((run.id, target.step_id))
+
+    retried = 0
+    for run_id, step_id in retry_targets:
+        if retry_workflow_step(run_id, step_id):
+            retried += 1
+    summary = get_workflow_batch_summary(batch_id)
+    if summary is not None:
+        summary["retried"] = retried
+    return summary

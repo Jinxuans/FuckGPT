@@ -556,10 +556,34 @@ class WorkflowDefinitionModel(SQLModel, table=True):
         self.definition_json = json.dumps(data or {}, ensure_ascii=False)
 
 
+class WorkflowBatchModel(SQLModel, table=True):
+    __tablename__ = "workflow_batches"
+
+    id: str = Field(primary_key=True)
+    definition_key: str = Field(index=True)
+    definition_version: int = Field(default=1, index=True)
+    name: str = ""
+    status: str = Field(default="pending", index=True)
+    total: int = 0
+    concurrency: int = 1
+    input_json: str = "{}"
+    created_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow)
+
+    def get_input(self) -> dict:
+        data = json.loads(self.input_json or "{}")
+        return data if isinstance(data, dict) else {}
+
+    def set_input(self, data: dict):
+        self.input_json = json.dumps(data or {}, ensure_ascii=False, default=str)
+
+
 class WorkflowRunModel(SQLModel, table=True):
     __tablename__ = "workflow_runs"
 
     id: str = Field(primary_key=True)
+    batch_id: str = Field(default="", index=True)
+    batch_item_index: int = Field(default=0, index=True)
     definition_key: str = Field(index=True)
     definition_version: int = Field(default=1, index=True)
     name: str = ""
@@ -568,6 +592,7 @@ class WorkflowRunModel(SQLModel, table=True):
     context_json: str = "{}"
     output_json: str = "{}"
     definition_json: str = "{}"
+    metadata_json: str = "{}"
     current_step_id: str = ""
     error: str = ""
     cancellation_requested_at: Optional[datetime] = None
@@ -590,6 +615,9 @@ class WorkflowRunModel(SQLModel, table=True):
 
     def get_definition(self) -> dict:
         return self._get_json(self.definition_json)
+
+    def get_metadata(self) -> dict:
+        return self._get_json(self.metadata_json)
 
 
 class WorkflowStepRunModel(SQLModel, table=True):
@@ -711,6 +739,9 @@ def init_db():
 
     _ensure_column("provider_definitions", "category", "TEXT DEFAULT ''")
     _ensure_column("account_status", "invalid_check_count", "INTEGER DEFAULT 0")
+    _ensure_column("workflow_runs", "batch_id", "TEXT DEFAULT ''")
+    _ensure_column("workflow_runs", "batch_item_index", "INTEGER DEFAULT 0")
+    _ensure_column("workflow_runs", "metadata_json", "TEXT DEFAULT '{}'")
     SQLModel.metadata.create_all(engine)
 
     with Session(engine) as session:

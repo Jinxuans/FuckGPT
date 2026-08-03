@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import os
 import threading
 import time
 
@@ -24,10 +25,36 @@ class TaskWorkerState:
     account_keys: set[str] = field(default_factory=set)
 
 
+def _bounded_int(value: object, default: int, *, minimum: int = 1, maximum: int = 100) -> int:
+    try:
+        result = int(value if value not in (None, "") else default)
+    except Exception:
+        result = default
+    return min(max(result, minimum), maximum)
+
+
 class TaskRuntime:
-    def __init__(self, *, max_parallel_tasks: int = 3, max_parallel_per_scope: int = 1, poll_interval: float = 0.5):
-        self.max_parallel_tasks = max_parallel_tasks
-        self.max_parallel_per_scope = max_parallel_per_scope
+    def __init__(
+        self,
+        *,
+        max_parallel_tasks: int | None = None,
+        max_parallel_per_scope: int | None = None,
+        poll_interval: float = 0.5,
+    ):
+        self.max_parallel_tasks = _bounded_int(
+            max_parallel_tasks if max_parallel_tasks is not None else os.environ.get("TASK_MAX_PARALLEL"),
+            10,
+            minimum=1,
+            maximum=100,
+        )
+        self.max_parallel_per_scope = _bounded_int(
+            max_parallel_per_scope
+            if max_parallel_per_scope is not None
+            else os.environ.get("TASK_MAX_PARALLEL_PER_SCOPE"),
+            1,
+            minimum=1,
+            maximum=50,
+        )
         self.poll_interval = poll_interval
         self._running = False
         self._dispatcher: threading.Thread | None = None
