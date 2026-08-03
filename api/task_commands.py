@@ -24,7 +24,7 @@ class RegisterTaskRequest(BaseModel):
     platform_proxy_value: str = ""
     mailbox_proxy_mode: str = ""
     mailbox_proxy_value: str = ""
-    executor_type: Literal["protocol", "headless", "headed"] = "headless"
+    executor_type: Literal["protocol", "browser_protocol", "headless", "headed"] = "headless"
     captcha_solver: str = "auto"
     extra: dict = Field(default_factory=dict)
 
@@ -44,7 +44,10 @@ def create_register_task(body: RegisterTaskRequest):
         raise HTTPException(400, "指定邮箱注册只支持单账号任务")
     if body.executor_type == "protocol":
         if mailbox_address_id:
-            raise HTTPException(400, "指定邮箱注册暂不支持协议模式，请使用 headless/headed")
+            raise HTTPException(
+                400,
+                "指定邮箱注册暂不支持纯协议模式，请使用 browser_protocol/headless/headed",
+            )
         pool_text = str(extra.get("local_ms_pool_text") or "").strip()
         pool_file = str(extra.get("local_ms_pool_file") or "").strip()
         # Keep compatibility with callers that still submit an inline Outlook

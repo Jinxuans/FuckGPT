@@ -249,7 +249,7 @@ def register_builtin_workflow_components() -> None:
                     "properties": {
                         "count": {"type": "integer", "minimum": 1, "maximum": 200},
                         "concurrency": {"type": "integer", "minimum": 1, "maximum": 20},
-                        "executor_type": {"type": "string", "enum": ["headless", "headed"]},
+                        "executor_type": {"type": "string", "enum": ["browser_protocol", "headless", "headed"]},
                         "platform_proxy_mode": {"type": "string", "enum": ["direct", "manual", "proxy_service"]},
                         "platform_proxy_value": {"type": "string"},
                         "extra": {"type": "object"},
@@ -285,6 +285,7 @@ def register_builtin_workflow_components() -> None:
                             "label": "注册执行器",
                             "type": "select",
                             "options": [
+                                {"label": "浏览器协议模式", "value": "browser_protocol"},
                                 {"label": "无头模式", "value": "headless"},
                                 {"label": "可视模式", "value": "headed"},
                             ],

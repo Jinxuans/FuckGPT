@@ -3789,6 +3789,7 @@ class ChatGPTBrowserRegister:
         cancel_check: Optional[Callable[[], bool]] = None,
         worker_idle_timeout: float = 120,
         worker_hard_timeout: float = 0,
+        flow_mode: str = "dom",
         log_fn: Callable[[str], None] = print,
         backend_config: Optional[BrowserBackendConfig] = None,
     ):
@@ -3810,6 +3811,7 @@ class ChatGPTBrowserRegister:
             if configured_hard_timeout > 0
             else 0.0
         )
+        self.flow_mode = str(flow_mode or "dom").strip().lower()
         self.log = log_fn
         # backend_config 为 None 时默认 Camoufox，跟老调用方一致。
         # BitBrowser 路径需要上层 plugin.py 显式传 backend_config。
@@ -3855,6 +3857,7 @@ class ChatGPTBrowserRegister:
                 "keep_browser_open": False,
                 "prefer_password_registration": self.prefer_password_registration,
                 "existing_account_only": self.existing_account_only,
+                "flow_mode": self.flow_mode,
             },
             "backend_config": {
                 "backend": self.backend_config.backend,
@@ -3922,18 +3925,36 @@ class ChatGPTBrowserRegister:
         try:
             page = browser.new_page()
             flow_label = "重新登录" if self.existing_account_only else "注册"
-            self.log(f"启动浏览器上下文{flow_label}状态机")
-            final_state = _browser_registration_flow(
-                page,
-                email,
-                password,
-                self.otp_callback,
-                self.log,
-                prefer_password_registration=self.prefer_password_registration,
-                password_provided=password_provided,
-                existing_account_callback=self.existing_account_callback,
-                existing_account_only=self.existing_account_only,
-            )
+            if self.flow_mode == "browser_protocol":
+                if self.existing_account_only:
+                    raise ExistingAccountAuthenticationError(
+                        "Browser Protocol 当前仅用于新账号注册"
+                    )
+                from .browser_protocol_register import browser_protocol_registration_flow
+
+                self.log("启动 Browser Protocol 页面内 Fetch 状态机")
+                final_state = browser_protocol_registration_flow(
+                    page,
+                    email,
+                    password,
+                    self.otp_callback,
+                    self.log,
+                    existing_account_callback=self.existing_account_callback,
+                    cancel_check=self.cancel_check,
+                )
+            else:
+                self.log(f"启动浏览器上下文{flow_label}状态机")
+                final_state = _browser_registration_flow(
+                    page,
+                    email,
+                    password,
+                    self.otp_callback,
+                    self.log,
+                    prefer_password_registration=self.prefer_password_registration,
+                    password_provided=password_provided,
+                    existing_account_callback=self.existing_account_callback,
+                    existing_account_only=self.existing_account_only,
+                )
             self.log(f"{flow_label}流程完成: page={final_state.get('page_type') or '-'}")
 
             # 获取 session token 和 cookies

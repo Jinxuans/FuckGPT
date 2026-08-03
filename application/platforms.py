@@ -5,6 +5,7 @@ from infrastructure.platform_runtime import PlatformRuntime
 
 EXECUTOR_LABELS = {
     "protocol": "协议模式",
+    "browser_protocol": "浏览器协议模式",
     "headless": "后台浏览器自动",
     "headed": "可视浏览器自动",
 }
