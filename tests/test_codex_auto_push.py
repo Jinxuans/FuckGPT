@@ -18,6 +18,7 @@ class _FakeLogger:
         self.events = []
         self.result_data = None
         self.finished = None
+        self.cancel_requested = False
 
     def log(self, message, **kwargs):
         self.events.append(("log", message, kwargs))
@@ -35,7 +36,7 @@ class _FakeLogger:
         self.events.append(("progress", current, {"total": total}))
 
     def is_cancel_requested(self):
-        return False
+        return self.cancel_requested
 
     def set_subtask(self, subtask_id, label=""):
         self.events.append(("subtask", subtask_id, {"label": label}))
@@ -160,6 +161,85 @@ def test_account_push_task_reuses_service_with_strict_codex_format(monkeypatch):
         "payload_format": "codex",
     }
     assert logger.finished == (tasks_module.TASK_STATUS_SUCCEEDED, "")
+
+
+def test_account_push_task_does_not_start_after_cancellation(monkeypatch):
+    service_created = []
+
+    class FakePushService:
+        def __init__(self):
+            service_created.append(True)
+
+    monkeypatch.setattr("application.account_pushes.AccountPushService", FakePushService)
+    logger = _FakeLogger()
+    logger.cancel_requested = True
+
+    tasks_module._execute_account_push_task(
+        {
+            "platform": "chatgpt",
+            "account_ids": [7],
+            "target_key": "nvtokens",
+            "payload_format": "codex",
+        },
+        logger,
+    )
+
+    assert service_created == []
+    assert logger.finished == (tasks_module.TASK_STATUS_CANCELLED, "任务已取消")
+
+
+def test_account_push_task_stays_cancelled_when_cancelled_during_remote_call(monkeypatch):
+    logger = _FakeLogger()
+
+    class FakePushService:
+        def push_accounts(self, selection, *, target_key, payload_format):
+            logger.cancel_requested = True
+            return {
+                "ok": True,
+                "succeeded": 1,
+                "failed": 0,
+                "results": [{"account_id": 7, "ok": True, "error": ""}],
+            }
+
+    monkeypatch.setattr("application.account_pushes.AccountPushService", FakePushService)
+
+    tasks_module._execute_account_push_task(
+        {
+            "platform": "chatgpt",
+            "account_ids": [7],
+            "target_key": "nvtokens",
+            "payload_format": "codex",
+        },
+        logger,
+    )
+
+    assert logger.finished == (tasks_module.TASK_STATUS_CANCELLED, "任务已取消")
+    assert logger.result_data is None
+    assert not any(event[0] == "success" for event in logger.events)
+
+
+def test_account_push_task_stays_cancelled_when_remote_call_raises_after_cancellation(monkeypatch):
+    logger = _FakeLogger()
+
+    class FakePushService:
+        def push_accounts(self, selection, *, target_key, payload_format):
+            logger.cancel_requested = True
+            raise RuntimeError("remote disconnected")
+
+    monkeypatch.setattr("application.account_pushes.AccountPushService", FakePushService)
+
+    tasks_module._execute_account_push_task(
+        {
+            "platform": "chatgpt",
+            "account_ids": [7],
+            "target_key": "nvtokens",
+            "payload_format": "codex",
+        },
+        logger,
+    )
+
+    assert logger.finished == (tasks_module.TASK_STATUS_CANCELLED, "任务已取消")
+    assert not any(event[0] == "error" for event in logger.events)
 
 
 def test_platform_oauth_stays_successful_when_auto_push_enqueue_fails(monkeypatch):
