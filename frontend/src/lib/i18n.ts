@@ -534,6 +534,7 @@ const ZH_MESSAGES = {
   "accountStatus.pending": "待处理",
 
   "choice.executor.protocol": "协议模式",
+  "choice.executor.browser_protocol": "浏览器协议模式",
   "choice.executor.headless": "后台浏览器自动",
   "choice.executor.headed": "可视浏览器自动",
   "choice.identity.mailbox": "系统邮箱",
@@ -1097,6 +1098,7 @@ const EN_MESSAGES: Record<TranslationKey, string> = {
   "accountStatus.pending": "Pending",
 
   "choice.executor.protocol": "Protocol",
+  "choice.executor.browser_protocol": "Browser-backed Protocol",
   "choice.executor.headless": "Background Browser",
   "choice.executor.headed": "Visible Browser",
   "choice.identity.mailbox": "System Mailbox",
@@ -1150,6 +1152,7 @@ const STATUS_KEYS: Record<string, TranslationKey> = {
 
 const CHOICE_KEYS: Record<string, TranslationKey> = {
   protocol: "choice.executor.protocol",
+  browser_protocol: "choice.executor.browser_protocol",
   headless: "choice.executor.headless",
   headed: "choice.executor.headed",
   mailbox: "choice.identity.mailbox",

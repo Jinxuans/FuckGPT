@@ -28,3 +28,4 @@ def test_chatgpt_exposes_protocol_registration(client):
     platforms = client.get("/api/platforms").json()
     chatgpt = next(item for item in platforms if item["name"] == "chatgpt")
     assert "protocol" in chatgpt["supported_executors"]
+    assert "browser_protocol" in chatgpt["supported_executors"]

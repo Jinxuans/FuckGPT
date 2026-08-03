@@ -1,4 +1,4 @@
-"""执行器基类 - 抽象 HTTP 请求层，支持 protocol/headless/headed 三种模式"""
+"""执行器基类 - 抽象 HTTP 请求层，支持 protocol/browser_protocol/headless/headed。"""
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any

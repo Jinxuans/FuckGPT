@@ -459,7 +459,7 @@ class ChatGPTPlatform(BasePlatform):
     name = "chatgpt"
     display_name = "ChatGPT"
     version = "1.0.0"
-    supported_executors = ["protocol", "headless", "headed"]
+    supported_executors = ["protocol", "browser_protocol", "headless", "headed"]
     supported_identity_modes = ["mailbox"]
     supported_oauth_providers = []
 
@@ -660,7 +660,7 @@ class ChatGPTPlatform(BasePlatform):
                     )
 
             return ChatGPTBrowserRegister(
-                headless=(ctx.executor_type == "headless"),
+                headless=(ctx.executor_type in {"browser_protocol", "headless"}),
                 proxy=ctx.proxy,
                 otp_callback=artifacts.otp_callback,
                 post_codex_oauth=post_codex_oauth,
@@ -672,6 +672,11 @@ class ChatGPTPlatform(BasePlatform):
                 cancel_check=ctx.platform.is_cancel_requested,
                 worker_idle_timeout=worker_idle_timeout,
                 worker_hard_timeout=worker_hard_timeout,
+                flow_mode=(
+                    "browser_protocol"
+                    if ctx.executor_type == "browser_protocol"
+                    else "dom"
+                ),
                 log_fn=ctx.log,
                 backend_config=(ctx.extra or {}).get("_reuse_backend_config"),
             )

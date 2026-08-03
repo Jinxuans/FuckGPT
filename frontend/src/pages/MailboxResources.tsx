@@ -90,7 +90,7 @@ type MailboxPayload = {
 };
 
 type MailboxRegistrationOptions = {
-  executorType: "headless" | "headed";
+  executorType: "browser_protocol" | "headless" | "headed";
   proxyMode: "direct" | "proxy_service" | "manual";
   proxyValue: string;
 };
@@ -291,7 +291,9 @@ function MailboxRegisterConfigModal({
       try {
         const saved = JSON.parse(window.localStorage.getItem(MAILBOX_REGISTER_OPTIONS_KEY) || "{}");
         return {
-          executorType: saved.executorType === "headed" ? "headed" : "headless",
+          executorType: ["browser_protocol", "headless", "headed"].includes(saved.executorType)
+            ? saved.executorType
+            : "headless",
           proxyMode: ["direct", "proxy_service", "manual"].includes(saved.proxyMode) ? saved.proxyMode : "direct",
           proxyValue: String(saved.proxyValue || ""),
         };
@@ -345,6 +347,7 @@ function MailboxRegisterConfigModal({
               onChange={(event) => setOptions((current) => ({ ...current, executorType: event.target.value as MailboxRegistrationOptions["executorType"] }))}
               className="control-surface control-surface-compact appearance-none"
             >
+              <option value="browser_protocol">浏览器协议模式</option>
               <option value="headless">后台浏览器自动</option>
               <option value="headed">可视浏览器自动</option>
             </select>
