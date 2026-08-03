@@ -229,9 +229,16 @@ def register_builtin_workflow_components() -> None:
                 "count": 1,
                 "concurrency": 1,
                 "executor_type": "headless",
+                "platform_proxy_mode": "direct",
+                "platform_proxy_value": "",
                 "extra": {"identity_provider": "mailbox"},
             },
-            "codex": {"browser_mode": "headless", "keep_browser_open": "false"},
+            "codex": {
+                "browser_mode": "headless",
+                "keep_browser_open": "false",
+                "platform_proxy_mode": "direct",
+                "platform_proxy_value": "",
+            },
             "push": {"target_key": "nvtokens", "payload_format": "codex"},
         },
         "input_schema": {
@@ -243,6 +250,8 @@ def register_builtin_workflow_components() -> None:
                         "count": {"type": "integer", "minimum": 1, "maximum": 200},
                         "concurrency": {"type": "integer", "minimum": 1, "maximum": 20},
                         "executor_type": {"type": "string", "enum": ["headless", "headed"]},
+                        "platform_proxy_mode": {"type": "string", "enum": ["direct", "manual", "proxy_service"]},
+                        "platform_proxy_value": {"type": "string"},
                         "extra": {"type": "object"},
                     },
                 },
@@ -251,6 +260,8 @@ def register_builtin_workflow_components() -> None:
                     "properties": {
                         "browser_mode": {"type": "string", "enum": ["headless", "headed"]},
                         "keep_browser_open": {"type": "string", "enum": ["false", "true"]},
+                        "platform_proxy_mode": {"type": "string", "enum": ["direct", "manual", "proxy_service"]},
+                        "platform_proxy_value": {"type": "string"},
                     },
                 },
                 "push": {
@@ -278,6 +289,22 @@ def register_builtin_workflow_components() -> None:
                                 {"label": "可视模式", "value": "headed"},
                             ],
                         },
+                        {
+                            "path": "registration.platform_proxy_mode",
+                            "label": "注册代理模式",
+                            "type": "select",
+                            "options": [
+                                {"label": "直连", "value": "direct"},
+                                {"label": "手动代理", "value": "manual"},
+                                {"label": "代理服务", "value": "proxy_service"},
+                            ],
+                        },
+                        {
+                            "path": "registration.platform_proxy_value",
+                            "label": "注册手动代理",
+                            "type": "text",
+                            "placeholder": "http://user:pass@host:port",
+                        },
                     ],
                 },
                 {
@@ -293,6 +320,22 @@ def register_builtin_workflow_components() -> None:
                             ],
                         },
                         {"path": "codex.keep_browser_open", "label": "保持浏览器打开", "type": "boolean"},
+                        {
+                            "path": "codex.platform_proxy_mode",
+                            "label": "Codex 代理模式",
+                            "type": "select",
+                            "options": [
+                                {"label": "直连", "value": "direct"},
+                                {"label": "手动代理", "value": "manual"},
+                                {"label": "代理服务", "value": "proxy_service"},
+                            ],
+                        },
+                        {
+                            "path": "codex.platform_proxy_value",
+                            "label": "Codex 手动代理",
+                            "type": "text",
+                            "placeholder": "http://user:pass@host:port",
+                        },
                     ],
                 },
                 {
