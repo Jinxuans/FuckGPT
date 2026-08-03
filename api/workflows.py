@@ -24,6 +24,12 @@ from application.workflows import (
     retry_workflow_step,
     update_workflow_step_input,
 )
+from application.workflow_presets import (
+    delete_workflow_input_preset,
+    list_workflow_input_presets,
+    save_last_used_workflow_input,
+    save_workflow_input_preset,
+)
 from services.workflow_runtime import workflow_runtime
 
 router = APIRouter(prefix="/workflows", tags=["workflows"])
@@ -31,6 +37,24 @@ router = APIRouter(prefix="/workflows", tags=["workflows"])
 
 class WorkflowDefinitionRequest(BaseModel):
     definition: dict = Field(default_factory=dict)
+
+
+class WorkflowInputPresetRequest(BaseModel):
+    name: str = ""
+    definition_version: int = 0
+    input: dict = Field(default_factory=dict)
+    launch_mode: str = "single"
+    batch_concurrency: int = 1
+    batch_count: int = 5
+    is_default: bool | None = None
+
+
+class WorkflowLastUsedInputRequest(BaseModel):
+    definition_version: int = 0
+    input: dict = Field(default_factory=dict)
+    launch_mode: str = "single"
+    batch_concurrency: int = 1
+    batch_count: int = 5
 
 
 class WorkflowRunRequest(BaseModel):
@@ -74,6 +98,45 @@ def upsert_definition(body: WorkflowDefinitionRequest):
         return create_or_update_workflow_definition(body.definition)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
+
+
+@router.get("/definitions/{definition_key}/presets")
+def list_input_presets(definition_key: str, version: int = 0):
+    try:
+        return list_workflow_input_presets(definition_key, version=version)
+    except ValueError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+@router.post("/definitions/{definition_key}/presets")
+def create_input_preset(definition_key: str, body: WorkflowInputPresetRequest):
+    try:
+        return save_workflow_input_preset(definition_key, body.model_dump())
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@router.put("/definitions/{definition_key}/presets/last-used")
+def save_last_used_input(definition_key: str, body: WorkflowLastUsedInputRequest):
+    try:
+        return save_last_used_workflow_input(definition_key, body.model_dump())
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@router.put("/definitions/{definition_key}/presets/{preset_id}")
+def update_input_preset(definition_key: str, preset_id: int, body: WorkflowInputPresetRequest):
+    try:
+        return save_workflow_input_preset(definition_key, body.model_dump(), preset_id=preset_id)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@router.delete("/definitions/{definition_key}/presets/{preset_id}")
+def delete_input_preset(definition_key: str, preset_id: int):
+    if not delete_workflow_input_preset(definition_key, preset_id):
+        raise HTTPException(404, "运行配置预设不存在")
+    return {"ok": True}
 
 
 @router.get("/batches")
