@@ -23,7 +23,13 @@ from domain.workflows import StepAdapter, StepTransition
 class PersistentTaskAdapter(StepAdapter):
     poll_seconds = 1
 
-    def create_task(self, *, inputs: dict[str, Any], task_id: str) -> dict:
+    def create_task(
+        self,
+        *,
+        inputs: dict[str, Any],
+        task_id: str,
+        workflow_context: dict[str, Any] | None = None,
+    ) -> dict:
         raise NotImplementedError
 
     def task_succeeded(self, task: dict, *, inputs: dict[str, Any]) -> StepTransition:
@@ -31,7 +37,11 @@ class PersistentTaskAdapter(StepAdapter):
 
     def start(self, *, inputs: dict[str, Any], idempotency_key: str, attempt: int) -> StepTransition:
         task_id = f"task_wf_{idempotency_key}_{attempt}"
-        task = self.create_task(inputs=inputs, task_id=task_id)
+        task = self.create_task(
+            inputs=inputs,
+            task_id=task_id,
+            workflow_context=self._workflow_context(idempotency_key),
+        )
         return self._observe(task, inputs=inputs)
 
     def resume(self, *, inputs: dict[str, Any], external_ref: str, attempt: int) -> StepTransition:
@@ -43,6 +53,20 @@ class PersistentTaskAdapter(StepAdapter):
     def cancel(self, *, inputs: dict[str, Any], external_ref: str) -> None:
         if external_ref:
             request_cancel(external_ref)
+
+    @staticmethod
+    def _workflow_context(idempotency_key: str) -> dict[str, Any]:
+        text = str(idempotency_key or "").strip()
+        context = {
+            "source": "workflow",
+            "workflow_idempotency_key": text,
+        }
+        if text.startswith("wf_"):
+            parts = text.split("_")
+            if len(parts) >= 4:
+                context["workflow_run_id"] = "_".join(parts[:3])
+                context["workflow_step_id"] = "_".join(parts[3:])
+        return context
 
     def _observe(self, task: dict, *, inputs: dict[str, Any]) -> StepTransition:
         status = str(task.get("status") or "")
@@ -67,10 +91,17 @@ class PersistentTaskAdapter(StepAdapter):
 class RegisterAccountAdapter(PersistentTaskAdapter):
     key = "account.register"
 
-    def create_task(self, *, inputs: dict[str, Any], task_id: str) -> dict:
+    def create_task(
+        self,
+        *,
+        inputs: dict[str, Any],
+        task_id: str,
+        workflow_context: dict[str, Any] | None = None,
+    ) -> dict:
         payload = dict(inputs.get("payload") or inputs)
         payload["count"] = 1
         payload["concurrency"] = 1
+        payload.update(dict(workflow_context or {}))
         extra = dict(payload.get("extra") or {})
         extra["auto_codex_oauth_after_register"] = "false"
         payload["extra"] = extra
@@ -92,7 +123,13 @@ class RegisterAccountAdapter(PersistentTaskAdapter):
 class CodexAuthorizeAdapter(PersistentTaskAdapter):
     key = "codex.authorize"
 
-    def create_task(self, *, inputs: dict[str, Any], task_id: str) -> dict:
+    def create_task(
+        self,
+        *,
+        inputs: dict[str, Any],
+        task_id: str,
+        workflow_context: dict[str, Any] | None = None,
+    ) -> dict:
         account_id = int(inputs.get("account_id") or 0)
         if account_id <= 0:
             raise ValueError("Codex 授权步骤缺少 account_id")
@@ -103,6 +140,8 @@ class CodexAuthorizeAdapter(PersistentTaskAdapter):
             concurrency=1,
             auto_push_after_oauth=False,
             task_id=task_id,
+            source="workflow",
+            workflow_context=dict(workflow_context or {}),
         )
 
     def start(self, *, inputs: dict[str, Any], idempotency_key: str, attempt: int) -> StepTransition:
@@ -135,7 +174,13 @@ class CodexAuthorizeAdapter(PersistentTaskAdapter):
 class PushAccountAdapter(PersistentTaskAdapter):
     key = "account.push"
 
-    def create_task(self, *, inputs: dict[str, Any], task_id: str) -> dict:
+    def create_task(
+        self,
+        *,
+        inputs: dict[str, Any],
+        task_id: str,
+        workflow_context: dict[str, Any] | None = None,
+    ) -> dict:
         account_id = int(inputs.get("account_id") or 0)
         target_key = str(inputs.get("target_key") or "").strip()
         if account_id <= 0:
@@ -149,6 +194,7 @@ class PushAccountAdapter(PersistentTaskAdapter):
             payload_format=str(inputs.get("payload_format") or "codex"),
             source="workflow",
             task_id=task_id,
+            workflow_context=dict(workflow_context or {}),
         )
 
     def start(self, *, inputs: dict[str, Any], idempotency_key: str, attempt: int) -> StepTransition:
@@ -178,6 +224,94 @@ def register_builtin_workflow_components() -> None:
         "version": 1,
         "name": "注册 → Codex 授权 → 推送",
         "description": "注册单个 ChatGPT 账号，完成 Codex 授权后推送到指定目标。",
+        "sample_input": {
+            "registration": {
+                "count": 1,
+                "concurrency": 1,
+                "executor_type": "headless",
+                "extra": {"identity_provider": "mailbox"},
+            },
+            "codex": {"browser_mode": "headless", "keep_browser_open": "false"},
+            "push": {"target_key": "nvtokens", "payload_format": "codex"},
+        },
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "registration": {
+                    "type": "object",
+                    "properties": {
+                        "count": {"type": "integer", "minimum": 1, "maximum": 200},
+                        "concurrency": {"type": "integer", "minimum": 1, "maximum": 20},
+                        "executor_type": {"type": "string", "enum": ["headless", "headed"]},
+                        "extra": {"type": "object"},
+                    },
+                },
+                "codex": {
+                    "type": "object",
+                    "properties": {
+                        "browser_mode": {"type": "string", "enum": ["headless", "headed"]},
+                        "keep_browser_open": {"type": "string", "enum": ["false", "true"]},
+                    },
+                },
+                "push": {
+                    "type": "object",
+                    "properties": {
+                        "target_key": {"type": "string"},
+                        "payload_format": {"type": "string", "enum": ["codex", "account"]},
+                    },
+                },
+            },
+        },
+        "ui_schema": {
+            "sections": [
+                {
+                    "title": "注册",
+                    "fields": [
+                        {"path": "registration.count", "label": "注册数量", "type": "number", "min": 1, "max": 200},
+                        {"path": "registration.concurrency", "label": "注册并发", "type": "number", "min": 1, "max": 20},
+                        {
+                            "path": "registration.executor_type",
+                            "label": "注册执行器",
+                            "type": "select",
+                            "options": [
+                                {"label": "无头模式", "value": "headless"},
+                                {"label": "可视模式", "value": "headed"},
+                            ],
+                        },
+                    ],
+                },
+                {
+                    "title": "Codex",
+                    "fields": [
+                        {
+                            "path": "codex.browser_mode",
+                            "label": "浏览器模式",
+                            "type": "select",
+                            "options": [
+                                {"label": "无头模式", "value": "headless"},
+                                {"label": "可视模式", "value": "headed"},
+                            ],
+                        },
+                        {"path": "codex.keep_browser_open", "label": "保持浏览器打开", "type": "boolean"},
+                    ],
+                },
+                {
+                    "title": "推送",
+                    "fields": [
+                        {"path": "push.target_key", "label": "推送目标", "type": "text", "placeholder": "nvtokens"},
+                        {
+                            "path": "push.payload_format",
+                            "label": "推送格式",
+                            "type": "select",
+                            "options": [
+                                {"label": "Codex", "value": "codex"},
+                                {"label": "账号", "value": "account"},
+                            ],
+                        },
+                    ],
+                },
+            ],
+        },
         "steps": [
             {
                 "id": "register",

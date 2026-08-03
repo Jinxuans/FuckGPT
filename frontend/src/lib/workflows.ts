@@ -10,10 +10,43 @@ export type WorkflowDefinition = {
   enabled: boolean
   definition: {
     steps?: WorkflowDefinitionStep[]
+    sample_input?: Record<string, unknown>
+    input_schema?: Record<string, unknown>
+    ui_schema?: WorkflowUiSchema
     [key: string]: unknown
   }
   created_at?: string
   updated_at?: string
+}
+
+export type WorkflowUiOption = {
+  label: string
+  value: string | number | boolean
+}
+
+export type WorkflowUiField = {
+  path: string
+  label: string
+  type?: 'text' | 'number' | 'select' | 'boolean'
+  options?: WorkflowUiOption[]
+  placeholder?: string
+  helper?: string
+  min?: number
+  max?: number
+}
+
+export type WorkflowUiSection = {
+  title: string
+  description?: string
+  fields?: WorkflowUiField[]
+}
+
+export type WorkflowUiSchema = {
+  sections?: WorkflowUiSection[]
+}
+
+export type WorkflowAdapter = {
+  key: string
 }
 
 export type WorkflowDefinitionStep = {
@@ -43,6 +76,7 @@ export type WorkflowStepRun = {
   timeout_at?: string
   started_at?: string
   finished_at?: string
+  duration_seconds?: number
   created_at?: string
   updated_at?: string
 }
@@ -57,7 +91,10 @@ export type WorkflowRun = {
   input: Record<string, unknown>
   context?: Record<string, unknown>
   output?: Record<string, unknown>
+  metadata?: Record<string, unknown>
   definition?: Record<string, unknown>
+  batch_id?: string
+  batch_item_index?: number
   current_step_id: string
   error: string
   cancellation_requested_at?: string
@@ -66,6 +103,97 @@ export type WorkflowRun = {
   created_at?: string
   updated_at?: string
   steps?: WorkflowStepRun[]
+}
+
+export type WorkflowStatusSummary = {
+  total: number
+  pending: number
+  running: number
+  waiting_external: number
+  retry_scheduled: number
+  needs_attention: number
+  cancel_requested: number
+  succeeded: number
+  failed: number
+  cancelled: number
+  terminal: number
+  active: number
+}
+
+export type WorkflowObservability = {
+  duration_seconds_avg: number
+  duration_seconds_max: number
+  stuck: number
+}
+
+export type WorkflowBatch = {
+  id: string
+  definition_key: string
+  definition_version: number
+  name: string
+  status: string
+  terminal: boolean
+  total: number
+  concurrency: number
+  input: Record<string, unknown>
+  summary: WorkflowStatusSummary
+  observability?: WorkflowObservability
+  runs?: WorkflowRun[] | null
+  created_at?: string
+  updated_at?: string
+}
+
+export type WorkflowStepSummary = {
+  step_id: string
+  name: string
+  status: string
+  adapter_key: string
+  attempt: number
+  max_attempts: number
+  error_code: string
+  error_message: string
+  error_category: string
+  operator_hint: string
+  external_ref: string
+  duration_seconds: number
+  stuck: boolean
+  stuck_reason: string
+}
+
+export type WorkflowRunSummary = {
+  run_id: string
+  batch_id?: string
+  batch_item_index?: number
+  definition_key: string
+  status: string
+  terminal: boolean
+  account_id: number
+  email: string
+  current_stage: string
+  display_status: string
+  operator_action: string
+  risk: string
+  duration_seconds: number
+  stuck: boolean
+  stuck_reason: string
+  stuck_step_id: string
+  steps: WorkflowStepSummary[]
+}
+
+export type WorkflowBatchSummary = {
+  id: string
+  definition_key: string
+  definition_version: number
+  name: string
+  status: string
+  terminal: boolean
+  total: number
+  concurrency: number
+  summary: WorkflowStatusSummary
+  observability?: WorkflowObservability
+  runs: WorkflowRunSummary[]
+  created_at?: string
+  updated_at?: string
 }
 
 export type WorkflowEvent = {
@@ -88,6 +216,7 @@ export const WORKFLOW_STATUS_VARIANTS: Record<string, 'default' | 'success' | 'w
   retry_scheduled: 'warning',
   needs_attention: 'warning',
   cancel_requested: 'warning',
+  paused: 'warning',
   succeeded: 'success',
   failed: 'danger',
   skipped: 'secondary',
@@ -125,6 +254,8 @@ export function getWorkflowStatusText(status: string, language?: Language) {
       return translate('workflowStatus.needs_attention', language)
     case 'cancel_requested':
       return translate('workflowStatus.cancel_requested', language)
+    case 'paused':
+      return translate('workflowStatus.paused', language)
     case 'succeeded':
       return translate('workflowStatus.succeeded', language)
     case 'failed':
@@ -143,7 +274,42 @@ export async function fetchWorkflowDefinitions() {
   return (data.items || []) as WorkflowDefinition[]
 }
 
+export async function fetchWorkflowAdapters() {
+  const data = await apiFetch('/workflows/adapters')
+  return (data.items || []) as WorkflowAdapter[]
+}
+
+export async function saveWorkflowDefinition(definition: Record<string, unknown>) {
+  return apiFetch('/workflows/definitions', {
+    method: 'POST',
+    body: JSON.stringify({ definition }),
+  }) as Promise<WorkflowDefinition>
+}
+
 export async function fetchWorkflowRuns(params: {
+  limit: number
+  offset: number
+  status?: string
+  definition_key?: string
+  batch_id?: string
+}) {
+  const search = new URLSearchParams({
+    limit: String(params.limit),
+    offset: String(params.offset),
+  })
+  if (params.status) search.set('status', params.status)
+  if (params.definition_key) search.set('definition_key', params.definition_key)
+  if (params.batch_id) search.set('batch_id', params.batch_id)
+  return apiFetch(`/workflows/runs?${search.toString()}`) as Promise<{
+    items: WorkflowRun[]
+    total: number
+    running: number
+    limit: number
+    offset: number
+  }>
+}
+
+export async function fetchWorkflowBatches(params: {
   limit: number
   offset: number
   status?: string
@@ -155,10 +321,9 @@ export async function fetchWorkflowRuns(params: {
   })
   if (params.status) search.set('status', params.status)
   if (params.definition_key) search.set('definition_key', params.definition_key)
-  return apiFetch(`/workflows/runs?${search.toString()}`) as Promise<{
-    items: WorkflowRun[]
+  return apiFetch(`/workflows/batches?${search.toString()}`) as Promise<{
+    items: WorkflowBatch[]
     total: number
-    running: number
     limit: number
     offset: number
   }>
@@ -176,8 +341,53 @@ export async function createWorkflowRun(payload: {
   }) as Promise<WorkflowRun>
 }
 
+export async function createWorkflowBatch(payload: {
+  definition_key: string
+  version?: number
+  name?: string
+  concurrency?: number
+  items: Array<{
+    name?: string
+    input: Record<string, unknown>
+    metadata?: Record<string, unknown>
+  }>
+}) {
+  return apiFetch('/workflows/runs/batch', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  }) as Promise<WorkflowBatch>
+}
+
 export async function fetchWorkflowRun(runId: string) {
   return apiFetch(`/workflows/runs/${runId}`) as Promise<WorkflowRun>
+}
+
+export async function fetchWorkflowBatch(batchId: string) {
+  return apiFetch(`/workflows/batches/${batchId}`) as Promise<WorkflowBatch>
+}
+
+export async function fetchWorkflowRunSummary(runId: string) {
+  return apiFetch(`/workflows/runs/${runId}/summary`) as Promise<WorkflowRunSummary>
+}
+
+export async function fetchWorkflowBatchSummary(batchId: string) {
+  return apiFetch(`/workflows/batches/${batchId}/summary`) as Promise<WorkflowBatchSummary>
+}
+
+export async function pauseWorkflowBatch(batchId: string) {
+  return apiFetch(`/workflows/batches/${batchId}/pause`, { method: 'POST' }) as Promise<WorkflowBatch>
+}
+
+export async function resumeWorkflowBatch(batchId: string) {
+  return apiFetch(`/workflows/batches/${batchId}/resume`, { method: 'POST' }) as Promise<WorkflowBatch>
+}
+
+export async function cancelWorkflowBatch(batchId: string) {
+  return apiFetch(`/workflows/batches/${batchId}/cancel`, { method: 'POST' }) as Promise<WorkflowBatchSummary>
+}
+
+export async function retryFailedWorkflowBatch(batchId: string) {
+  return apiFetch(`/workflows/batches/${batchId}/retry-failed`, { method: 'POST' }) as Promise<WorkflowBatchSummary & { retried?: number }>
 }
 
 export async function fetchWorkflowEvents(runId: string, since = 0) {

@@ -152,7 +152,21 @@ def _task_account_keys(task_type: str, payload: dict[str, Any]) -> list[str]:
     return []
 
 
-def _task_scope(task_type: str, platform: str, payload: dict[str, Any]) -> str:
+def _is_workflow_child_task(payload: dict[str, Any]) -> bool:
+    return str(payload.get("source") or "").strip().lower() == "workflow"
+
+
+def _workflow_child_scope(task_type: str, platform: str, payload: dict[str, Any], *, task_id: str = "") -> str:
+    run_id = str(payload.get("workflow_run_id") or "").strip()
+    step_id = str(payload.get("workflow_step_id") or "").strip()
+    idempotency_key = str(payload.get("workflow_idempotency_key") or "").strip()
+    scope_key = ":".join(item for item in (run_id, step_id, idempotency_key, task_id) if item)
+    return f"{platform}:{task_type}:workflow:{scope_key or 'child'}"
+
+
+def _task_scope(task_type: str, platform: str, payload: dict[str, Any], *, task_id: str = "") -> str:
+    if _is_workflow_child_task(payload):
+        return _workflow_child_scope(task_type, platform, payload, task_id=task_id)
     if task_type == TASK_TYPE_PLATFORM_ACTION and str(payload.get("action_id") or "") == "codex_oauth_authorize":
         account_id = int(payload.get("account_id", 0) or 0)
         if account_id > 0:
@@ -320,8 +334,11 @@ def create_codex_oauth_batch_task(
     concurrency: int = 1,
     auto_push_after_oauth: bool = True,
     task_id: str = "",
+    source: str = "manual",
+    workflow_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     normalized_ids = [int(item) for item in account_ids or [] if int(item or 0) > 0]
+    source = str(source or "manual")
     return create_task(
         task_type=TASK_TYPE_CODEX_OAUTH_BATCH,
         platform=platform or "chatgpt",
@@ -332,6 +349,8 @@ def create_codex_oauth_batch_task(
             "params": dict(params or {}),
             "concurrency": int(concurrency or 1),
             "auto_push_after_oauth": bool(auto_push_after_oauth),
+            "source": source,
+            **dict(workflow_context or {}),
         },
         progress_total=len(normalized_ids),
         task_id=task_id,
@@ -368,6 +387,7 @@ def create_account_push_task(
     payload_format: str,
     source: str = "manual",
     task_id: str = "",
+    workflow_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     normalized_ids = [int(item) for item in account_ids or [] if int(item or 0) > 0]
     return create_task(
@@ -379,6 +399,7 @@ def create_account_push_task(
             "target_key": str(target_key or ""),
             "payload_format": str(payload_format or ""),
             "source": str(source or "manual"),
+            **dict(workflow_context or {}),
         },
         progress_total=len(normalized_ids),
         task_id=task_id,
@@ -632,7 +653,7 @@ def claim_next_runnable_task(
             payload = task.get_payload()
             platform = task.platform or str(payload.get("platform", "") or "")
             account_keys = _task_account_keys(task.type, payload)
-            scope = _task_scope(task.type, platform, payload)
+            scope = _task_scope(task.type, platform, payload, task_id=task.id)
             if scope and running_scope_counts.get(scope, 0) >= max_parallel_per_scope:
                 continue
             if account_keys and busy_account_keys.intersection(account_keys):

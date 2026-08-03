@@ -50,6 +50,82 @@ def test_claim_allows_different_task_types_on_same_platform():
     assert next_claimed["scope"] == "chatgpt:account_check_all"
 
 
+def test_claim_allows_workflow_children_of_same_task_type():
+    first = create_task(
+        task_type=TASK_TYPE_REGISTER,
+        platform="chatgpt",
+        payload={
+            "count": 1,
+            "source": "workflow",
+            "workflow_run_id": "wf_100_a",
+            "workflow_step_id": "register",
+        },
+        progress_total=1,
+    )
+    second = create_task(
+        task_type=TASK_TYPE_REGISTER,
+        platform="chatgpt",
+        payload={
+            "count": 1,
+            "source": "workflow",
+            "workflow_run_id": "wf_200_b",
+            "workflow_step_id": "register",
+        },
+        progress_total=1,
+    )
+
+    claimed = claim_next_runnable_task()
+    assert claimed["id"] == first["id"]
+
+    next_claimed = claim_next_runnable_task(
+        running_scope_counts={claimed["scope"]: 1},
+        busy_account_keys=set(claimed["account_keys"]),
+        max_parallel_per_scope=1,
+    )
+
+    assert next_claimed["id"] == second["id"]
+    assert next_claimed["scope"] != claimed["scope"]
+
+
+def test_claim_keeps_workflow_children_serial_for_same_account():
+    first = create_task(
+        task_type=TASK_TYPE_CODEX_OAUTH_BATCH,
+        platform="chatgpt",
+        payload={
+            "platform": "chatgpt",
+            "account_ids": [101],
+            "source": "workflow",
+            "workflow_run_id": "wf_100_a",
+            "workflow_step_id": "codex",
+        },
+        progress_total=1,
+    )
+    second = create_task(
+        task_type=TASK_TYPE_CODEX_OAUTH_BATCH,
+        platform="chatgpt",
+        payload={
+            "platform": "chatgpt",
+            "account_ids": [101],
+            "source": "workflow",
+            "workflow_run_id": "wf_200_b",
+            "workflow_step_id": "codex",
+        },
+        progress_total=1,
+    )
+
+    claimed = claim_next_runnable_task()
+    assert claimed["id"] == first["id"]
+    assert "account:101" in claimed["account_keys"]
+
+    next_claimed = claim_next_runnable_task(
+        running_scope_counts={claimed["scope"]: 1},
+        busy_account_keys=set(claimed["account_keys"]),
+        max_parallel_per_scope=1,
+    )
+
+    assert next_claimed is None
+
+
 def test_claim_allows_codex_oauth_actions_for_different_accounts():
     first = create_task(
         task_type=TASK_TYPE_PLATFORM_ACTION,

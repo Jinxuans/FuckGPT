@@ -3,12 +3,16 @@ import {
   AlertTriangle,
   CheckCircle2,
   Clock3,
+  Download,
   ExternalLink,
   GitBranch,
+  Layers3,
   Loader2,
+  Pause,
   Play,
   RefreshCw,
   RotateCcw,
+  Save,
   Square,
   XCircle,
 } from 'lucide-react'
@@ -22,22 +26,39 @@ import {
   CANCELLABLE_WORKFLOW_STATUSES,
   RETRYABLE_STEP_STATUSES,
   WORKFLOW_STATUS_VARIANTS,
+  cancelWorkflowBatch,
   cancelWorkflowRun,
+  createWorkflowBatch,
   createWorkflowRun,
+  fetchWorkflowAdapters,
+  fetchWorkflowBatchSummary,
+  fetchWorkflowBatches,
   fetchWorkflowDefinitions,
   fetchWorkflowEvents,
   fetchWorkflowRun,
+  fetchWorkflowRunSummary,
   fetchWorkflowRuns,
   getWorkflowStatusText,
+  pauseWorkflowBatch,
+  resumeWorkflowBatch,
+  retryFailedWorkflowBatch,
   retryWorkflowStep,
+  saveWorkflowDefinition,
   updateWorkflowStepInput,
+  type WorkflowAdapter,
+  type WorkflowBatch,
+  type WorkflowBatchSummary,
   type WorkflowDefinition,
   type WorkflowEvent,
   type WorkflowRun,
+  type WorkflowRunSummary,
   type WorkflowStepRun,
+  type WorkflowUiField,
+  type WorkflowUiSection,
 } from '@/lib/workflows'
 
 const PAGE_SIZE = 20
+const BATCH_PAGE_SIZE = 10
 
 const STATUS_OPTIONS = [
   '',
@@ -96,6 +117,8 @@ const DEFAULT_REGISTER_KAKAO_CODEX_PUSH_INPUT = {
   },
 }
 
+type LaunchMode = 'single' | 'batch'
+
 function formatMaybeDate(value: string | undefined, language: Language) {
   if (!value) return '-'
   const date = new Date(value)
@@ -112,6 +135,17 @@ function formatJson(value: unknown) {
   return JSON.stringify(value ?? {}, null, 2)
 }
 
+function formatDuration(seconds: number | undefined) {
+  const total = Math.max(Number(seconds || 0), 0)
+  if (total < 60) return `${total}s`
+  const minutes = Math.floor(total / 60)
+  const rest = total % 60
+  if (minutes < 60) return rest ? `${minutes}m ${rest}s` : `${minutes}m`
+  const hours = Math.floor(minutes / 60)
+  const minuteRest = minutes % 60
+  return minuteRest ? `${hours}h ${minuteRest}m` : `${hours}h`
+}
+
 function parseJsonObject(text: string) {
   const parsed = JSON.parse(text || '{}')
   if (!parsed || Array.isArray(parsed) || typeof parsed !== 'object') {
@@ -120,22 +154,79 @@ function parseJsonObject(text: string) {
   return parsed as Record<string, unknown>
 }
 
+function parseJsonArray(text: string) {
+  const parsed = JSON.parse(text || '[]')
+  if (!Array.isArray(parsed)) {
+    throw new Error('JSON must be an array')
+  }
+  return parsed
+}
+
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return Boolean(value && typeof value === 'object' && !Array.isArray(value))
+}
+
+function cloneRecord(value: Record<string, unknown>) {
+  return JSON.parse(JSON.stringify(value || {})) as Record<string, unknown>
+}
+
+function getPathValue(record: Record<string, unknown>, path: string) {
+  return path.split('.').reduce<unknown>((current, part) => {
+    if (!isPlainObject(current)) return undefined
+    return current[part]
+  }, record)
+}
+
+function setPathValue(record: Record<string, unknown>, path: string, value: unknown) {
+  const next = cloneRecord(record)
+  const parts = path.split('.').filter(Boolean)
+  let cursor: Record<string, unknown> = next
+  parts.slice(0, -1).forEach((part) => {
+    if (!isPlainObject(cursor[part])) {
+      cursor[part] = {}
+    }
+    cursor = cursor[part] as Record<string, unknown>
+  })
+  const leaf = parts[parts.length - 1]
+  if (leaf) {
+    cursor[leaf] = value
+  }
+  return next
 }
 
 function workflowInputForDefinition(definition?: WorkflowDefinition) {
   const sampleInput = definition?.definition?.sample_input
   if (isPlainObject(sampleInput)) {
-    return sampleInput
+    return cloneRecord(sampleInput)
   }
   if (definition?.key === 'register_kakao_codex_push') {
-    return DEFAULT_REGISTER_KAKAO_CODEX_PUSH_INPUT
+    return cloneRecord(DEFAULT_REGISTER_KAKAO_CODEX_PUSH_INPUT)
   }
   if (definition?.key === 'register_codex_push') {
-    return DEFAULT_REGISTER_CODEX_PUSH_INPUT
+    return cloneRecord(DEFAULT_REGISTER_CODEX_PUSH_INPUT)
   }
   return {}
+}
+
+function normalizeUiSections(definition?: WorkflowDefinition) {
+  const sections = definition?.definition?.ui_schema?.sections
+  if (!Array.isArray(sections)) return []
+  return sections
+    .map((section) => ({
+      ...section,
+      fields: Array.isArray(section.fields) ? section.fields.filter((field) => field.path) : [],
+    }))
+    .filter((section) => section.fields.length > 0)
+}
+
+function boolFromValue(value: unknown) {
+  if (typeof value === 'boolean') return value
+  return String(value || '').toLowerCase() === 'true'
+}
+
+function selectValueForField(field: WorkflowUiField, rawValue: string) {
+  const option = (field.options || []).find((item) => String(item.value) === rawValue)
+  return option ? option.value : rawValue
 }
 
 function stepIcon(status: string) {
@@ -150,31 +241,536 @@ function shortError(error: Record<string, unknown>) {
   return String(error?.message || error?.code || '')
 }
 
+function errorCategory(error: Record<string, unknown>) {
+  return String(error?.category || '')
+}
+
+function operatorHint(error: Record<string, unknown>) {
+  return String(error?.operator_hint || '')
+}
+
 function externalTaskUrl(step: WorkflowStepRun) {
   const taskId = step.external_ref || String(step.output?.task_id || '')
   return taskId ? '/tasks' : ''
 }
 
+function summaryCount(summary: WorkflowBatchSummary['summary'] | WorkflowBatch['summary'] | undefined, key: string) {
+  if (!summary) return 0
+  return Number((summary as Record<string, number>)[key] || 0)
+}
+
+function WorkflowInputFields({
+  sections,
+  value,
+  onChange,
+}: {
+  sections: WorkflowUiSection[]
+  value: Record<string, unknown>
+  onChange: (path: string, nextValue: unknown) => void
+}) {
+  if (sections.length === 0) return null
+  return (
+    <div className="space-y-3 rounded-md border border-[var(--border-soft)] bg-[var(--bg-pane)]/35 p-3">
+      {sections.map((section) => (
+        <div key={section.title} className="space-y-2">
+          <div>
+            <h3 className="text-xs font-semibold text-[var(--text-primary)]">{section.title}</h3>
+            {section.description && (
+              <p className="mt-0.5 text-xs text-[var(--text-muted)]">{section.description}</p>
+            )}
+          </div>
+          <div className="grid gap-2 sm:grid-cols-2">
+            {(section.fields || []).map((field) => {
+              const currentValue = getPathValue(value, field.path)
+              if (field.type === 'boolean') {
+                return (
+                  <label
+                    key={field.path}
+                    className="flex min-h-9 items-center gap-2 rounded-md border border-[var(--border-soft)] bg-[var(--bg-card)] px-3 py-2 text-sm text-[var(--text-secondary)]"
+                  >
+                    <input
+                      type="checkbox"
+                      checked={boolFromValue(currentValue)}
+                      onChange={(event) => {
+                        const checked = event.target.checked
+                        onChange(field.path, typeof currentValue === 'string' ? String(checked) : checked)
+                      }}
+                    />
+                    <span>{field.label}</span>
+                  </label>
+                )
+              }
+              return (
+                <label key={field.path} className="block">
+                  <span className="mb-1 block text-xs font-medium text-[var(--text-muted)]">
+                    {field.label}
+                  </span>
+                  {field.type === 'select' ? (
+                    <select
+                      className="control-surface control-surface-compact"
+                      value={String(currentValue ?? '')}
+                      onChange={(event) => onChange(field.path, selectValueForField(field, event.target.value))}
+                    >
+                      {(field.options || []).map((option) => (
+                        <option key={`${field.path}:${String(option.value)}`} value={String(option.value)}>
+                          {option.label}
+                        </option>
+                      ))}
+                    </select>
+                  ) : (
+                    <input
+                      className="control-surface control-surface-compact"
+                      type={field.type === 'number' ? 'number' : 'text'}
+                      min={field.min}
+                      max={field.max}
+                      placeholder={field.placeholder || ''}
+                      value={String(currentValue ?? '')}
+                      onChange={(event) => {
+                        if (field.type === 'number') {
+                          onChange(field.path, Number(event.target.value || 0))
+                          return
+                        }
+                        onChange(field.path, event.target.value)
+                      }}
+                    />
+                  )}
+                  {field.helper && <span className="mt-1 block text-[11px] text-[var(--text-muted)]">{field.helper}</span>}
+                </label>
+              )
+            })}
+          </div>
+        </div>
+      ))}
+    </div>
+  )
+}
+
+function csvToList(value: string) {
+  return value
+    .split(',')
+    .map((item) => item.trim())
+    .filter(Boolean)
+}
+
+function workflowStepsFromTemplate(template: Record<string, unknown> | null) {
+  const steps = template?.steps
+  return Array.isArray(steps) ? steps.filter(isPlainObject) : []
+}
+
+function TemplateDefinitionEditor({
+  value,
+  adapters,
+  onChange,
+  setError,
+  t,
+}: {
+  value: string
+  adapters: WorkflowAdapter[]
+  onChange: (value: string) => void
+  setError: (value: string) => void
+  t: (key: any, params?: Record<string, string | number>) => string
+}) {
+  const template = useMemo(() => {
+    try {
+      return parseJsonObject(value)
+    } catch {
+      return null
+    }
+  }, [value])
+  const steps = workflowStepsFromTemplate(template)
+
+  const updateTemplate = (updater: (draft: Record<string, unknown>) => Record<string, unknown>) => {
+    try {
+      const current = parseJsonObject(value)
+      const next = updater(cloneRecord(current))
+      onChange(formatJson(next))
+      setError('')
+    } catch (exc: unknown) {
+      setError(exc instanceof Error ? exc.message : 'Invalid template JSON')
+    }
+  }
+
+  const patchRoot = (patch: Record<string, unknown>) => {
+    updateTemplate((draft) => ({ ...draft, ...patch }))
+  }
+
+  const patchStep = (index: number, patch: Record<string, unknown>) => {
+    updateTemplate((draft) => {
+      const nextSteps = workflowStepsFromTemplate(draft).map((step) => ({ ...step }))
+      nextSteps[index] = { ...nextSteps[index], ...patch }
+      draft.steps = nextSteps
+      return draft
+    })
+  }
+
+  const updateStepJsonField = (index: number, field: 'input' | 'if', text: string) => {
+    try {
+      const parsed = parseJsonObject(text)
+      patchStep(index, { [field]: parsed })
+    } catch {
+      setError(t('workflows.invalidJson'))
+    }
+  }
+
+  const addStep = () => {
+    updateTemplate((draft) => {
+      const nextSteps = workflowStepsFromTemplate(draft).map((step) => ({ ...step }))
+      const id = `step_${nextSteps.length + 1}`
+      nextSteps.push({
+        id,
+        name: id,
+        uses: adapters[0]?.key || '',
+        needs: nextSteps.length ? [String(nextSteps[nextSteps.length - 1].id || '')].filter(Boolean) : [],
+        input: {},
+        max_attempts: 1,
+        retry_delay: '30s',
+        timeout: '',
+        concurrency: 0,
+        on_failure: 'fail',
+      })
+      draft.steps = nextSteps
+      return draft
+    })
+  }
+
+  const removeStep = (index: number) => {
+    updateTemplate((draft) => {
+      const removedId = String(workflowStepsFromTemplate(draft)[index]?.id || '')
+      const nextSteps = workflowStepsFromTemplate(draft)
+        .filter((_, currentIndex) => currentIndex !== index)
+        .map((step) => ({
+          ...step,
+          needs: Array.isArray(step.needs) ? step.needs.filter((item) => String(item) !== removedId) : [],
+        }))
+      draft.steps = nextSteps
+      return draft
+    })
+  }
+
+  const moveStep = (index: number, direction: -1 | 1) => {
+    updateTemplate((draft) => {
+      const nextSteps = workflowStepsFromTemplate(draft).map((step) => ({ ...step }))
+      const target = index + direction
+      if (target < 0 || target >= nextSteps.length) return draft
+      const current = nextSteps[index]
+      nextSteps[index] = nextSteps[target]
+      nextSteps[target] = current
+      draft.steps = nextSteps
+      return draft
+    })
+  }
+
+  if (!template) {
+    return null
+  }
+
+  return (
+    <div className="space-y-3 rounded-md border border-[var(--border-soft)] bg-[var(--bg-pane)]/25 p-3">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <h3 className="text-xs font-semibold text-[var(--text-primary)]">
+          {t('workflows.templateStepEditor')}
+        </h3>
+        <Button variant="outline" size="sm" onClick={addStep}>
+          {t('workflows.addStep')}
+        </Button>
+      </div>
+
+      <div className="grid gap-2 sm:grid-cols-2">
+        <label className="block">
+          <span className="mb-1 block text-xs font-medium text-[var(--text-muted)]">Key</span>
+          <input
+            className="control-surface control-surface-compact"
+            value={String(template.key || '')}
+            onChange={(event) => patchRoot({ key: event.target.value })}
+          />
+        </label>
+        <label className="block">
+          <span className="mb-1 block text-xs font-medium text-[var(--text-muted)]">Version</span>
+          <input
+            className="control-surface control-surface-compact"
+            type="number"
+            min={1}
+            value={Number(template.version || 1)}
+            onChange={(event) => patchRoot({ version: Number(event.target.value || 1) })}
+          />
+        </label>
+        <label className="block">
+          <span className="mb-1 block text-xs font-medium text-[var(--text-muted)]">Name</span>
+          <input
+            className="control-surface control-surface-compact"
+            value={String(template.name || '')}
+            onChange={(event) => patchRoot({ name: event.target.value })}
+          />
+        </label>
+        <label className="block">
+          <span className="mb-1 block text-xs font-medium text-[var(--text-muted)]">
+            {t('workflows.stuckAfter')}
+          </span>
+          <input
+            className="control-surface control-surface-compact"
+            value={String(template.stuck_after || '30m')}
+            onChange={(event) => patchRoot({ stuck_after: event.target.value })}
+          />
+        </label>
+      </div>
+      <label className="block">
+        <span className="mb-1 block text-xs font-medium text-[var(--text-muted)]">Description</span>
+        <input
+          className="control-surface control-surface-compact"
+          value={String(template.description || '')}
+          onChange={(event) => patchRoot({ description: event.target.value })}
+        />
+      </label>
+
+      <div className="grid gap-2 sm:grid-cols-2">
+        <label className="block">
+          <span className="mb-1 block text-xs font-medium text-[var(--text-muted)]">
+            {t('workflows.adapterLimit')}
+          </span>
+          <textarea
+            key={`adapter-limits:${String(template.key || '')}`}
+            className="control-surface control-surface-mono min-h-20 resize-y"
+            defaultValue={formatJson(isPlainObject(template.limits) ? template.limits.adapters || {} : {})}
+            onBlur={(event) => {
+              try {
+                const parsed = parseJsonObject(event.target.value)
+                patchRoot({
+                  limits: {
+                    ...(isPlainObject(template.limits) ? template.limits : {}),
+                    adapters: parsed,
+                  },
+                })
+              } catch {
+                setError(t('workflows.invalidJson'))
+              }
+            }}
+            spellCheck={false}
+          />
+        </label>
+        <label className="block">
+          <span className="mb-1 block text-xs font-medium text-[var(--text-muted)]">
+            {t('workflows.stepConcurrency')}
+          </span>
+          <textarea
+            key={`step-limits:${String(template.key || '')}`}
+            className="control-surface control-surface-mono min-h-20 resize-y"
+            defaultValue={formatJson(isPlainObject(template.limits) ? template.limits.steps || {} : {})}
+            onBlur={(event) => {
+              try {
+                const parsed = parseJsonObject(event.target.value)
+                patchRoot({
+                  limits: {
+                    ...(isPlainObject(template.limits) ? template.limits : {}),
+                    steps: parsed,
+                  },
+                })
+              } catch {
+                setError(t('workflows.invalidJson'))
+              }
+            }}
+            spellCheck={false}
+          />
+        </label>
+      </div>
+
+      <div className="space-y-2">
+        {steps.map((step, index) => (
+          <div key={`${String(step.id || '')}:${index}`} className="rounded-md border border-[var(--border-soft)] bg-[var(--bg-card)] p-3">
+            <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+              <div className="min-w-0">
+                <p className="truncate text-sm font-medium text-[var(--text-primary)]">
+                  {String(step.name || step.id || `step ${index + 1}`)}
+                </p>
+                <p className="font-mono text-xs text-[var(--text-muted)]">{String(step.uses || '')}</p>
+              </div>
+              <div className="flex flex-wrap gap-2">
+                <Button variant="outline" size="sm" onClick={() => moveStep(index, -1)} disabled={index === 0}>
+                  {t('workflows.moveStepUp')}
+                </Button>
+                <Button variant="outline" size="sm" onClick={() => moveStep(index, 1)} disabled={index >= steps.length - 1}>
+                  {t('workflows.moveStepDown')}
+                </Button>
+                <Button variant="outline" size="sm" onClick={() => removeStep(index)} className="text-red-400 hover:text-red-300">
+                  {t('workflows.removeStep')}
+                </Button>
+              </div>
+            </div>
+            <div className="grid gap-2 sm:grid-cols-2">
+              <label className="block">
+                <span className="mb-1 block text-xs font-medium text-[var(--text-muted)]">
+                  {t('workflows.stepId')}
+                </span>
+                <input
+                  className="control-surface control-surface-compact"
+                  value={String(step.id || '')}
+                  onChange={(event) => patchStep(index, { id: event.target.value })}
+                />
+              </label>
+              <label className="block">
+                <span className="mb-1 block text-xs font-medium text-[var(--text-muted)]">
+                  {t('workflows.stepName')}
+                </span>
+                <input
+                  className="control-surface control-surface-compact"
+                  value={String(step.name || '')}
+                  onChange={(event) => patchStep(index, { name: event.target.value })}
+                />
+              </label>
+              <label className="block">
+                <span className="mb-1 block text-xs font-medium text-[var(--text-muted)]">
+                  {t('workflows.stepAdapter')}
+                </span>
+                <select
+                  className="control-surface control-surface-compact"
+                  value={String(step.uses || '')}
+                  onChange={(event) => patchStep(index, { uses: event.target.value })}
+                >
+                  <option value="">{t('common.unknown')}</option>
+                  {adapters.map((adapter) => (
+                    <option key={`${String(step.id)}:${adapter.key}`} value={adapter.key}>
+                      {adapter.key}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label className="block">
+                <span className="mb-1 block text-xs font-medium text-[var(--text-muted)]">
+                  {t('workflows.stepNeeds')}
+                </span>
+                <input
+                  className="control-surface control-surface-compact"
+                  placeholder={t('workflows.stepNeedsHint')}
+                  value={Array.isArray(step.needs) ? step.needs.join(', ') : ''}
+                  onChange={(event) => patchStep(index, { needs: csvToList(event.target.value) })}
+                />
+              </label>
+              <label className="block">
+                <span className="mb-1 block text-xs font-medium text-[var(--text-muted)]">
+                  {t('workflows.onFailure')}
+                </span>
+                <select
+                  className="control-surface control-surface-compact"
+                  value={String(step.on_failure || 'fail')}
+                  onChange={(event) => patchStep(index, { on_failure: event.target.value })}
+                >
+                  <option value="fail">{t('workflows.onFailure.fail')}</option>
+                  <option value="needs_attention">{t('workflows.onFailure.needs_attention')}</option>
+                  <option value="skip">{t('workflows.onFailure.skip')}</option>
+                </select>
+              </label>
+              <label className="block">
+                <span className="mb-1 block text-xs font-medium text-[var(--text-muted)]">
+                  {t('workflows.stepConcurrency')}
+                </span>
+                <input
+                  className="control-surface control-surface-compact"
+                  type="number"
+                  min={0}
+                  max={200}
+                  value={Number(step.concurrency || 0)}
+                  onChange={(event) => patchStep(index, { concurrency: Number(event.target.value || 0) })}
+                />
+              </label>
+              <label className="block">
+                <span className="mb-1 block text-xs font-medium text-[var(--text-muted)]">
+                  {t('workflows.retryDelay')}
+                </span>
+                <input
+                  className="control-surface control-surface-compact"
+                  value={String(step.retry_delay || '30s')}
+                  onChange={(event) => patchStep(index, { retry_delay: event.target.value })}
+                />
+              </label>
+              <label className="block">
+                <span className="mb-1 block text-xs font-medium text-[var(--text-muted)]">
+                  {t('workflows.timeout')}
+                </span>
+                <input
+                  className="control-surface control-surface-compact"
+                  value={String(step.timeout || '')}
+                  onChange={(event) => patchStep(index, { timeout: event.target.value })}
+                />
+              </label>
+            </div>
+            <div className="mt-2 grid gap-2 sm:grid-cols-2">
+              <label className="block">
+                <span className="mb-1 block text-xs font-medium text-[var(--text-muted)]">
+                  {t('workflows.stepInputMapping')}
+                </span>
+                <textarea
+                  key={`${String(step.id)}:input`}
+                  className="control-surface control-surface-mono min-h-24 resize-y"
+                  defaultValue={formatJson(isPlainObject(step.input) ? step.input : {})}
+                  onBlur={(event) => updateStepJsonField(index, 'input', event.target.value)}
+                  spellCheck={false}
+                />
+              </label>
+              <label className="block">
+                <span className="mb-1 block text-xs font-medium text-[var(--text-muted)]">
+                  {t('workflows.stepCondition')}
+                </span>
+                <textarea
+                  key={`${String(step.id)}:if`}
+                  className="control-surface control-surface-mono min-h-24 resize-y"
+                  defaultValue={formatJson(isPlainObject(step.if) ? step.if : {})}
+                  onBlur={(event) => {
+                    const trimmed = event.target.value.trim()
+                    if (!trimmed || trimmed === '{}') {
+                      patchStep(index, { if: undefined })
+                      return
+                    }
+                    updateStepJsonField(index, 'if', event.target.value)
+                  }}
+                  spellCheck={false}
+                />
+              </label>
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+}
+
 export default function Workflows() {
   const { t, language } = useI18n()
   const [definitions, setDefinitions] = useState<WorkflowDefinition[]>([])
+  const [adapters, setAdapters] = useState<WorkflowAdapter[]>([])
   const [definitionKey, setDefinitionKey] = useState('')
   const [definitionFilter, setDefinitionFilter] = useState('')
   const [status, setStatus] = useState('')
   const [runs, setRuns] = useState<WorkflowRun[]>([])
+  const [batches, setBatches] = useState<WorkflowBatch[]>([])
+  const [batchTotal, setBatchTotal] = useState(0)
+  const [selectedBatchId, setSelectedBatchId] = useState('')
+  const [selectedBatchSummary, setSelectedBatchSummary] = useState<WorkflowBatchSummary | null>(null)
   const [total, setTotal] = useState(0)
   const [running, setRunning] = useState(0)
   const [offset, setOffset] = useState(0)
   const [selectedRunId, setSelectedRunId] = useState('')
   const [selectedRun, setSelectedRun] = useState<WorkflowRun | null>(null)
+  const [runSummary, setRunSummary] = useState<WorkflowRunSummary | null>(null)
   const [events, setEvents] = useState<WorkflowEvent[]>([])
+  const [inputObject, setInputObject] = useState<Record<string, unknown>>(
+    cloneRecord(DEFAULT_REGISTER_CODEX_PUSH_INPUT),
+  )
   const [inputText, setInputText] = useState(formatJson(DEFAULT_REGISTER_CODEX_PUSH_INPUT))
   const [inputError, setInputError] = useState('')
+  const [templateText, setTemplateText] = useState('{}')
+  const [templateError, setTemplateError] = useState('')
+  const [templateMessage, setTemplateMessage] = useState('')
+  const [savingTemplate, setSavingTemplate] = useState(false)
+  const [batchError, setBatchError] = useState('')
+  const [batchItemsText, setBatchItemsText] = useState('')
+  const [batchCount, setBatchCount] = useState(5)
+  const [batchConcurrency, setBatchConcurrency] = useState(1)
+  const [launchMode, setLaunchMode] = useState<LaunchMode>('single')
   const [stepInputText, setStepInputText] = useState('{}')
   const [stepInputError, setStepInputError] = useState('')
   const [editingStepId, setEditingStepId] = useState('')
   const [loading, setLoading] = useState(false)
   const [submitting, setSubmitting] = useState(false)
+  const [batchActionId, setBatchActionId] = useState('')
   const [actionId, setActionId] = useState('')
   const [error, setError] = useState('')
 
@@ -183,14 +779,47 @@ export default function Workflows() {
     [definitionKey, definitions],
   )
 
+  const uiSections = useMemo(() => normalizeUiSections(selectedDefinition), [selectedDefinition])
+  const selectedBatch = useMemo(
+    () => batches.find((item) => item.id === selectedBatchId) || null,
+    [batches, selectedBatchId],
+  )
   const pages = Math.max(1, Math.ceil(total / PAGE_SIZE))
   const currentPage = Math.floor(offset / PAGE_SIZE) + 1
+  const selectedBatchStatus = selectedBatchSummary?.status || selectedBatch?.status || ''
+  const selectedBatchTerminal = Boolean(selectedBatchSummary?.terminal || selectedBatch?.terminal)
 
   const loadDefinitions = useCallback(async () => {
     const items = await fetchWorkflowDefinitions()
     setDefinitions(items)
     setDefinitionKey((current) => current || items[0]?.key || '')
   }, [])
+
+  const loadAdapters = useCallback(async () => {
+    setAdapters(await fetchWorkflowAdapters())
+  }, [])
+
+  const loadBatches = useCallback(async () => {
+    const data = await fetchWorkflowBatches({
+      limit: BATCH_PAGE_SIZE,
+      offset: 0,
+      definition_key: definitionFilter,
+    })
+    setBatches(data.items || [])
+    setBatchTotal(Number(data.total || 0))
+  }, [definitionFilter])
+
+  const loadBatchSummary = useCallback(async () => {
+    if (!selectedBatchId) {
+      setSelectedBatchSummary(null)
+      return
+    }
+    try {
+      setSelectedBatchSummary(await fetchWorkflowBatchSummary(selectedBatchId))
+    } catch {
+      setSelectedBatchSummary(null)
+    }
+  }, [selectedBatchId])
 
   const loadRuns = useCallback(async () => {
     setLoading(true)
@@ -201,33 +830,41 @@ export default function Workflows() {
         offset,
         status,
         definition_key: definitionFilter,
+        batch_id: selectedBatchId,
       })
       setRuns(data.items || [])
       setTotal(Number(data.total || 0))
       setRunning(Number(data.running || 0))
-      setSelectedRunId((current) => current || data.items?.[0]?.id || '')
+      setSelectedRunId((current) => {
+        if (current && data.items?.some((item) => item.id === current)) return current
+        return data.items?.[0]?.id || ''
+      })
     } catch (exc: unknown) {
       setError(exc instanceof Error ? exc.message : t('workflows.loadFailed'))
     } finally {
       setLoading(false)
     }
-  }, [definitionFilter, offset, status, t])
+  }, [definitionFilter, offset, selectedBatchId, status, t])
 
   const loadSelectedRun = useCallback(async () => {
     if (!selectedRunId) {
       setSelectedRun(null)
+      setRunSummary(null)
       setEvents([])
       return
     }
     try {
-      const [run, eventData] = await Promise.all([
+      const [run, eventData, summary] = await Promise.all([
         fetchWorkflowRun(selectedRunId),
         fetchWorkflowEvents(selectedRunId),
+        fetchWorkflowRunSummary(selectedRunId),
       ])
       setSelectedRun(run)
+      setRunSummary(summary)
       setEvents(eventData.items || [])
     } catch (exc: unknown) {
       setSelectedRun(null)
+      setRunSummary(null)
       setEvents([])
       setError(exc instanceof Error ? exc.message : t('workflows.loadFailed'))
     }
@@ -240,8 +877,20 @@ export default function Workflows() {
   }, [loadDefinitions, t])
 
   useEffect(() => {
+    loadAdapters().catch(() => undefined)
+  }, [loadAdapters])
+
+  useEffect(() => {
+    loadBatches().catch(() => undefined)
+  }, [loadBatches])
+
+  useEffect(() => {
     loadRuns()
   }, [loadRuns])
+
+  useEffect(() => {
+    loadBatchSummary()
+  }, [loadBatchSummary])
 
   useEffect(() => {
     loadSelectedRun()
@@ -249,37 +898,142 @@ export default function Workflows() {
 
   useEffect(() => {
     if (!selectedDefinition) return
-    setInputText(formatJson(workflowInputForDefinition(selectedDefinition)))
+    const next = workflowInputForDefinition(selectedDefinition)
+    setInputObject(next)
+    setInputText(formatJson(next))
+    setInputError('')
+    setTemplateText(formatJson(selectedDefinition.definition || {}))
+    setTemplateError('')
+    setTemplateMessage('')
   }, [selectedDefinition])
 
   useEffect(() => {
     const hasActiveRun =
       running > 0 ||
       runs.some((item) => CANCELLABLE_WORKFLOW_STATUSES.has(item.status)) ||
+      batches.some((item) => CANCELLABLE_WORKFLOW_STATUSES.has(item.status)) ||
       (selectedRun && CANCELLABLE_WORKFLOW_STATUSES.has(selectedRun.status))
     if (!hasActiveRun) return
     const timer = window.setInterval(() => {
       loadRuns()
+      loadBatches()
+      loadBatchSummary()
       loadSelectedRun()
     }, 2500)
     return () => window.clearInterval(timer)
-  }, [loadRuns, loadSelectedRun, running, runs, selectedRun])
+  }, [batches, loadBatchSummary, loadBatches, loadRuns, loadSelectedRun, running, runs, selectedRun])
+
+  const setInputFromObject = (next: Record<string, unknown>) => {
+    setInputObject(next)
+    setInputText(formatJson(next))
+    setInputError('')
+    setBatchError('')
+  }
+
+  const handleJsonChange = (nextText: string) => {
+    setInputText(nextText)
+    try {
+      setInputObject(parseJsonObject(nextText))
+      setInputError('')
+    } catch {
+      setInputError(t('workflows.invalidJson'))
+    }
+  }
+
+  const updateInputField = (path: string, nextValue: unknown) => {
+    setInputFromObject(setPathValue(inputObject, path, nextValue))
+  }
+
+  const resetInput = () => {
+    setInputFromObject(workflowInputForDefinition(selectedDefinition))
+  }
+
+  const resetTemplate = () => {
+    setTemplateText(formatJson(selectedDefinition?.definition || {}))
+    setTemplateError('')
+    setTemplateMessage('')
+  }
+
+  const saveTemplate = async () => {
+    setTemplateError('')
+    setTemplateMessage('')
+    setSavingTemplate(true)
+    try {
+      const definition = parseJsonObject(templateText)
+      const saved = await saveWorkflowDefinition(definition)
+      setTemplateMessage(t('workflows.templateSaved'))
+      await loadDefinitions()
+      setDefinitionKey(saved.key)
+    } catch (exc: unknown) {
+      setTemplateError(exc instanceof Error ? exc.message : t('workflows.invalidJson'))
+    } finally {
+      setSavingTemplate(false)
+    }
+  }
+
+  const refreshWorkflowPanels = async () => {
+    await Promise.all([loadBatches(), loadBatchSummary(), loadRuns(), loadSelectedRun()])
+  }
+
+  const parseBatchItems = (baseInput: Record<string, unknown>) => {
+    const trimmed = batchItemsText.trim()
+    if (trimmed) {
+      return parseJsonArray(trimmed).map((raw, index) => {
+        if (!isPlainObject(raw)) {
+          throw new Error(t('workflows.batchJsonInvalid'))
+        }
+        const itemInput = isPlainObject(raw.input) ? raw.input : raw
+        return {
+          name: String(raw.name || `${selectedDefinition?.name || selectedDefinition?.key || 'workflow'} #${index + 1}`),
+          input: cloneRecord(itemInput),
+          metadata: isPlainObject(raw.metadata) ? cloneRecord(raw.metadata) : { source: 'ui_batch_json' },
+        }
+      })
+    }
+    const count = Math.min(Math.max(Number(batchCount || 1), 1), 200)
+    return Array.from({ length: count }, (_, index) => ({
+      name: `${selectedDefinition?.name || selectedDefinition?.key || 'workflow'} #${index + 1}`,
+      input: cloneRecord(baseInput),
+      metadata: { source: 'ui_duplicate', index: index + 1 },
+    }))
+  }
 
   const startRun = async () => {
     if (!selectedDefinition) return
     setInputError('')
+    setBatchError('')
     setSubmitting(true)
     try {
       const parsedInput = parseJsonObject(inputText)
-      const run = await createWorkflowRun({
-        definition_key: selectedDefinition.key,
-        version: selectedDefinition.version,
-        input: parsedInput,
-      })
-      setSelectedRunId(run.id)
-      setSelectedRun(run)
+      if (launchMode === 'batch') {
+        let batchItems: ReturnType<typeof parseBatchItems>
+        try {
+          batchItems = parseBatchItems(parsedInput)
+        } catch (exc: unknown) {
+          setBatchError(exc instanceof Error ? exc.message : t('workflows.batchJsonInvalid'))
+          return
+        }
+        const batch = await createWorkflowBatch({
+          definition_key: selectedDefinition.key,
+          version: selectedDefinition.version,
+          concurrency: batchConcurrency,
+          items: batchItems,
+        })
+        setSelectedBatchId(batch.id)
+        setSelectedRunId(batch.runs?.[0]?.id || '')
+        setSelectedRun(batch.runs?.[0] || null)
+      } else {
+        const run = await createWorkflowRun({
+          definition_key: selectedDefinition.key,
+          version: selectedDefinition.version,
+          input: parsedInput,
+        })
+        setSelectedBatchId('')
+        setSelectedRunId(run.id)
+        setSelectedRun(run)
+      }
       setOffset(0)
-      await loadRuns()
+      await Promise.all([loadBatches(), loadRuns()])
     } catch (exc: unknown) {
       setInputError(exc instanceof Error ? exc.message : t('workflows.invalidJson'))
     } finally {
@@ -287,12 +1041,68 @@ export default function Workflows() {
     }
   }
 
+  const pauseBatch = async () => {
+    if (!selectedBatchId) return
+    setBatchActionId('pause')
+    try {
+      await pauseWorkflowBatch(selectedBatchId)
+      await refreshWorkflowPanels()
+    } finally {
+      setBatchActionId('')
+    }
+  }
+
+  const resumeBatch = async () => {
+    if (!selectedBatchId) return
+    setBatchActionId('resume')
+    try {
+      await resumeWorkflowBatch(selectedBatchId)
+      await refreshWorkflowPanels()
+    } finally {
+      setBatchActionId('')
+    }
+  }
+
+  const cancelBatch = async () => {
+    if (!selectedBatchId) return
+    setBatchActionId('cancel')
+    try {
+      await cancelWorkflowBatch(selectedBatchId)
+      await refreshWorkflowPanels()
+    } finally {
+      setBatchActionId('')
+    }
+  }
+
+  const retryFailedBatch = async () => {
+    if (!selectedBatchId) return
+    setBatchActionId('retry')
+    try {
+      await retryFailedWorkflowBatch(selectedBatchId)
+      await refreshWorkflowPanels()
+    } finally {
+      setBatchActionId('')
+    }
+  }
+
+  const exportBatchSummary = () => {
+    if (!selectedBatchSummary && !selectedBatch) return
+    const payload = selectedBatchSummary || selectedBatch
+    const blob = new Blob([formatJson(payload)], { type: 'application/json;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    const anchor = document.createElement('a')
+    anchor.href = url
+    anchor.download = `${selectedBatchId || 'workflow-batch'}-summary.json`
+    anchor.click()
+    URL.revokeObjectURL(url)
+  }
+
   const cancelRun = async (runId: string) => {
     setActionId(runId)
     try {
       const run = await cancelWorkflowRun(runId)
       setSelectedRun(run)
-      await loadRuns()
+      await Promise.all([loadRuns(), loadBatches(), loadBatchSummary()])
     } finally {
       setActionId('')
     }
@@ -315,7 +1125,7 @@ export default function Workflows() {
       updatedRun = await retryWorkflowStep(updatedRun.id, step.step_id)
       setSelectedRun(updatedRun)
       setEditingStepId('')
-      await loadRuns()
+      await Promise.all([loadRuns(), loadBatches(), loadBatchSummary()])
     } finally {
       setActionId('')
     }
@@ -333,8 +1143,12 @@ export default function Workflows() {
   const resetFilters = () => {
     setStatus('')
     setDefinitionFilter('')
+    setSelectedBatchId('')
     setOffset(0)
   }
+
+  const activeBatchSummary = selectedBatchSummary?.summary || selectedBatch?.summary
+  const activeBatchObservability = selectedBatchSummary?.observability || selectedBatch?.observability
 
   return (
     <div className="space-y-4">
@@ -347,7 +1161,17 @@ export default function Workflows() {
             {t('workflows.subtitle')}
           </p>
         </div>
-        <Button variant="outline" size="sm" onClick={loadRuns} disabled={loading}>
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={() => {
+            loadRuns()
+            loadBatches()
+            loadBatchSummary()
+            loadSelectedRun()
+          }}
+          disabled={loading}
+        >
           <RefreshCw className={cn('mr-1.5 h-4 w-4', loading && 'animate-spin')} />
           {t('common.refresh')}
         </Button>
@@ -370,7 +1194,15 @@ export default function Workflows() {
             {running}
           </p>
         </div>
-        <div className="rounded-lg border border-[var(--border-soft)] bg-[var(--bg-pane)]/45 px-3 py-3 sm:col-span-2">
+        <div className="rounded-lg border border-[var(--border-soft)] bg-[var(--bg-pane)]/45 px-3 py-3">
+          <p className="text-[11px] font-medium text-[var(--text-muted)]">
+            {t('workflows.metric.batches')}
+          </p>
+          <p className="mt-1 text-xl font-semibold text-[var(--text-primary)]">
+            {batchTotal}
+          </p>
+        </div>
+        <div className="rounded-lg border border-[var(--border-soft)] bg-[var(--bg-pane)]/45 px-3 py-3">
           <p className="text-[11px] font-medium text-[var(--text-muted)]">
             {t('workflows.metric.selected')}
           </p>
@@ -386,7 +1218,7 @@ export default function Workflows() {
         </div>
       )}
 
-      <div className="grid gap-4 xl:grid-cols-[minmax(420px,0.9fr)_minmax(520px,1.1fr)]">
+      <div className="grid gap-4 xl:grid-cols-[minmax(440px,0.9fr)_minmax(560px,1.1fr)]">
         <section className="space-y-4">
           <div className="rounded-lg border border-[var(--border)] bg-[var(--bg-card)]">
             <div className="border-b border-[var(--border)] px-3 py-3">
@@ -416,32 +1248,310 @@ export default function Workflows() {
                   {selectedDefinition.description}
                 </p>
               )}
-              <label className="block">
-                <span className="mb-1.5 block text-xs font-medium text-[var(--text-muted)]">
-                  {t('workflows.inputJson')}
-                </span>
-                <textarea
-                  className="control-surface control-surface-mono min-h-56 resize-y"
-                  value={inputText}
-                  onChange={(event) => setInputText(event.target.value)}
-                  spellCheck={false}
-                />
-              </label>
+
+              <WorkflowInputFields
+                sections={uiSections}
+                value={inputObject}
+                onChange={updateInputField}
+              />
+
+              <div className="grid gap-2 sm:grid-cols-2">
+                <label className="block">
+                  <span className="mb-1.5 block text-xs font-medium text-[var(--text-muted)]">
+                    {t('workflows.launchMode')}
+                  </span>
+                  <select
+                    className="control-surface control-surface-compact"
+                    value={launchMode}
+                    onChange={(event) => setLaunchMode(event.target.value as LaunchMode)}
+                  >
+                    <option value="single">{t('workflows.launchMode.single')}</option>
+                    <option value="batch">{t('workflows.launchMode.batch')}</option>
+                  </select>
+                </label>
+                {launchMode === 'batch' && (
+                  <label className="block">
+                    <span className="mb-1.5 block text-xs font-medium text-[var(--text-muted)]">
+                      {t('workflows.batchConcurrency')}
+                    </span>
+                    <input
+                      className="control-surface control-surface-compact"
+                      type="number"
+                      min={1}
+                      max={50}
+                      value={batchConcurrency}
+                      onChange={(event) => setBatchConcurrency(Math.min(Math.max(Number(event.target.value || 1), 1), 50))}
+                    />
+                  </label>
+                )}
+              </div>
+
+              {launchMode === 'batch' && (
+                <div className="space-y-2 rounded-md border border-[var(--border-soft)] bg-[var(--bg-pane)]/35 p-3">
+                  <div className="grid gap-2 sm:grid-cols-[140px_1fr]">
+                    <label className="block">
+                      <span className="mb-1 block text-xs font-medium text-[var(--text-muted)]">
+                        {t('workflows.batchCount')}
+                      </span>
+                      <input
+                        className="control-surface control-surface-compact"
+                        type="number"
+                        min={1}
+                        max={200}
+                        value={batchCount}
+                        onChange={(event) => setBatchCount(Math.min(Math.max(Number(event.target.value || 1), 1), 200))}
+                      />
+                    </label>
+                    <div className="text-xs leading-5 text-[var(--text-muted)]">
+                      {t('workflows.batchCountHint')}
+                    </div>
+                  </div>
+                  <label className="block">
+                    <span className="mb-1 block text-xs font-medium text-[var(--text-muted)]">
+                      {t('workflows.batchItemsJson')}
+                    </span>
+                    <textarea
+                      className="control-surface control-surface-mono min-h-28 resize-y"
+                      value={batchItemsText}
+                      onChange={(event) => {
+                        setBatchItemsText(event.target.value)
+                        setBatchError('')
+                      }}
+                      placeholder={t('workflows.batchItemsJsonPlaceholder')}
+                      spellCheck={false}
+                    />
+                  </label>
+                  {batchError && <p className="text-xs text-red-400">{batchError}</p>}
+                </div>
+              )}
+
+              <details open className="rounded-md border border-[var(--border-soft)] bg-[var(--bg-pane)]/20">
+                <summary className="cursor-pointer px-3 py-2 text-xs font-medium text-[var(--text-accent)]">
+                  {t('workflows.advancedJson')}
+                </summary>
+                <div className="border-t border-[var(--border-soft)] p-3">
+                  <textarea
+                    className="control-surface control-surface-mono min-h-48 resize-y"
+                    value={inputText}
+                    onChange={(event) => handleJsonChange(event.target.value)}
+                    spellCheck={false}
+                  />
+                </div>
+              </details>
+
               {inputError && <p className="text-xs text-red-400">{inputError}</p>}
               <div className="flex items-center justify-between gap-2">
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={() => setInputText(formatJson(workflowInputForDefinition(selectedDefinition)))}
-                >
+                <Button variant="outline" size="sm" onClick={resetInput}>
                   <RotateCcw className="mr-1.5 h-4 w-4" />
                   {t('workflows.resetInput')}
                 </Button>
-                <Button onClick={startRun} disabled={!selectedDefinition || submitting}>
+                <Button onClick={startRun} disabled={!selectedDefinition || submitting || Boolean(inputError || batchError)}>
                   <Play className="mr-1.5 h-4 w-4" />
-                  {submitting ? t('workflows.starting') : t('workflows.startRun')}
+                  {submitting
+                    ? t('workflows.starting')
+                    : launchMode === 'batch'
+                      ? t('workflows.startBatch')
+                      : t('workflows.startRun')}
                 </Button>
               </div>
+            </div>
+          </div>
+
+          <div className="rounded-lg border border-[var(--border)] bg-[var(--bg-card)]">
+            <details>
+              <summary className="cursor-pointer border-b border-[var(--border)] px-3 py-3 text-sm font-semibold text-[var(--text-primary)]">
+                {t('workflows.templateEditor')}
+              </summary>
+              <div className="space-y-3 p-3">
+                <p className="text-xs leading-5 text-[var(--text-muted)]">
+                  {t('workflows.templateEditorHint')}
+                </p>
+                {adapters.length > 0 && (
+                  <details className="rounded-md border border-[var(--border-soft)] bg-[var(--bg-pane)]/25">
+                    <summary className="cursor-pointer px-3 py-2 text-xs font-medium text-[var(--text-accent)]">
+                      {t('workflows.adapterKeys')}
+                    </summary>
+                    <div className="flex max-h-32 flex-wrap gap-1 overflow-auto border-t border-[var(--border-soft)] p-2">
+                      {adapters.map((adapter) => (
+                        <span
+                          key={adapter.key}
+                          className="rounded bg-[var(--chip-bg)] px-1.5 py-0.5 font-mono text-[11px] text-[var(--text-secondary)]"
+                        >
+                          {adapter.key}
+                        </span>
+                      ))}
+                    </div>
+                  </details>
+                )}
+                <TemplateDefinitionEditor
+                  value={templateText}
+                  adapters={adapters}
+                  onChange={(nextText) => {
+                    setTemplateText(nextText)
+                    setTemplateMessage('')
+                  }}
+                  setError={setTemplateError}
+                  t={t}
+                />
+                <details open className="rounded-md border border-[var(--border-soft)] bg-[var(--bg-pane)]/20">
+                  <summary className="cursor-pointer px-3 py-2 text-xs font-medium text-[var(--text-accent)]">
+                    {t('workflows.advancedJson')}
+                  </summary>
+                  <div className="border-t border-[var(--border-soft)] p-3">
+                    <textarea
+                      className="control-surface control-surface-mono min-h-72 resize-y"
+                      value={templateText}
+                      onChange={(event) => {
+                        setTemplateText(event.target.value)
+                        setTemplateError('')
+                        setTemplateMessage('')
+                      }}
+                      spellCheck={false}
+                    />
+                  </div>
+                </details>
+                {templateError && <p className="text-xs text-red-400">{templateError}</p>}
+                {templateMessage && <p className="text-xs text-emerald-500">{templateMessage}</p>}
+                <div className="flex flex-wrap justify-end gap-2">
+                  <Button variant="outline" size="sm" onClick={resetTemplate}>
+                    <RotateCcw className="mr-1.5 h-4 w-4" />
+                    {t('workflows.resetTemplate')}
+                  </Button>
+                  <Button size="sm" onClick={saveTemplate} disabled={savingTemplate}>
+                    <Save className="mr-1.5 h-4 w-4" />
+                    {savingTemplate ? t('workflows.savingTemplate') : t('workflows.saveTemplate')}
+                  </Button>
+                </div>
+              </div>
+            </details>
+          </div>
+
+          <div className="rounded-lg border border-[var(--border)] bg-[var(--bg-card)]">
+            <div className="border-b border-[var(--border)] px-3 py-3">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="flex items-center gap-2">
+                  <Layers3 className="h-4 w-4 text-[var(--text-muted)]" />
+                  <h2 className="text-sm font-semibold text-[var(--text-primary)]">
+                    {t('workflows.batches')}
+                  </h2>
+                </div>
+                {selectedBatchId && (
+                  <div className="flex flex-wrap justify-end gap-2">
+                    {selectedBatchStatus === 'paused' ? (
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={resumeBatch}
+                        disabled={Boolean(batchActionId) || selectedBatchTerminal}
+                      >
+                        <Play className="mr-1 h-3.5 w-3.5" />
+                        {batchActionId === 'resume' ? t('workflows.batchActionRunning') : t('workflows.resumeBatch')}
+                      </Button>
+                    ) : (
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={pauseBatch}
+                        disabled={Boolean(batchActionId) || selectedBatchTerminal}
+                      >
+                        <Pause className="mr-1 h-3.5 w-3.5" />
+                        {batchActionId === 'pause' ? t('workflows.batchActionRunning') : t('workflows.pauseBatch')}
+                      </Button>
+                    )}
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={retryFailedBatch}
+                      disabled={
+                        Boolean(batchActionId) ||
+                        summaryCount(activeBatchSummary, 'failed') + summaryCount(activeBatchSummary, 'needs_attention') + summaryCount(activeBatchSummary, 'cancelled') <= 0
+                      }
+                    >
+                      <RotateCcw className="mr-1 h-3.5 w-3.5" />
+                      {batchActionId === 'retry' ? t('workflows.batchActionRunning') : t('workflows.retryFailedBatch')}
+                    </Button>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={cancelBatch}
+                      disabled={Boolean(batchActionId) || selectedBatchTerminal}
+                      className="text-amber-500 hover:text-amber-400"
+                    >
+                      <Square className="mr-1 h-3.5 w-3.5" />
+                      {batchActionId === 'cancel' ? t('workflows.batchActionRunning') : t('workflows.cancelBatch')}
+                    </Button>
+                    <Button variant="outline" size="sm" onClick={exportBatchSummary}>
+                      <Download className="mr-1 h-3.5 w-3.5" />
+                      {t('workflows.exportBatch')}
+                    </Button>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      onClick={() => {
+                        setSelectedBatchId('')
+                        setOffset(0)
+                      }}
+                    >
+                      {t('workflows.clearBatch')}
+                    </Button>
+                  </div>
+                )}
+              </div>
+              {activeBatchSummary && (
+                <div className="mt-2 grid grid-cols-2 gap-2 text-xs sm:grid-cols-3 xl:grid-cols-6">
+                  <div className="rounded-md bg-[var(--bg-pane)] px-2 py-1 text-[var(--text-muted)]">
+                    {t('common.total')}: {summaryCount(activeBatchSummary, 'total')}
+                  </div>
+                  <div className="rounded-md bg-[var(--bg-pane)] px-2 py-1 text-emerald-500">
+                    {t('common.success')}: {summaryCount(activeBatchSummary, 'succeeded')}
+                  </div>
+                  <div className="rounded-md bg-[var(--bg-pane)] px-2 py-1 text-red-400">
+                    {t('common.failure')}: {summaryCount(activeBatchSummary, 'failed')}
+                  </div>
+                  <div className="rounded-md bg-[var(--bg-pane)] px-2 py-1 text-amber-400">
+                    {t('workflows.needsAttentionShort')}: {summaryCount(activeBatchSummary, 'needs_attention')}
+                  </div>
+                  <div className="rounded-md bg-[var(--bg-pane)] px-2 py-1 text-[var(--text-muted)]">
+                    {t('workflows.duration')}: {formatDuration(activeBatchObservability?.duration_seconds_avg)}
+                  </div>
+                  <div className={cn(
+                    'rounded-md bg-[var(--bg-pane)] px-2 py-1',
+                    Number(activeBatchObservability?.stuck || 0) > 0 ? 'text-amber-400' : 'text-[var(--text-muted)]',
+                  )}>
+                    {t('workflows.stuck')}: {activeBatchObservability?.stuck || 0}
+                  </div>
+                </div>
+              )}
+            </div>
+            <div className="max-h-56 overflow-auto">
+              {batches.length === 0 && (
+                <div className="empty-state-panel m-3">{t('workflows.emptyBatches')}</div>
+              )}
+              {batches.map((batch) => (
+                <button
+                  key={batch.id}
+                  className={cn(
+                    'block w-full border-b border-[var(--border-soft)] px-3 py-2 text-left text-sm last:border-b-0 hover:bg-[var(--bg-hover)]',
+                    selectedBatchId === batch.id && 'bg-[var(--accent-soft)]',
+                  )}
+                  onClick={() => {
+                    setSelectedBatchId(batch.id)
+                    setOffset(0)
+                  }}
+                >
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="truncate font-medium text-[var(--text-primary)]">{batch.name}</span>
+                    <Badge variant={WORKFLOW_STATUS_VARIANTS[batch.status] || 'secondary'}>
+                      {getWorkflowStatusText(batch.status, language)}
+                    </Badge>
+                  </div>
+                  <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-xs text-[var(--text-muted)]">
+                    <span>{batch.total} items</span>
+                    <span>{t('workflows.batchConcurrency')}: {batch.concurrency}</span>
+                    <span className="font-mono">{batch.id}</span>
+                  </div>
+                </button>
+              ))}
             </div>
           </div>
 
@@ -476,7 +1586,7 @@ export default function Workflows() {
                   </option>
                 ))}
               </select>
-              {(status || definitionFilter) && (
+              {(status || definitionFilter || selectedBatchId) && (
                 <Button variant="ghost" size="sm" onClick={resetFilters}>
                   {t('common.clear')}
                 </Button>
@@ -484,7 +1594,7 @@ export default function Workflows() {
             </div>
 
             <div className="glass-table-wrap">
-              <table className="w-full min-w-[720px] text-sm">
+              <table className="w-full min-w-[760px] text-sm">
                 <thead>
                   <tr className="border-b border-[var(--border)] text-[var(--text-muted)]">
                     <th className="px-3 py-2 text-left">{t('workflows.run')}</th>
@@ -505,14 +1615,19 @@ export default function Workflows() {
                     >
                       <td className="px-3 py-3 align-top">
                         <button
-                          className="max-w-[260px] truncate text-left text-sm font-medium text-[var(--text-primary)] hover:text-[var(--accent-strong)]"
+                          className="max-w-[280px] truncate text-left text-sm font-medium text-[var(--text-primary)] hover:text-[var(--accent-strong)]"
                           onClick={() => setSelectedRunId(run.id)}
                         >
                           {run.name || run.definition_key}
                         </button>
-                        <div className="mt-1 max-w-[260px] truncate font-mono text-xs text-[var(--text-muted)]">
+                        <div className="mt-1 max-w-[280px] truncate font-mono text-xs text-[var(--text-muted)]">
                           {run.id}
                         </div>
+                        {run.batch_id && (
+                          <div className="mt-1 text-xs text-[var(--text-muted)]">
+                            {t('workflows.batchItem')}: #{run.batch_item_index || 0}
+                          </div>
+                        )}
                       </td>
                       <td className="px-3 py-3 align-top">
                         <Badge variant={WORKFLOW_STATUS_VARIANTS[run.status] || 'secondary'}>
@@ -607,6 +1722,47 @@ export default function Workflows() {
                   {selectedRun.error}
                 </div>
               )}
+
+              {runSummary && (
+                <div className="rounded-md border border-[var(--border-soft)] bg-[var(--bg-pane)]/35 p-3">
+                  <div className="grid gap-2 sm:grid-cols-2">
+                    <div>
+                      <p className="text-[11px] text-[var(--text-muted)]">{t('workflows.displayStatus')}</p>
+                      <p className="mt-1 text-sm font-medium text-[var(--text-primary)]">{runSummary.display_status}</p>
+                    </div>
+                    <div>
+                      <p className="text-[11px] text-[var(--text-muted)]">{t('workflows.operatorAction')}</p>
+                      <p className="mt-1 text-sm text-[var(--text-secondary)]">{runSummary.operator_action}</p>
+                    </div>
+                    <div>
+                      <p className="text-[11px] text-[var(--text-muted)]">{t('workflows.currentStage')}</p>
+                      <p className="mt-1 font-mono text-xs text-[var(--text-secondary)]">{runSummary.current_stage || '-'}</p>
+                    </div>
+                    <div>
+                      <p className="text-[11px] text-[var(--text-muted)]">{t('workflows.accountRef')}</p>
+                      <p className="mt-1 truncate text-xs text-[var(--text-secondary)]">
+                        {runSummary.email || runSummary.account_id || '-'}
+                      </p>
+                    </div>
+                    <div>
+                      <p className="text-[11px] text-[var(--text-muted)]">{t('workflows.duration')}</p>
+                      <p className="mt-1 text-xs text-[var(--text-secondary)]">
+                        {formatDuration(runSummary.duration_seconds)}
+                      </p>
+                    </div>
+                    <div>
+                      <p className="text-[11px] text-[var(--text-muted)]">{t('workflows.stuckStep')}</p>
+                      <p className={cn(
+                        'mt-1 truncate text-xs',
+                        runSummary.stuck ? 'text-amber-400' : 'text-[var(--text-secondary)]',
+                      )}>
+                        {runSummary.stuck ? `${runSummary.stuck_step_id || '-'}: ${runSummary.stuck_reason}` : '-'}
+                      </p>
+                    </div>
+                  </div>
+                </div>
+              )}
+
               <div className="grid gap-2 sm:grid-cols-3">
                 <div className="rounded-md border border-[var(--border-soft)] bg-[var(--bg-pane)]/45 px-3 py-2">
                   <p className="text-[11px] text-[var(--text-muted)]">{t('workflows.createdAt')}</p>
@@ -652,6 +1808,8 @@ export default function Workflows() {
                     const taskUrl = externalTaskUrl(step)
                     const editing = editingStepId === step.step_id
                     const busy = actionId === `${selectedRun.id}:${step.step_id}`
+                    const category = errorCategory(step.error)
+                    const hint = operatorHint(step.error)
                     return (
                       <div
                         key={step.id}
@@ -694,6 +1852,11 @@ export default function Workflows() {
                             </div>
                             <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-[var(--text-muted)]">
                               <span>{step.adapter_key}</span>
+                              {step.duration_seconds !== undefined && (
+                                <span>
+                                  {t('workflows.duration')}: {formatDuration(step.duration_seconds)}
+                                </span>
+                              )}
                               {step.next_run_at && (
                                 <span>
                                   {t('workflows.nextRunAt')}: {formatMaybeDate(step.next_run_at, language)}
@@ -716,6 +1879,19 @@ export default function Workflows() {
                             </div>
                             {shortError(step.error) && (
                               <p className="mt-2 text-xs text-red-400">{shortError(step.error)}</p>
+                            )}
+                            {(category || hint) && (
+                              <div className="mt-2 rounded-md border border-amber-500/20 bg-amber-500/10 px-2 py-1.5 text-xs text-amber-300">
+                                {category && (
+                                  <span className="mr-2 font-mono text-amber-200">{category}</span>
+                                )}
+                                {hint || t('workflows.noOperatorHint')}
+                              </div>
+                            )}
+                            {runSummary?.steps.find((item) => item.step_id === step.step_id)?.stuck && (
+                              <div className="mt-2 rounded-md border border-amber-500/20 bg-amber-500/10 px-2 py-1.5 text-xs text-amber-300">
+                                {runSummary.steps.find((item) => item.step_id === step.step_id)?.stuck_reason || t('workflows.stuck')}
+                              </div>
                             )}
                             <details className="mt-2">
                               <summary className="cursor-pointer text-xs text-[var(--text-accent)]">
