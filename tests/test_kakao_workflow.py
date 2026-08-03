@@ -317,6 +317,13 @@ def test_kakao_workflow_components_register_adapter_and_template():
     assert "codex.platform_proxy_mode" in field_paths
     assert "codex.platform_proxy_value" in field_paths
 
+    kakao_section = next(section for section in kakao_definition["ui_schema"]["sections"] if section["title"] == "Kakao")
+    kakao_fields = {field["path"]: field for field in kakao_section["fields"]}
+    assert kakao_fields["kakao.payment_method"]["type"] == "select"
+    assert kakao_fields["kakao.scanner_kind"]["options"][0]["value"] == ""
+    assert kakao_fields["kakao.supplier_setting_id"]["advanced"] is True
+    assert kakao_fields["kakao.scanner_setting_id"]["advanced"] is True
+
 
 def test_kakao_workflow_template_is_visible_from_api(client):
     response = client.get("/api/workflows/definitions")

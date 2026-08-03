@@ -277,78 +277,100 @@ function WorkflowInputFields({
   onChange: (path: string, nextValue: unknown) => void
 }) {
   if (sections.length === 0) return null
+
+  const renderField = (field: WorkflowUiField) => {
+    const currentValue = getPathValue(value, field.path)
+    if (field.type === 'boolean') {
+      return (
+        <label
+          key={field.path}
+          className="flex min-h-9 items-start gap-2 rounded-md border border-[var(--border-soft)] bg-[var(--bg-card)] px-3 py-2 text-sm text-[var(--text-secondary)]"
+        >
+          <input
+            className="mt-0.5"
+            type="checkbox"
+            checked={boolFromValue(currentValue)}
+            onChange={(event) => {
+              const checked = event.target.checked
+              onChange(field.path, typeof currentValue === 'string' ? String(checked) : checked)
+            }}
+          />
+          <span>
+            <span className="block">{field.label}</span>
+            {field.helper && <span className="mt-0.5 block text-[11px] text-[var(--text-muted)]">{field.helper}</span>}
+          </span>
+        </label>
+      )
+    }
+    return (
+      <label key={field.path} className="block">
+        <span className="mb-1 block text-xs font-medium text-[var(--text-muted)]">
+          {field.label}
+        </span>
+        {field.type === 'select' ? (
+          <select
+            className="control-surface control-surface-compact"
+            value={String(currentValue ?? '')}
+            onChange={(event) => onChange(field.path, selectValueForField(field, event.target.value))}
+          >
+            {(field.options || []).map((option) => (
+              <option key={`${field.path}:${String(option.value)}`} value={String(option.value)}>
+                {option.label}
+              </option>
+            ))}
+          </select>
+        ) : (
+          <input
+            className="control-surface control-surface-compact"
+            type={field.type === 'number' ? 'number' : 'text'}
+            min={field.min}
+            max={field.max}
+            placeholder={field.placeholder || ''}
+            value={String(currentValue ?? '')}
+            onChange={(event) => {
+              if (field.type === 'number') {
+                onChange(field.path, event.target.value === '' ? null : Number(event.target.value))
+                return
+              }
+              onChange(field.path, event.target.value)
+            }}
+          />
+        )}
+        {field.helper && <span className="mt-1 block text-[11px] text-[var(--text-muted)]">{field.helper}</span>}
+      </label>
+    )
+  }
+
   return (
     <div className="space-y-3 rounded-md border border-[var(--border-soft)] bg-[var(--bg-pane)]/35 p-3">
-      {sections.map((section) => (
-        <div key={section.title} className="space-y-2">
-          <div>
-            <h3 className="text-xs font-semibold text-[var(--text-primary)]">{section.title}</h3>
-            {section.description && (
-              <p className="mt-0.5 text-xs text-[var(--text-muted)]">{section.description}</p>
+      {sections.map((section) => {
+        const fields = section.fields || []
+        const primaryFields = fields.filter((field) => !field.advanced)
+        const advancedFields = fields.filter((field) => field.advanced)
+        return (
+          <div key={section.title} className="space-y-2">
+            <div>
+              <h3 className="text-xs font-semibold text-[var(--text-primary)]">{section.title}</h3>
+              {section.description && (
+                <p className="mt-0.5 text-xs text-[var(--text-muted)]">{section.description}</p>
+              )}
+            </div>
+            <div className="grid gap-2 sm:grid-cols-2">
+              {primaryFields.map(renderField)}
+            </div>
+            {advancedFields.length > 0 && (
+              <details className="rounded-md border border-dashed border-[var(--border-soft)] bg-[var(--bg-card)]/40 px-3 py-2">
+                <summary className="cursor-pointer select-none text-xs font-medium text-[var(--text-muted)]">
+                  高级设置（通常无需配置）
+                </summary>
+                <div className="mt-2 grid gap-2 sm:grid-cols-2">
+                  {advancedFields.map(renderField)}
+                </div>
+              </details>
             )}
           </div>
-          <div className="grid gap-2 sm:grid-cols-2">
-            {(section.fields || []).map((field) => {
-              const currentValue = getPathValue(value, field.path)
-              if (field.type === 'boolean') {
-                return (
-                  <label
-                    key={field.path}
-                    className="flex min-h-9 items-center gap-2 rounded-md border border-[var(--border-soft)] bg-[var(--bg-card)] px-3 py-2 text-sm text-[var(--text-secondary)]"
-                  >
-                    <input
-                      type="checkbox"
-                      checked={boolFromValue(currentValue)}
-                      onChange={(event) => {
-                        const checked = event.target.checked
-                        onChange(field.path, typeof currentValue === 'string' ? String(checked) : checked)
-                      }}
-                    />
-                    <span>{field.label}</span>
-                  </label>
-                )
-              }
-              return (
-                <label key={field.path} className="block">
-                  <span className="mb-1 block text-xs font-medium text-[var(--text-muted)]">
-                    {field.label}
-                  </span>
-                  {field.type === 'select' ? (
-                    <select
-                      className="control-surface control-surface-compact"
-                      value={String(currentValue ?? '')}
-                      onChange={(event) => onChange(field.path, selectValueForField(field, event.target.value))}
-                    >
-                      {(field.options || []).map((option) => (
-                        <option key={`${field.path}:${String(option.value)}`} value={String(option.value)}>
-                          {option.label}
-                        </option>
-                      ))}
-                    </select>
-                  ) : (
-                    <input
-                      className="control-surface control-surface-compact"
-                      type={field.type === 'number' ? 'number' : 'text'}
-                      min={field.min}
-                      max={field.max}
-                      placeholder={field.placeholder || ''}
-                      value={String(currentValue ?? '')}
-                      onChange={(event) => {
-                        if (field.type === 'number') {
-                          onChange(field.path, Number(event.target.value || 0))
-                          return
-                        }
-                        onChange(field.path, event.target.value)
-                      }}
-                    />
-                  )}
-                  {field.helper && <span className="mt-1 block text-[11px] text-[var(--text-muted)]">{field.helper}</span>}
-                </label>
-              )
-            })}
-          </div>
-        </div>
-      ))}
+        )
+      })}
     </div>
   )
 }

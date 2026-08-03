@@ -399,12 +399,49 @@ def register_kakao_workflow_components() -> None:
                     },
                     {
                         "title": "Kakao",
+                        "description": "默认沿用 Kakao 流水线配置；这里只需设置本次任务需要覆盖的选项。",
                         "fields": [
-                            {"path": "kakao.payment_method", "label": "支付方式", "type": "text", "placeholder": "kakao_pay"},
-                            {"path": "kakao.supplier_setting_id", "label": "提链供应商 ID", "type": "number", "min": 0},
-                            {"path": "kakao.scanner_setting_id", "label": "扫码供应商 ID", "type": "number", "min": 0},
-                            {"path": "kakao.scanner_kind", "label": "扫码供应商类型", "type": "text", "placeholder": "scanner_546789"},
-                            {"path": "kakao.auto_submit_scanner", "label": "自动上传扫码", "type": "boolean"},
+                            {
+                                "path": "kakao.payment_method",
+                                "label": "支付方式",
+                                "type": "select",
+                                "options": [
+                                    {"label": "Kakao Pay", "value": "kakao_pay"},
+                                    {"label": "Naver Pay", "value": "naver_pay"},
+                                ],
+                            },
+                            {
+                                "path": "kakao.scanner_kind",
+                                "label": "扫码供应商",
+                                "type": "select",
+                                "options": [
+                                    {"label": "使用 Kakao 全局默认", "value": ""},
+                                    {"label": "I7wap 扫码平台", "value": "scanner"},
+                                    {"label": "546789 扫码平台", "value": "scanner_546789"},
+                                ],
+                            },
+                            {
+                                "path": "kakao.auto_submit_scanner",
+                                "label": "自动上传扫码",
+                                "type": "boolean",
+                                "helper": "关闭后，长链生成时任务会暂停并等待人工处理。",
+                            },
+                            {
+                                "path": "kakao.supplier_setting_id",
+                                "label": "提链供应商配置 ID",
+                                "type": "number",
+                                "min": 0,
+                                "advanced": True,
+                                "helper": "留空使用 Kakao 流水线中的全局提链供应商。",
+                            },
+                            {
+                                "path": "kakao.scanner_setting_id",
+                                "label": "扫码供应商配置 ID",
+                                "type": "number",
+                                "min": 0,
+                                "advanced": True,
+                                "helper": "留空使用上方所选扫码供应商的全局配置。",
+                            },
                         ],
                     },
                     {
