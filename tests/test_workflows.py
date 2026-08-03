@@ -43,6 +43,7 @@ from domain.workflows import (
     RUN_SUCCEEDED,
     STEP_FAILED,
     STEP_NEEDS_ATTENTION,
+    STEP_PENDING,
     STEP_READY,
     STEP_RETRY_SCHEDULED,
     STEP_RUNNING,
@@ -400,7 +401,7 @@ def test_workflow_batch_creates_runs_and_summaries():
     assert run_summary["operator_action"] == "无需操作"
 
 
-def test_workflow_batch_concurrency_blocks_new_items_until_active_item_releases():
+def test_workflow_batch_sliding_window_releases_slot_for_external_wait():
     _register_test_adapters()
     create_or_update_workflow_definition(
         _definition("test_batch_concurrency", [{"id": "hold", "uses": "test.hold"}])
@@ -417,17 +418,107 @@ def test_workflow_batch_concurrency_blocks_new_items_until_active_item_releases(
         for item in list_workflow_runs(limit=10, offset=0, batch_id=batch["id"])["items"]
     ]
     waiting = [run for run in runs if run["steps"][0]["status"] == STEP_WAITING_EXTERNAL]
-    ready = [run for run in runs if run["steps"][0]["status"] == STEP_READY]
+    pending = [run for run in runs if run["steps"][0]["status"] == STEP_PENDING]
     assert len(waiting) == 1
-    assert len(ready) == 1
+    assert len(pending) == 1
 
-    assert not run_due_workflow_once()
+    assert run_due_workflow_once()
     still_waiting = [
         get_workflow_run(item["id"])
         for item in list_workflow_runs(limit=10, offset=0, batch_id=batch["id"])["items"]
     ]
-    assert len([run for run in still_waiting if run["steps"][0]["status"] == STEP_WAITING_EXTERNAL]) == 1
-    assert len([run for run in still_waiting if run["steps"][0]["status"] == STEP_READY]) == 1
+    assert len([run for run in still_waiting if run["steps"][0]["status"] == STEP_WAITING_EXTERNAL]) == 2
+    assert not run_due_workflow_once()
+
+
+def test_workflow_batch_external_waiting_limit_blocks_new_external_starts(monkeypatch):
+    monkeypatch.setenv("WORKFLOW_DEFAULT_EXTERNAL_WAITING_LIMIT", "1")
+    _register_test_adapters()
+    create_or_update_workflow_definition(
+        _definition("test_batch_external_limit", [{"id": "hold", "uses": "test.hold"}])
+    )
+    batch = create_workflow_batch(
+        definition_key="test_batch_external_limit",
+        concurrency=2,
+        items=[{"input": {"value": 1}}, {"input": {"value": 2}}],
+    )
+
+    assert run_due_workflow_once()
+    assert not run_due_workflow_once()
+
+    runs = [
+        get_workflow_run(item["id"])
+        for item in list_workflow_runs(limit=10, offset=0, batch_id=batch["id"])["items"]
+    ]
+    assert len([run for run in runs if run["steps"][0]["status"] == STEP_WAITING_EXTERNAL]) == 1
+    assert len([run for run in runs if run["steps"][0]["status"] == STEP_READY]) == 1
+
+
+def test_workflow_batch_long_retry_releases_slot_for_next_item():
+    _register_test_adapters()
+    create_or_update_workflow_definition(
+        _definition(
+            "test_batch_long_retry",
+            [{"id": "flaky", "uses": "test.flaky", "max_attempts": 2, "retry_delay": "5m"}],
+        )
+    )
+    batch = create_workflow_batch(
+        definition_key="test_batch_long_retry",
+        concurrency=1,
+        items=[{"input": {"value": 1}}, {"input": {"value": 2}}],
+    )
+    first_run_id = batch["runs"][0]["id"]
+    second_run_id = batch["runs"][1]["id"]
+
+    assert run_due_workflow_once()
+    first_detail = get_workflow_run(first_run_id)
+    second_detail = get_workflow_run(second_run_id)
+    assert first_detail["steps"][0]["status"] == STEP_RETRY_SCHEDULED
+    assert second_detail["steps"][0]["status"] == STEP_PENDING
+
+    assert run_due_workflow_once()
+    first_detail = get_workflow_run(first_run_id)
+    second_detail = get_workflow_run(second_run_id)
+    assert first_detail["steps"][0]["status"] == STEP_RETRY_SCHEDULED
+    assert second_detail["steps"][0]["status"] == STEP_RETRY_SCHEDULED
+
+
+def test_workflow_batch_prefers_existing_pipeline_before_opening_next_item():
+    _register_test_adapters()
+    create_or_update_workflow_definition(
+        _definition(
+            "test_batch_pipeline_first",
+            [
+                {"id": "first", "uses": "test.immediate"},
+                {"id": "second", "uses": "test.immediate", "needs": ["first"]},
+            ],
+        )
+    )
+    batch = create_workflow_batch(
+        definition_key="test_batch_pipeline_first",
+        concurrency=1,
+        items=[{"input": {"value": 1}}, {"input": {"value": 2}}],
+    )
+    first_run_id = batch["runs"][0]["id"]
+    second_run_id = batch["runs"][1]["id"]
+
+    assert run_due_workflow_once()
+    first_detail = get_workflow_run(first_run_id)
+    second_detail = get_workflow_run(second_run_id)
+    assert first_detail["steps"][0]["status"] == STEP_SUCCEEDED
+    assert first_detail["steps"][1]["status"] == STEP_READY
+    assert second_detail["steps"][0]["status"] == STEP_PENDING
+
+    assert run_due_workflow_once()
+    first_detail = get_workflow_run(first_run_id)
+    second_detail = get_workflow_run(second_run_id)
+    assert first_detail["status"] == RUN_SUCCEEDED
+    assert second_detail["steps"][0]["status"] == STEP_PENDING
+
+    assert run_due_workflow_once()
+    second_detail = get_workflow_run(second_run_id)
+    assert second_detail["steps"][0]["status"] == STEP_SUCCEEDED
+    assert second_detail["steps"][1]["status"] == STEP_READY
 
 
 def test_workflow_runtime_executes_due_steps_concurrently():
