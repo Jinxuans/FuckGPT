@@ -13,6 +13,12 @@ from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 
+from application.account_recovery import (
+    AccountReloginResult,
+    AccountStateSnapshot,
+    check_and_recover_account,
+    execute_runtime_action_with_worker_proxy as _execute_shared_runtime_action_with_worker_proxy,
+)
 from core.account_graph import (
     load_account_graphs,
     patch_account_graph,
@@ -1245,16 +1251,16 @@ def _execute_configured_account_check_task(payload: dict[str, Any], logger: Task
                 if proxy_mode == PROXY_MODE_PROXY_SERVICE:
                     lease = worker_proxy_manager.acquire(scope_id=task_id, cancel_check=logger.is_cancel_requested, policy=proxy_policy)
                     proxy = lease.url
-                valid, result = _run_single_account_check(
-                    int(model.id or 0), proxy=proxy, disable_proxy_pool=True,
-                    strict_proxy=proxy_mode != PROXY_MODE_DIRECT,
-                    request_timeout_seconds=request_timeout, track_invalid_attempt=automatic,
-                )
-                if lease is not None:
-                    lease.report_success()
-                if (not valid) and relogin_invalid:
-                    logger.log(f"{email}: 检测失效，开始重新登录", level="warning")
-                    relogin_result = _execute_relogin_for_account(
+                def check_state() -> AccountStateSnapshot:
+                    valid, result = _run_single_account_check(
+                        int(model.id or 0), proxy=proxy, disable_proxy_pool=True,
+                        strict_proxy=proxy_mode != PROXY_MODE_DIRECT,
+                        request_timeout_seconds=request_timeout, track_invalid_attempt=automatic,
+                    )
+                    return AccountStateSnapshot(ok=True, valid=bool(valid), data=dict(result or {}))
+
+                def relogin_account() -> AccountReloginResult:
+                    result = _execute_relogin_for_account(
                         platform=platform or str(model.platform or ""),
                         account_id=int(model.id or 0),
                         email=email,
@@ -1262,23 +1268,49 @@ def _execute_configured_account_check_task(payload: dict[str, Any], logger: Task
                         logger=logger,
                         scope_id=task_id,
                     )
-                    if relogin_result.get("cancelled"):
+                    account_refresh = result.get("account_refresh")
+                    refreshed = None
+                    if isinstance(account_refresh, dict):
+                        refreshed_valid = account_refresh.get("valid")
+                        refreshed = AccountStateSnapshot(
+                            ok=bool(account_refresh.get("ok", True)),
+                            valid=refreshed_valid if isinstance(refreshed_valid, bool) else None,
+                            data=dict(account_refresh),
+                            error=str(account_refresh.get("error") or ""),
+                        )
+                    return AccountReloginResult(
+                        ok=bool(result.get("ok")),
+                        data=dict(result.get("data") or {}) if isinstance(result.get("data"), dict) else {},
+                        error=str(result.get("error") or ""),
+                        refreshed=refreshed,
+                    )
+
+                recovery = check_and_recover_account(
+                    check_state=check_state,
+                    relogin=relogin_account,
+                    relogin_invalid=relogin_invalid,
+                    log_fn=logger.log,
+                    label=f"{email}: ",
+                )
+                if lease is not None:
+                    lease.report_success()
+                if recovery.relogin_attempted:
+                    if logger.is_cancel_requested() or recovery.relogin_error == "任务已取消":
                         return {"cancelled": True, "email": email}
-                    account_refresh = relogin_result.get("account_refresh")
-                    final_valid = bool(
-                        account_refresh.get("valid", True)
-                        if isinstance(account_refresh, dict)
-                        else relogin_result.get("ok")
+                    final_valid = (
+                        recovery.final.valid
+                        if isinstance(recovery.final.valid, bool)
+                        else recovery.relogin_ok
                     )
                     return {
                         "ok": True,
-                        **result,
-                        "valid": final_valid,
+                        **recovery.initial.data,
+                        "valid": bool(final_valid),
                         "relogin_attempted": True,
-                        "relogin_ok": bool(relogin_result.get("ok")),
-                        "relogin_error": str(relogin_result.get("error") or ""),
+                        "relogin_ok": recovery.relogin_ok,
+                        "relogin_error": recovery.relogin_error,
                     }
-                return {"ok": True, "valid": valid, **result}
+                return {"ok": True, "valid": bool(recovery.final.valid), **recovery.final.data}
             except Exception as exc:
                 retryable = is_retryable_network_error(exc)
                 if lease is not None and retryable:
@@ -1901,62 +1933,16 @@ def _execute_runtime_action_with_worker_proxy(
     scope_id: str,
 ):
     """Execute one action with a worker-owned, replaceable proxy lease."""
-    from core.worker_proxy import WorkerProxyPolicy, worker_proxy_manager
-
-    proxy_mode = normalize_proxy_mode(
-        str(params.get("platform_proxy_mode") or "").strip(),
-        default=PROXY_MODE_DIRECT,
+    return _execute_shared_runtime_action_with_worker_proxy(
+        platform=platform,
+        account_id=account_id,
+        action_id=action_id,
+        params=params,
+        scope_id=scope_id,
+        log_fn=logger.log,
+        cancel_check=logger.is_cancel_requested,
+        runtime_factory=PlatformRuntime,
     )
-    policy = WorkerProxyPolicy.load()
-    attempts = policy.replace_max_attempts if proxy_mode == PROXY_MODE_PROXY_SERVICE else 1
-    result = None
-    for proxy_attempt in range(1, attempts + 1):
-        lease = None
-        runtime_params = dict(params)
-        try:
-            if proxy_mode == PROXY_MODE_PROXY_SERVICE:
-                lease = worker_proxy_manager.acquire(
-                    scope_id=scope_id,
-                    log_fn=logger.log,
-                    cancel_check=logger.is_cancel_requested,
-                    policy=policy,
-                )
-                runtime_params["platform_proxy_mode"] = PROXY_MODE_MANUAL
-                runtime_params["platform_proxy_value"] = lease.url
-                runtime_params["_proxy_log_mode"] = PROXY_MODE_PROXY_SERVICE
-            runtime = PlatformRuntime()
-            result = runtime.execute_action(
-                type("Command", (), {
-                    "platform": platform,
-                    "account_id": account_id,
-                    "action_id": action_id,
-                    "params": runtime_params,
-                })(),
-                log_fn=logger.log,
-                cancel_check=logger.is_cancel_requested,
-            )
-            network_error = RuntimeError(str(result.error or ""))
-            retry_proxy = (
-                not result.ok
-                and proxy_mode == PROXY_MODE_PROXY_SERVICE
-                and is_retryable_network_error(network_error)
-            )
-            if lease is not None:
-                if retry_proxy:
-                    lease.report_failure()
-                else:
-                    lease.report_success()
-            if retry_proxy and proxy_attempt < attempts:
-                logger.log(
-                    f"代理网络异常，换 IP 重试 ({proxy_attempt + 1}/{attempts}): {result.error}",
-                    level="warning",
-                )
-                continue
-            return result
-        finally:
-            if lease is not None:
-                lease.release()
-    return result
 
 
 def _execute_codex_oauth_batch_task(payload: dict[str, Any], logger: TaskLogger) -> None:
