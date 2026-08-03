@@ -41,6 +41,7 @@ class AccountModel(SQLModel, table=True):
     __tablename__ = "accounts"
     __table_args__ = (
         UniqueConstraint("platform", "email", name="uq_accounts_platform_email"),
+        Index("ix_accounts_platform_created_id", "platform", "created_at", "id"),
     )
 
     id: Optional[int] = Field(default=None, primary_key=True)
@@ -491,6 +492,19 @@ class KakaoPipelineModel(SQLModel, table=True):
     __tablename__ = "kakao_pipelines"
     __table_args__ = (
         UniqueConstraint("account_id", name="uq_kakao_pipelines_account"),
+        Index(
+            "ix_kakao_pipelines_archive_state_updated",
+            "archived_at",
+            "state",
+            "final_result",
+            "updated_at",
+            "id",
+        ),
+        Index(
+            "ix_kakao_pipelines_archive_purged",
+            "archived_at",
+            "purged_at",
+        ),
     )
 
     id: Optional[int] = Field(default=None, primary_key=True)
@@ -566,6 +580,10 @@ class KakaoPipelineModel(SQLModel, table=True):
     created_at: datetime = Field(default_factory=_utcnow)
     updated_at: datetime = Field(default_factory=_utcnow)
     completed_at: Optional[datetime] = None
+    archived_at: Optional[datetime] = None
+    archive_reason: str = ""
+    archive_disposition: str = ""
+    purged_at: Optional[datetime] = None
 
     def get_supplier_response(self) -> dict:
         data = json.loads(self.supplier_response_json or "{}")
@@ -902,6 +920,25 @@ def init_db():
     _ensure_column("kakao_pipelines", "codex_push_skip_reason", "TEXT DEFAULT ''")
     _ensure_column("kakao_pipelines", "codex_push_enqueue_error", "TEXT DEFAULT ''")
     _ensure_column("kakao_pipelines", "codex_post_action_done_at", "DATETIME")
+    _ensure_column("kakao_pipelines", "archived_at", "DATETIME")
+    _ensure_column("kakao_pipelines", "archive_reason", "TEXT DEFAULT ''")
+    _ensure_column("kakao_pipelines", "archive_disposition", "TEXT DEFAULT ''")
+    _ensure_column("kakao_pipelines", "purged_at", "DATETIME")
+    _ensure_index(
+        "accounts",
+        "ix_accounts_platform_created_id",
+        ("platform", "created_at", "id"),
+    )
+    _ensure_index(
+        "kakao_pipelines",
+        "ix_kakao_pipelines_archive_state_updated",
+        ("archived_at", "state", "final_result", "updated_at", "id"),
+    )
+    _ensure_index(
+        "kakao_pipelines",
+        "ix_kakao_pipelines_archive_purged",
+        ("archived_at", "purged_at"),
+    )
     _ensure_column("workflow_runs", "batch_id", "TEXT DEFAULT ''")
     _ensure_column("workflow_runs", "batch_item_index", "INTEGER DEFAULT 0")
     _ensure_column("workflow_runs", "metadata_json", "TEXT DEFAULT '{}'")
@@ -938,6 +975,26 @@ def _ensure_column(table: str, column: str, col_type: str):
     with engine.begin() as conn:
         conn.exec_driver_sql(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
     print(f"[DB] 已添加列 {table}.{column}")
+
+
+def _ensure_index(table: str, index_name: str, columns: tuple[str, ...]) -> None:
+    """Create a simple index for an existing table after its columns migrate."""
+
+    inspector = inspect(engine)
+    if table not in set(inspector.get_table_names()):
+        return
+    existing_columns = {item["name"] for item in inspector.get_columns(table)}
+    if not columns or any(column not in existing_columns for column in columns):
+        return
+    existing_indexes = {item["name"] for item in inspector.get_indexes(table)}
+    if index_name in existing_indexes:
+        return
+    column_sql = ", ".join(columns)
+    with engine.begin() as conn:
+        conn.exec_driver_sql(
+            f"CREATE INDEX IF NOT EXISTS {index_name} ON {table} ({column_sql})"
+        )
+    print(f"[DB] 已添加索引 {index_name}")
 
 
 def _cleanup_empty_provider_settings():

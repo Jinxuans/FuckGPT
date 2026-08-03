@@ -2,6 +2,8 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import {
   AlertTriangle,
+  Archive,
+  ArchiveRestore,
   Check,
   CheckCircle2,
   ChevronDown,
@@ -19,6 +21,7 @@ import {
   Settings2,
   ShieldCheck,
   Smartphone,
+  Trash2,
   X,
 } from 'lucide-react'
 
@@ -42,6 +45,7 @@ type KakaoSetting = {
 
 type ScannerKind = 'scanner' | 'scanner_546789'
 type AccountProxyMode = 'direct' | 'proxy_service' | 'manual'
+type PipelineView = 'workspace' | 'completed' | 'archived' | 'all'
 
 type AccountProxySetting = {
   mode: AccountProxyMode
@@ -116,6 +120,10 @@ type Pipeline = {
   updated_at?: string | null
   latest_event_at?: string | null
   completed_at?: string | null
+  archived_at?: string | null
+  archive_reason?: string | null
+  archive_disposition?: string | null
+  purged_at?: string | null
   events?: Array<{ time: string; level: string; message: string }>
   supplier_response?: Record<string, unknown>
   scanner_response?: Record<string, unknown>
@@ -183,6 +191,12 @@ const SETTING_TITLES: Record<SettingKind, string> = {
 }
 
 const PAGE_SIZE = 20
+const PIPELINE_VIEWS: Array<{ key: PipelineView; label: string }> = [
+  { key: 'workspace', label: '工作台' },
+  { key: 'completed', label: '已完成' },
+  { key: 'archived', label: '归档' },
+  { key: 'all', label: '全部' },
+]
 const ACTIVE_PIPELINE_STATES = new Set([
   'supplier_submitting',
   'supplier_processing',
@@ -211,6 +225,16 @@ const ADVANCE_PLUS_PIPELINE_STATES = new Set([
   'scanner_submit_unconfirmed',
   'plus_checking',
   'plus_pending',
+  'plus_unconfirmed',
+  'plus_check_failed',
+])
+
+const UNCERTAIN_PIPELINE_STATES = new Set([
+  'supplier_poll_failed',
+  'supplier_submit_unconfirmed',
+  'scanner_poll_failed',
+  'scanner_submit_unconfirmed',
+  'scanner_recovery_unconfirmed',
   'plus_unconfirmed',
   'plus_check_failed',
 ])
@@ -564,6 +588,13 @@ function getPostActionPresentation(account: KakaoAccount) {
 }
 
 function postActionsAreActive(account: KakaoAccount) {
+  const rawStatuses = [
+    account.pipeline.post_actions?.codex?.status,
+    account.pipeline.post_actions?.push?.status,
+  ]
+  if (rawStatuses.some(status => ACTIVE_POST_ACTION_STATUSES.has(normalizePostActionStatus(status)))) {
+    return true
+  }
   const { codexState, pushState } = getPostActionPresentation(account)
   return codexState === 'active' || pushState === 'active'
 }
@@ -576,6 +607,31 @@ function postActionsHaveError(account: KakaoAccount) {
 function pipelineFlowComplete(account: KakaoAccount) {
   const { plusComplete, codexSettled, pushState } = getPostActionPresentation(account)
   return plusComplete && codexSettled && ['complete', 'skipped'].includes(pushState)
+}
+
+function pipelineIsArchived(account: KakaoAccount) {
+  return Boolean(account.pipeline.archived_at || account.pipeline.purged_at)
+}
+
+function pipelineIsPurged(account: KakaoAccount) {
+  const disposition = String(account.pipeline.archive_disposition || '').trim().toLowerCase()
+  return Boolean(account.pipeline.purged_at || disposition === 'purged')
+}
+
+function pipelineWasAbandoned(account: KakaoAccount) {
+  const disposition = String(account.pipeline.archive_disposition || '').trim().toLowerCase()
+  return disposition.includes('abandon') || disposition.includes('discard')
+}
+
+function pipelineIsCompleteForArchive(account: KakaoAccount) {
+  return account.pipeline.state === 'completed'
+    || account.pipeline.final_result === 'plus'
+}
+
+function pipelineArchiveRequiresForce(account: KakaoAccount) {
+  return ACTIVE_PIPELINE_STATES.has(account.pipeline.state)
+    || UNCERTAIN_PIPELINE_STATES.has(account.pipeline.state)
+    || postActionsAreActive(account)
 }
 
 function formatLatestTime(value?: string | null) {
@@ -623,6 +679,41 @@ function LatestEventTime({ value }: { value?: string | null }) {
       <span className="block font-mono text-xs text-[var(--text-secondary)]">{formatted.primary}</span>
       {formatted.relative ? <span className="mt-1 block text-[11px] text-[var(--text-muted)]">{formatted.relative}</span> : null}
     </time>
+  )
+}
+
+function ArchiveStateBadge({ account }: { account: KakaoAccount }) {
+  if (pipelineIsPurged(account)) return <Badge variant="danger">已清除</Badge>
+  if (pipelineWasAbandoned(account)) return <Badge variant="warning">已放弃</Badge>
+  return <Badge variant="secondary">已归档</Badge>
+}
+
+function ArchivedPipelineSummary({ account }: { account: KakaoAccount }) {
+  const pipeline = account.pipeline
+  const archived = formatLatestTime(pipeline.purged_at || pipeline.archived_at)
+  const reason = String(pipeline.archive_reason || '').trim() || '未填写归档原因'
+
+  return (
+    <div className="min-w-[320px] max-w-[460px]">
+      <div className="flex flex-wrap items-center justify-center gap-2">
+        <ArchiveStateBadge account={account} />
+        {pipelineIsPurged(account) ? (
+          <span className="text-xs text-red-500">流水线详情已永久清除</span>
+        ) : (
+          <span className="text-xs text-[var(--text-secondary)]">
+            {pipelineWasAbandoned(account) ? '流程已停止并归档' : '流程记录已归档'}
+          </span>
+        )}
+      </div>
+      <p className="mt-2 break-words text-center text-xs leading-5 text-[var(--text-secondary)]" title={reason}>
+        {reason}
+      </p>
+      {archived ? (
+        <p className="mt-1 text-center text-[11px] text-[var(--text-muted)]" title={archived.full}>
+          {pipelineIsPurged(account) ? '清除于' : '归档于'} {archived.primary}
+        </p>
+      ) : null}
+    </div>
   )
 }
 
@@ -1352,19 +1443,23 @@ export default function KakaoPipeline() {
   const [pushTargets, setPushTargets] = useState<PushTarget[]>([])
   const [search, setSearch] = useState('')
   const [debouncedSearch, setDebouncedSearch] = useState('')
+  const [view, setView] = useState<PipelineView>('workspace')
   const [page, setPage] = useState(1)
   const [total, setTotal] = useState(0)
   const [loading, setLoading] = useState(true)
   const [pageLoading, setPageLoading] = useState(false)
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [operations, setOperations] = useState<Record<number, string>>({})
+  const [selectedAccountIds, setSelectedAccountIds] = useState<Set<number>>(() => new Set())
+  const [archiveBusy, setArchiveBusy] = useState('')
   const [expanded, setExpanded] = useState<number | null>(null)
   const [details, setDetails] = useState<Record<number, Pipeline>>({})
-  const [toast, setToast] = useState<{ type: 'success' | 'error'; text: string } | null>(null)
+  const [toast, setToast] = useState<{ type: 'success' | 'warning' | 'error'; text: string } | null>(null)
   const activeRequests = useRef(new Set<number>())
   const loadRequestRef = useRef(0)
   const accountLoadInFlightRef = useRef(false)
   const hasLoadedAccountsRef = useRef(false)
+  const selectAllCheckboxRef = useRef<HTMLInputElement | null>(null)
 
   const loadSettings = useCallback(async () => {
     const result = await apiFetch('/kakao-pipeline/settings')
@@ -1386,12 +1481,27 @@ export default function KakaoPipeline() {
       const params = new URLSearchParams({
         page: String(page),
         pageSize: String(PAGE_SIZE),
+        view,
       })
       if (debouncedSearch) params.set('search', debouncedSearch)
       const result = await apiFetch(`/kakao-pipeline/accounts?${params.toString()}`)
       if (requestId !== loadRequestRef.current) return
-      setAccounts(Array.isArray(result.items) ? result.items : [])
-      setTotal(Number(result.total || 0))
+      const nextAccounts = Array.isArray(result?.items) ? result.items : []
+      const nextTotal = Number(result?.total || 0)
+      const nextTotalPages = Math.max(1, Math.ceil(nextTotal / PAGE_SIZE))
+      setTotal(nextTotal)
+      if (page > nextTotalPages) {
+        setAccounts([])
+        setSelectedAccountIds(new Set())
+        setPage(nextTotalPages)
+        return
+      }
+      const visibleIds = new Set<number>(nextAccounts.map((item: KakaoAccount) => item.id))
+      setAccounts(nextAccounts)
+      setSelectedAccountIds(current => {
+        const next = new Set([...current].filter(accountId => visibleIds.has(accountId)))
+        return next.size === current.size ? current : next
+      })
       hasLoadedAccountsRef.current = true
     } catch (error) {
       if (requestId !== loadRequestRef.current) return
@@ -1403,7 +1513,7 @@ export default function KakaoPipeline() {
       }
       if (requestId === loadRequestRef.current) accountLoadInFlightRef.current = false
     }
-  }, [debouncedSearch, page])
+  }, [debouncedSearch, page, view])
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
@@ -1412,6 +1522,10 @@ export default function KakaoPipeline() {
     }, 350)
     return () => window.clearTimeout(timer)
   }, [search])
+
+  useEffect(() => {
+    setSelectedAccountIds(new Set())
+  }, [page, search, view])
 
   useEffect(() => {
     if (!toast) return
@@ -1483,13 +1597,14 @@ export default function KakaoPipeline() {
       if (document.visibilityState !== 'visible' || accountLoadInFlightRef.current) return
       void loadAccounts(false)
     }
-    const timer = window.setInterval(refreshVisiblePage, 3000)
+    const refreshInterval = view === 'workspace' || view === 'all' ? 3000 : 15000
+    const timer = window.setInterval(refreshVisiblePage, refreshInterval)
     document.addEventListener('visibilitychange', refreshVisiblePage)
     return () => {
       window.clearInterval(timer)
       document.removeEventListener('visibilitychange', refreshVisiblePage)
     }
-  }, [loadAccounts])
+  }, [loadAccounts, view])
 
   const toggleDetail = async (accountId: number) => {
     if (expanded === accountId) {
@@ -1623,10 +1738,256 @@ export default function KakaoPipeline() {
     }
   }
 
+  const runArchiveRequest = async (
+    targets: KakaoAccount[],
+    label: string,
+    path: string,
+    body: Record<string, unknown>,
+    successText: string,
+  ) => {
+    const accountIds = targets.map(account => account.id)
+    if (!accountIds.length || archiveBusy) return
+    if (accountIds.some(accountId => activeRequests.current.has(accountId))) {
+      setToast({ type: 'error', text: '所选账号仍有操作正在提交，请稍候再试' })
+      return
+    }
+
+    accountIds.forEach(accountId => activeRequests.current.add(accountId))
+    setArchiveBusy(label)
+    setOperations(current => {
+      const next = { ...current }
+      accountIds.forEach(accountId => { next[accountId] = label })
+      return next
+    })
+    try {
+      const result = await apiFetch(path, {
+        method: 'POST',
+        body: JSON.stringify(body),
+      })
+      const errorCount = Number(result?.failed ?? result?.error_count ?? 0)
+      const successCount = Number(result?.succeeded ?? result?.success_count ?? Math.max(0, accountIds.length - errorCount))
+      const resultItems = Array.isArray(result?.results) ? result.results : (Array.isArray(result?.items) ? result.items : [])
+      const failedAccountIds = new Set<number>(
+        resultItems.flatMap((item: { account_id?: unknown; ok?: boolean; success?: boolean }) => {
+          const accountId = Number(item?.account_id || 0)
+          return (item?.ok === false || item?.success === false) && accountId > 0 ? [accountId] : []
+        }),
+      )
+      setSelectedAccountIds(failedAccountIds)
+      setDetails(current => {
+        const next = { ...current }
+        accountIds.forEach(accountId => {
+          if (!failedAccountIds.has(accountId)) delete next[accountId]
+        })
+        return next
+      })
+      const warningMessages = [...new Set(
+        resultItems.flatMap((item: { warnings?: unknown }) => (
+          Array.isArray(item?.warnings)
+            ? item.warnings.map(warning => String(warning || '').trim()).filter(Boolean)
+            : []
+        )),
+      )]
+      const warningSuffix = warningMessages.length ? `。警告：${warningMessages.join('；')}` : ''
+      if (result?.ok === false || errorCount > 0) {
+        const firstError = resultItems.length
+          ? String(resultItems.find((item: { ok?: boolean; success?: boolean; error?: string }) => (
+            item?.ok === false || item?.success === false
+          ))?.error || '').trim()
+          : ''
+        setToast({
+          type: 'error',
+          text: `${label}部分失败：成功 ${successCount}，失败 ${errorCount}${firstError ? `。${firstError}` : ''}${warningSuffix}`,
+        })
+      } else if (warningMessages.length > 0) {
+        setToast({ type: 'warning', text: `${successText}${warningSuffix}` })
+      } else {
+        setToast({ type: 'success', text: successText })
+      }
+      await loadAccounts(false)
+    } catch (error) {
+      setToast({ type: 'error', text: parseError(error) })
+    } finally {
+      accountIds.forEach(accountId => activeRequests.current.delete(accountId))
+      setOperations(current => {
+        const next = { ...current }
+        accountIds.forEach(accountId => { delete next[accountId] })
+        return next
+      })
+      setArchiveBusy('')
+    }
+  }
+
+  const archiveAccounts = async (targets: KakaoAccount[]) => {
+    const candidates = targets.filter(account => !pipelineIsArchived(account))
+    if (!candidates.length) return
+
+    const incomplete = candidates.filter(account => !pipelineIsCompleteForArchive(account))
+    const force = candidates.some(pipelineArchiveRequiresForce)
+    const defaultReason = incomplete.length
+      ? (candidates.length === 1 ? '人工放弃 Kakao 流程' : `批量放弃并归档 ${incomplete.length} 个未完成流程`)
+      : (candidates.length === 1 ? 'Kakao 流程已完成' : `批量归档 ${candidates.length} 个已完成流程`)
+    const reasonInput = window.prompt(
+      incomplete.length
+        ? `所选账号中有 ${incomplete.length} 个流程尚未完成，将标记为“已放弃”。请输入归档原因：`
+        : '请输入归档原因：',
+      defaultReason,
+    )
+    if (reasonInput === null) return
+    const reason = reasonInput.trim()
+    if (!reason) {
+      setToast({ type: 'error', text: '归档原因不能为空' })
+      return
+    }
+
+    const confirmed = window.confirm(
+      force
+        ? `强制归档确认\n\n所选账号中有正在执行或结果尚不确定的流程。继续后只会停止本地后续推进并归档 ${candidates.length} 个账号；远端供应商或扫码任务无法从本地取消，仍可能继续执行。此操作需要稍后手动恢复才能继续。`
+        : incomplete.length
+          ? `确认放弃并归档 ${candidates.length} 个账号？未完成流程会标记为“已放弃”。`
+          : `确认归档 ${candidates.length} 个已完成账号？`,
+    )
+    if (!confirmed) return
+
+    await runArchiveRequest(
+      candidates,
+      force ? '强制归档中' : '归档中',
+      '/kakao-pipeline/archive',
+      {
+        account_ids: candidates.map(account => account.id),
+        reason,
+        disposition: 'auto',
+        force,
+      },
+      incomplete.length
+        ? `已放弃并归档 ${candidates.length} 个账号`
+        : `已归档 ${candidates.length} 个账号`,
+    )
+  }
+
+  const restoreArchivedAccounts = async (targets: KakaoAccount[]) => {
+    const candidates = targets.filter(account => pipelineIsArchived(account) && !pipelineIsPurged(account))
+    if (!candidates.length) return
+    if (!window.confirm(`确认恢复 ${candidates.length} 个归档账号到工作台？`)) return
+    await runArchiveRequest(
+      candidates,
+      '恢复归档中',
+      '/kakao-pipeline/archive/restore',
+      { account_ids: candidates.map(account => account.id) },
+      `已恢复 ${candidates.length} 个账号`,
+    )
+  }
+
+  const retryArchivedTaskCancellation = async (targets: KakaoAccount[]) => {
+    const candidates = targets.filter(account => (
+      pipelineIsArchived(account)
+      && !pipelineIsPurged(account)
+      && postActionsAreActive(account)
+    ))
+    if (!candidates.length) return
+    await runArchiveRequest(
+      candidates,
+      '重试停止任务中',
+      '/kakao-pipeline/archive',
+      {
+        account_ids: candidates.map(account => account.id),
+        reason: '',
+        disposition: 'auto',
+        force: true,
+      },
+      `已重新请求停止 ${candidates.length} 个账号的关联任务`,
+    )
+  }
+
+  const purgeArchivedAccounts = async (targets: KakaoAccount[]) => {
+    const candidates = targets.filter(account => pipelineIsArchived(account) && !pipelineIsPurged(account))
+    if (!candidates.length) return
+    const confirmationText = candidates.length === 1
+      ? candidates[0].email
+      : `永久清除 ${candidates.length} 个账号`
+    const typed = window.prompt(
+      `永久清除会删除归档流水线的订单、响应和日志详情，且不可恢复。\n请输入“${confirmationText}”确认：`,
+      '',
+    )
+    if (typed === null) return
+    if (typed.trim() !== confirmationText) {
+      setToast({ type: 'error', text: '确认文字不匹配，已取消永久清除' })
+      return
+    }
+    await runArchiveRequest(
+      candidates,
+      '永久清除中',
+      '/kakao-pipeline/archive/purge',
+      { account_ids: candidates.map(account => account.id) },
+      `已永久清除 ${candidates.length} 个账号的流水线详情`,
+    )
+  }
+
   const renderActions = (account: KakaoAccount) => {
     const pipeline = account.pipeline
-    const { plusComplete, codexSettled, codexState, pushState } = getPostActionPresentation(account)
     const busy = operations[account.id]
+
+    if (pipelineIsArchived(account)) {
+      if (busy) {
+        return (
+          <div className="flex items-center justify-end">
+            <Button variant="outline" size="sm" disabled>
+              <LoaderCircle className="mr-1.5 h-3.5 w-3.5 animate-spin" /> {busy}
+            </Button>
+          </div>
+        )
+      }
+      if (pipelineIsPurged(account)) {
+        return (
+          <div className="flex items-center justify-end">
+            <span className="text-xs text-[var(--text-muted)]">详情已永久清除</span>
+          </div>
+        )
+      }
+      const linkedTaskActive = postActionsAreActive(account)
+      return (
+        <div className="flex flex-wrap items-center justify-end gap-1.5">
+          <Button
+            variant="outline"
+            size="sm"
+            disabled={Boolean(archiveBusy)}
+            onClick={() => void toggleDetail(account.id)}
+          >
+            <FileText className="mr-1.5 h-3.5 w-3.5" /> 查看日志
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            disabled={Boolean(archiveBusy)}
+            onClick={() => void restoreArchivedAccounts([account])}
+          >
+            <ArchiveRestore className="mr-1.5 h-3.5 w-3.5" /> 恢复
+          </Button>
+          {linkedTaskActive ? (
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={Boolean(archiveBusy)}
+              title="再次请求取消仍在运行的关联任务"
+              onClick={() => void retryArchivedTaskCancellation([account])}
+            >
+              <RotateCcw className="mr-1.5 h-3.5 w-3.5" /> 重试停止任务
+            </Button>
+          ) : null}
+          <Button
+            variant="destructive"
+            size="sm"
+            disabled={Boolean(archiveBusy) || linkedTaskActive}
+            title={linkedTaskActive ? '等待关联任务停止后再永久清除' : '永久清除流水线详情'}
+            onClick={() => void purgeArchivedAccounts([account])}
+          >
+            <Trash2 className="mr-1.5 h-3.5 w-3.5" /> 永久清除
+          </Button>
+        </div>
+      )
+    }
+
+    const { plusComplete, codexSettled, codexState, pushState } = getPostActionPresentation(account)
     const supplierReady = Boolean(settings?.supplier.has_cdk)
     const scannerKind = settings?.default_scanner_kind || 'scanner'
     const selectedScanner = settings?.[scannerKind]
@@ -1770,6 +2131,17 @@ export default function KakaoPipeline() {
             <Check className="mr-1.5 h-3.5 w-3.5" /> 刷新账号状态
           </Button>
         ) : null}
+        <Button
+          variant="outline"
+          size="sm"
+          disabled={Boolean(archiveBusy)}
+          className={pipelineIsCompleteForArchive(account) ? undefined : 'text-amber-500 hover:text-amber-500'}
+          title={pipelineIsCompleteForArchive(account) ? '归档已完成流水线' : '放弃当前流程并归档'}
+          onClick={() => void archiveAccounts([account])}
+        >
+          <Archive className="mr-1.5 h-3.5 w-3.5" />
+          {pipelineIsCompleteForArchive(account) ? '归档' : '放弃并归档'}
+        </Button>
         <AccountMoreMenu
           accountId={account.id}
           onCopyCredential={copyAccountCredential}
@@ -1789,14 +2161,54 @@ export default function KakaoPipeline() {
 
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE))
   const activeCount = accounts.filter(account => (
-    ACTIVE_PIPELINE_STATES.has(account.pipeline.state) || postActionsAreActive(account)
+    !pipelineIsArchived(account)
+    && (ACTIVE_PIPELINE_STATES.has(account.pipeline.state) || postActionsAreActive(account))
   )).length
-  const readyCount = accounts.filter(account => account.pipeline.state === 'link_ready').length
+  const readyCount = accounts.filter(account => !pipelineIsArchived(account) && account.pipeline.state === 'link_ready').length
   const errorCount = accounts.filter(account => (
-    ATTENTION_PIPELINE_STATES.has(account.pipeline.state) || postActionsHaveError(account)
+    !pipelineIsArchived(account)
+    && (ATTENTION_PIPELINE_STATES.has(account.pipeline.state) || postActionsHaveError(account))
   )).length
-  const completedCount = accounts.filter(pipelineFlowComplete).length
+  const completedCount = accounts.filter(account => !pipelineIsArchived(account) && pipelineFlowComplete(account)).length
+  const archivedCount = accounts.filter(account => pipelineIsArchived(account) && !pipelineIsPurged(account)).length
+  const abandonedCount = accounts.filter(account => pipelineIsArchived(account) && pipelineWasAbandoned(account) && !pipelineIsPurged(account)).length
+  const purgedCount = accounts.filter(pipelineIsPurged).length
+  const selectableAccounts = accounts.filter(account => !pipelineIsPurged(account))
+  const selectedAccounts = accounts.filter(account => selectedAccountIds.has(account.id))
+  const selectedUnarchivedAccounts = selectedAccounts.filter(account => !pipelineIsArchived(account))
+  const selectedArchivedAccounts = selectedAccounts.filter(account => pipelineIsArchived(account) && !pipelineIsPurged(account))
+  const selectedArchivedActiveAccounts = selectedArchivedAccounts.filter(postActionsAreActive)
+  const selectedArchivedHasActiveTask = selectedArchivedActiveAccounts.length > 0
+  const selectedUnarchivedIncompleteCount = selectedUnarchivedAccounts.filter(account => !pipelineIsCompleteForArchive(account)).length
+  const selectedHasPendingOperation = selectedAccounts.some(account => Boolean(operations[account.id]))
+  const selectedOnPageCount = selectableAccounts.filter(account => selectedAccountIds.has(account.id)).length
+  const allPageSelected = selectableAccounts.length > 0 && selectedOnPageCount === selectableAccounts.length
   const expandedAccount = expanded === null ? null : accounts.find(account => account.id === expanded) || null
+
+  useEffect(() => {
+    if (!selectAllCheckboxRef.current) return
+    selectAllCheckboxRef.current.indeterminate = selectedOnPageCount > 0 && !allPageSelected
+  }, [allPageSelected, selectedOnPageCount])
+
+  const toggleAccountSelection = (accountId: number, checked: boolean) => {
+    setSelectedAccountIds(current => {
+      const next = new Set(current)
+      if (checked) next.add(accountId)
+      else next.delete(accountId)
+      return next
+    })
+  }
+
+  const togglePageSelection = (checked: boolean) => {
+    setSelectedAccountIds(current => {
+      const next = new Set(current)
+      selectableAccounts.forEach(account => {
+        if (checked) next.add(account.id)
+        else next.delete(account.id)
+      })
+      return next
+    })
+  }
 
   return (
     <div className="space-y-5">
@@ -1817,7 +2229,9 @@ export default function KakaoPipeline() {
             'fixed right-5 top-5 z-[70] flex max-w-md items-center gap-2 rounded-lg border px-4 py-3 text-left text-sm shadow-[var(--shadow-hard)]',
             toast.type === 'success'
               ? 'border-emerald-500/30 bg-[var(--bg-card)] text-emerald-500'
-              : 'border-red-500/30 bg-[var(--bg-card)] text-red-500',
+              : toast.type === 'warning'
+                ? 'border-amber-500/30 bg-[var(--bg-card)] text-amber-500'
+                : 'border-red-500/30 bg-[var(--bg-card)] text-red-500',
           )}
         >
           {toast.type === 'success' ? <CheckCircle2 className="h-4 w-4 shrink-0" /> : <AlertTriangle className="h-4 w-4 shrink-0" />}
@@ -1884,6 +2298,39 @@ export default function KakaoPipeline() {
         </div>
       )}
 
+      <nav
+        className="flex gap-1 overflow-x-auto border-b border-[var(--border)]"
+        role="tablist"
+        aria-label="Kakao 流水线视图"
+      >
+        {PIPELINE_VIEWS.map(item => {
+          const active = view === item.key
+          return (
+            <button
+              key={item.key}
+              type="button"
+              role="tab"
+              aria-selected={active}
+              aria-controls="kakao-accounts-table"
+              className={cn(
+                'relative shrink-0 px-4 py-2.5 text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-[var(--accent)]',
+                active
+                  ? 'text-[var(--accent)] after:absolute after:inset-x-2 after:bottom-0 after:h-0.5 after:rounded-full after:bg-[var(--accent)]'
+                  : 'text-[var(--text-muted)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]',
+              )}
+              onClick={() => {
+                if (item.key === view) return
+                setPage(1)
+                setView(item.key)
+              }}
+            >
+              {item.label}
+              {active ? <span className="ml-1.5 text-xs text-[var(--text-muted)]">{total}</span> : null}
+            </button>
+          )
+        })}
+      </nav>
+
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="relative w-full max-w-sm">
           <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-[var(--text-muted)]" />
@@ -1900,32 +2347,117 @@ export default function KakaoPipeline() {
           {readyCount > 0 ? <span className="text-amber-500">待上传 {readyCount}</span> : null}
           {errorCount > 0 ? <span className="text-red-500">异常 {errorCount}</span> : null}
           {completedCount > 0 ? <span className="text-emerald-500">已完成 {completedCount}</span> : null}
+          {archivedCount > 0 ? <span className="text-[var(--text-secondary)]">已归档 {archivedCount}</span> : null}
+          {abandonedCount > 0 ? <span className="text-amber-500">已放弃 {abandonedCount}</span> : null}
+          {purgedCount > 0 ? <span className="text-red-500">已清除 {purgedCount}</span> : null}
           <span className="text-[var(--text-muted)]">共 {total} 个账号</span>
         </div>
       </div>
 
-      <div className="overflow-hidden border border-[var(--border)] bg-[var(--bg-surface)]">
+      {selectedAccounts.length > 0 ? (
+        <div
+          className="flex flex-wrap items-center justify-between gap-3 border border-[var(--accent-edge)] bg-[var(--accent-soft)] px-4 py-3"
+          aria-label="批量归档操作"
+        >
+          <div className="flex items-center gap-3 text-sm">
+            <span className="font-medium text-[var(--text-primary)]">已选 {selectedAccounts.length} 个账号</span>
+            {archiveBusy ? (
+              <span className="flex items-center gap-1.5 text-xs text-[var(--text-secondary)]" role="status">
+                <LoaderCircle className="h-3.5 w-3.5 animate-spin" /> {archiveBusy}
+              </span>
+            ) : null}
+          </div>
+          <div className="flex flex-wrap items-center justify-end gap-2">
+            {selectedUnarchivedAccounts.length > 0 ? (
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={Boolean(archiveBusy) || selectedHasPendingOperation}
+                className={selectedUnarchivedIncompleteCount > 0 ? 'text-amber-500 hover:text-amber-500' : undefined}
+                onClick={() => void archiveAccounts(selectedUnarchivedAccounts)}
+              >
+                <Archive className="mr-1.5 h-3.5 w-3.5" />
+                {selectedUnarchivedIncompleteCount > 0 ? '放弃并归档' : '归档'} {selectedUnarchivedAccounts.length} 个
+              </Button>
+            ) : null}
+            {selectedArchivedAccounts.length > 0 ? (
+              <>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  disabled={Boolean(archiveBusy) || selectedHasPendingOperation}
+                  onClick={() => void restoreArchivedAccounts(selectedArchivedAccounts)}
+                >
+                  <ArchiveRestore className="mr-1.5 h-3.5 w-3.5" /> 恢复 {selectedArchivedAccounts.length} 个
+                </Button>
+                {selectedArchivedActiveAccounts.length > 0 ? (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    disabled={Boolean(archiveBusy) || selectedHasPendingOperation}
+                    title="再次请求取消仍在运行的关联任务"
+                    onClick={() => void retryArchivedTaskCancellation(selectedArchivedActiveAccounts)}
+                  >
+                    <RotateCcw className="mr-1.5 h-3.5 w-3.5" />
+                    重试停止 {selectedArchivedActiveAccounts.length} 个
+                  </Button>
+                ) : null}
+                <Button
+                  variant="destructive"
+                  size="sm"
+                  disabled={Boolean(archiveBusy) || selectedHasPendingOperation || selectedArchivedHasActiveTask}
+                  title={selectedArchivedHasActiveTask ? '所选账号仍有关联任务未停止' : '永久清除所选流水线详情'}
+                  onClick={() => void purgeArchivedAccounts(selectedArchivedAccounts)}
+                >
+                  <Trash2 className="mr-1.5 h-3.5 w-3.5" /> 永久清除 {selectedArchivedAccounts.length} 个
+                </Button>
+              </>
+            ) : null}
+            <Button
+              variant="ghost"
+              size="sm"
+              disabled={Boolean(archiveBusy)}
+              onClick={() => setSelectedAccountIds(new Set())}
+            >
+              取消选择
+            </Button>
+          </div>
+        </div>
+      ) : null}
+
+      <div id="kakao-accounts-table" className="overflow-hidden border border-[var(--border)] bg-[var(--bg-surface)]">
         <div className="overflow-x-auto">
-          <table className="w-full min-w-[1080px] table-fixed text-left" aria-busy={loading || pageLoading}>
+          <table className="w-full min-w-[1160px] table-fixed text-left" aria-busy={loading || pageLoading}>
             <colgroup>
-              <col className="w-[25%]" />
-              <col className="w-[33%]" />
-              <col className="w-[14%]" />
-              <col className="w-[28%]" />
+              <col className="w-12" />
+              <col className="w-[23%]" />
+              <col className="w-[32%]" />
+              <col className="w-[13%]" />
+              <col />
             </colgroup>
             <thead className="border-b border-[var(--border)] bg-[var(--bg-pane)] text-[var(--text-muted)]">
               <tr>
+                <th className="py-3 pl-4 pr-1">
+                  <input
+                    ref={selectAllCheckboxRef}
+                    type="checkbox"
+                    checked={allPageSelected}
+                    disabled={loading || pageLoading || Boolean(archiveBusy) || selectableAccounts.length === 0}
+                    aria-label="选择本页可操作账号"
+                    onChange={event => togglePageSelection(event.target.checked)}
+                  />
+                </th>
                 <th className="px-4 py-3">账号</th>
-                <th className="px-4 py-3 text-center">流程进度</th>
+                <th className="px-4 py-3 text-center">{view === 'archived' ? '归档信息' : view === 'all' ? '流程 / 归档信息' : '流程进度'}</th>
                 <th className="px-4 py-3">最新时间</th>
-                <th className="px-4 py-3 text-right">下一步</th>
+                <th className="px-4 py-3 text-right">{view === 'archived' ? '归档操作' : '下一步'}</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-[var(--border-soft)]">
               {loading ? (
                 Array.from({ length: 6 }).map((_, index) => (
                   <tr key={index}>
-                    {Array.from({ length: 4 }).map((__, cell) => (
+                    {Array.from({ length: 5 }).map((__, cell) => (
                       <td key={cell} className="px-4 py-4">
                         <div className="h-4 animate-pulse rounded bg-[var(--chip-bg)]" />
                       </td>
@@ -1934,19 +2466,32 @@ export default function KakaoPipeline() {
                 ))
               ) : accounts.length === 0 ? (
                 <tr>
-                  <td colSpan={4} className="px-4 py-14 text-center text-sm text-[var(--text-muted)]">
-                    没有找到本地 ChatGPT 账号。
+                  <td colSpan={5} className="px-4 py-14 text-center text-sm text-[var(--text-muted)]">
+                    {view === 'archived' ? '没有找到归档账号。' : view === 'completed' ? '没有找到已完成账号。' : '没有找到本地 ChatGPT 账号。'}
                   </td>
                 </tr>
               ) : accounts.map(account => (
                     <tr key={account.id} className={cn(
                       'align-top transition-colors hover:bg-[var(--bg-hover)]',
-                      ATTENTION_PIPELINE_STATES.has(account.pipeline.state) || postActionsHaveError(account)
+                      pipelineIsPurged(account)
                         ? 'bg-red-500/[0.025]'
-                        : pipelineFlowComplete(account)
-                          ? 'bg-emerald-500/[0.025]'
-                          : '',
+                        : pipelineIsArchived(account)
+                          ? 'bg-slate-500/[0.035]'
+                          : ATTENTION_PIPELINE_STATES.has(account.pipeline.state) || postActionsHaveError(account)
+                            ? 'bg-red-500/[0.025]'
+                            : pipelineFlowComplete(account)
+                              ? 'bg-emerald-500/[0.025]'
+                              : '',
                     )}>
+                      <td className="py-4 pl-4 pr-1">
+                        <input
+                          type="checkbox"
+                          checked={selectedAccountIds.has(account.id)}
+                          disabled={Boolean(archiveBusy) || pipelineIsPurged(account)}
+                          aria-label={`选择账号 ${account.email}`}
+                          onChange={event => toggleAccountSelection(account.id, event.target.checked)}
+                        />
+                      </td>
                       <td className="px-4 py-4">
                         <div className="max-w-full truncate text-sm font-medium text-[var(--text-primary)]" title={account.email}>
                           {account.email}
@@ -1955,11 +2500,16 @@ export default function KakaoPipeline() {
                           <span className="font-mono">#{account.id}</span>
                           {planBadge(account)}
                           {phoneBindingBadge(account)}
+                          {pipelineIsArchived(account) ? <ArchiveStateBadge account={account} /> : null}
                           <span>{account.validity === 'valid' ? '账号有效' : `有效性：${account.validity || '未检测'}`}</span>
                         </div>
                       </td>
-                      <td className="px-4 py-4"><PipelineProgress account={account} /></td>
-                      <td className="px-4 py-4"><LatestEventTime value={account.pipeline.latest_event_at} /></td>
+                      <td className="px-4 py-4">
+                        {pipelineIsArchived(account) ? <ArchivedPipelineSummary account={account} /> : <PipelineProgress account={account} />}
+                      </td>
+                      <td className="px-4 py-4">
+                        <LatestEventTime value={account.pipeline.purged_at || account.pipeline.archived_at || account.pipeline.latest_event_at} />
+                      </td>
                       <td className="px-4 py-4">{renderActions(account)}</td>
                     </tr>
               ))}

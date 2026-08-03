@@ -95,6 +95,8 @@ class KakaoUpgradeAdapter(StepAdapter):
 
         existing = self._get_pipeline(account_id)
         if existing:
+            if existing.get("archived_at"):
+                return self._map_pipeline(existing)
             if not self._pipeline_is_complete(existing):
                 existing = self.service.set_codex_post_actions_enabled(account_id, False)
             return self._advance_or_map(existing, inputs=inputs, attempt=attempt)
@@ -125,6 +127,8 @@ class KakaoUpgradeAdapter(StepAdapter):
             return StepTransition.failed("Kakao 升级步骤缺少 account_id", code="kakao_account_missing")
         try:
             existing = self._get_pipeline(account_id)
+            if existing and existing.get("archived_at"):
+                return self._map_pipeline(existing)
             if existing and not self._pipeline_is_complete(existing):
                 self.service.set_codex_post_actions_enabled(account_id, False)
             pipeline = self.service.advance_background(account_id)
@@ -140,6 +144,8 @@ class KakaoUpgradeAdapter(StepAdapter):
         return
 
     def _advance_or_map(self, pipeline: dict[str, Any], *, inputs: dict[str, Any], attempt: int) -> StepTransition:
+        if pipeline.get("archived_at"):
+            return self._map_pipeline(pipeline)
         state = _text(pipeline.get("state"))
         account_id = _int_or_zero(pipeline.get("account_id") or inputs.get("account_id"))
 
@@ -210,6 +216,16 @@ class KakaoUpgradeAdapter(StepAdapter):
         state = _text(pipeline.get("state"))
         account_id = _int_or_zero(pipeline.get("account_id"))
         output = self._output(pipeline)
+
+        if pipeline.get("archived_at"):
+            disposition = _text(pipeline.get("archive_disposition"))
+            if disposition == "completed":
+                return StepTransition.succeeded(output, message="Kakao 流水线已完成并归档")
+            return StepTransition.needs_attention(
+                "Kakao 流水线已放弃并归档，工作流不会继续推进",
+                code="kakao_pipeline_archived",
+                output=output,
+            )
 
         if state == "completed" or _text(pipeline.get("final_result")) == "plus" or _text(pipeline.get("plus_status")) == "plus":
             return StepTransition.succeeded(output, message="Kakao 已确认升级为 Plus")
@@ -306,6 +322,10 @@ class KakaoUpgradeAdapter(StepAdapter):
             "completion_source": _text(pipeline.get("completion_source")),
             "last_error_code": _text(pipeline.get("last_error_code")),
             "last_error_message": _text(pipeline.get("last_error_message")),
+            "archived_at": pipeline.get("archived_at"),
+            "archive_disposition": _text(pipeline.get("archive_disposition")),
+            "archive_reason": _text(pipeline.get("archive_reason")),
+            "purged_at": pipeline.get("purged_at"),
         }
 
     @staticmethod

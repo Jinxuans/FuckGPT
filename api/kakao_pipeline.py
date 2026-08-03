@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from typing import Literal
+
 from fastapi import APIRouter, HTTPException, Query, Response
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from features.kakao_pipeline.client import CustomerApiProblem
 from features.kakao_pipeline.service import KakaoPipelineService
@@ -47,6 +49,17 @@ class AutoUploadRequest(BaseModel):
 class AccountProxyRequest(BaseModel):
     mode: str = "direct"
     value: str = ""
+
+
+class KakaoArchiveRequest(BaseModel):
+    account_ids: list[int] = Field(min_length=1, max_length=500)
+    reason: str = ""
+    disposition: Literal["auto", "completed", "abandoned"] = "auto"
+    force: bool = False
+
+
+class KakaoArchiveIdsRequest(BaseModel):
+    account_ids: list[int] = Field(min_length=1, max_length=500)
 
 
 def _raise_problem(exc: Exception) -> None:
@@ -119,11 +132,49 @@ def set_account_proxy(body: AccountProxyRequest, response: Response):
 def list_accounts(
     response: Response,
     search: str = "",
-    page: int = Query(default=1, ge=1),
+    page: int = Query(default=1, ge=1, le=10_000_000),
     page_size: int = Query(default=20, alias="pageSize", ge=1, le=100),
+    view: Literal["workspace", "completed", "archived", "all"] = "workspace",
 ):
     response.headers["Cache-Control"] = "no-store"
-    return service.list_accounts(search=search, page=page, page_size=page_size)
+    return service.list_accounts(
+        search=search,
+        page=page,
+        page_size=page_size,
+        view=view,
+    )
+
+
+@router.post("/archive")
+def archive_accounts(body: KakaoArchiveRequest, response: Response):
+    response.headers["Cache-Control"] = "no-store"
+    try:
+        return service.archive_accounts(
+            body.account_ids,
+            reason=body.reason,
+            disposition=body.disposition,
+            force=body.force,
+        )
+    except Exception as exc:  # noqa: BLE001
+        _raise_problem(exc)
+
+
+@router.post("/archive/restore")
+def restore_archived_accounts(body: KakaoArchiveIdsRequest, response: Response):
+    response.headers["Cache-Control"] = "no-store"
+    try:
+        return service.restore_accounts(body.account_ids)
+    except Exception as exc:  # noqa: BLE001
+        _raise_problem(exc)
+
+
+@router.post("/archive/purge")
+def purge_archived_accounts(body: KakaoArchiveIdsRequest, response: Response):
+    response.headers["Cache-Control"] = "no-store"
+    try:
+        return service.purge_archived_accounts(body.account_ids)
+    except Exception as exc:  # noqa: BLE001
+        _raise_problem(exc)
 
 
 @router.get("/accounts/{account_id}")

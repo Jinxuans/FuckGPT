@@ -134,6 +134,49 @@ def test_kakao_adapter_succeeds_when_pipeline_is_completed_plus():
     assert service.post_action_calls == []
 
 
+def test_kakao_adapter_treats_completed_archive_as_succeeded():
+    service = _FakeKakaoService(
+        {
+            "account_id": 71,
+            "state": "completed",
+            "plus_status": "plus",
+            "final_result": "plus",
+            "archived_at": "2026-08-04T00:00:00+00:00",
+            "archive_disposition": "completed",
+            "archive_reason": "finished",
+        }
+    )
+    adapter = KakaoUpgradeAdapter(service)
+
+    transition = adapter.start(inputs={"account_id": 71}, idempotency_key="wf_archived_done", attempt=1)
+
+    assert transition.status == STEP_SUCCEEDED
+    assert transition.output["archive_disposition"] == "completed"
+    assert service.post_action_calls == []
+    assert service.advance_calls == []
+
+
+def test_kakao_adapter_stops_abandoned_archive_without_advancing():
+    service = _FakeKakaoService(
+        {
+            "account_id": 72,
+            "state": "scanner_processing",
+            "archived_at": "2026-08-04T00:00:00+00:00",
+            "archive_disposition": "abandoned",
+            "archive_reason": "operator stopped tracking",
+        }
+    )
+    adapter = KakaoUpgradeAdapter(service)
+
+    transition = adapter.resume(inputs={"account_id": 72}, external_ref="kakao:72", attempt=1)
+
+    assert transition.status == STEP_NEEDS_ATTENTION
+    assert transition.error["code"] == "kakao_pipeline_archived"
+    assert transition.output["archive_reason"] == "operator stopped tracking"
+    assert service.post_action_calls == []
+    assert service.advance_calls == []
+
+
 def test_kakao_adapter_starts_missing_pipeline_and_waits():
     service = _FakeKakaoService(
         None,

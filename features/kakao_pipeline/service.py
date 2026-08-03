@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
-from sqlalchemy import or_
+from sqlalchemy import and_, func, or_
 from sqlmodel import Session, select
 
 from application.account_recovery import (
@@ -34,7 +34,6 @@ from core.proxy_resolution import (
     mask_proxy_url,
     normalize_proxy_mode,
 )
-from domain.accounts import AccountQuery
 from domain.actions import ActionExecutionResult
 from infrastructure.platform_runtime import PlatformRuntime  # re-exported for existing integration hooks
 from infrastructure.provider_settings_repository import ProviderSettingsRepository
@@ -46,6 +45,18 @@ from .workstation_client import WorkstationScannerClient
 KAKAO_PROVIDER_TYPE = "kakao_pipeline"
 SCANNER_KINDS = ("scanner", "scanner_546789")
 ACCOUNT_PROXY_MODES = {PROXY_MODE_DIRECT, PROXY_MODE_MANUAL, PROXY_MODE_PROXY_SERVICE}
+KAKAO_ACCOUNT_VIEWS = {"workspace", "completed", "archived", "all"}
+ARCHIVE_DISPOSITIONS = {"auto", "completed", "abandoned"}
+ARCHIVE_UNCERTAIN_STATES = {
+    "supplier_poll_failed",
+    "supplier_submit_unconfirmed",
+    "scanner_poll_failed",
+    "scanner_submit_unconfirmed",
+    "scanner_recovery_unconfirmed",
+    "plus_unconfirmed",
+    "plus_check_failed",
+}
+MAX_ARCHIVE_BATCH_SIZE = 500
 SCANNER_BASE_URL = "https://customer.i7wap.xyz"
 LEGACY_SCANNER_BASE_URLS = {"https://upi.i7wap.xyz"}
 SETTING_DEFAULTS = {
@@ -879,15 +890,32 @@ class KakaoPipelineService:
             return removed
 
     @staticmethod
-    def _pipeline_for_account(session: Session, account_id: int, *, create: bool = False) -> KakaoPipelineModel | None:
+    def _pipeline_for_account(
+        session: Session,
+        account_id: int,
+        *,
+        create: bool = False,
+        allow_archived: bool = False,
+    ) -> KakaoPipelineModel | None:
         model = session.exec(
             select(KakaoPipelineModel).where(KakaoPipelineModel.account_id == int(account_id))
         ).first()
+        if model is not None and model.archived_at is not None and not allow_archived:
+            raise ValueError("Kakao 流水线已归档，请先恢复后再操作")
         if model is None and create:
             model = KakaoPipelineModel(account_id=int(account_id))
             session.add(model)
             session.flush()
         return model
+
+    @staticmethod
+    def _ensure_account_pipeline_mutable(account_id: int) -> None:
+        with Session(engine) as session:
+            pipeline = session.exec(
+                select(KakaoPipelineModel).where(KakaoPipelineModel.account_id == int(account_id))
+            ).first()
+            if pipeline is not None and pipeline.archived_at is not None:
+                raise ValueError("Kakao 流水线已归档，请先恢复后再操作")
 
     @staticmethod
     def _account_credentials(account_id: int) -> tuple[AccountModel, str, str]:
@@ -923,7 +951,7 @@ class KakaoPipelineService:
             pipeline = session.exec(
                 select(KakaoPipelineModel).where(KakaoPipelineModel.account_id == int(account_id))
             ).first()
-            if pipeline is None:
+            if pipeline is None or pipeline.archived_at is not None:
                 return
             pipeline.updated_at = _utcnow()
             _append_event(pipeline, message, level=level)
@@ -1255,6 +1283,10 @@ class KakaoPipelineService:
                 "last_error_code": "",
                 "last_error_message": "",
                 "latest_event_at": None,
+                "archived_at": None,
+                "archive_reason": "",
+                "archive_disposition": "",
+                "purged_at": None,
                 "post_actions": KakaoPipelineService._serialize_post_actions(
                     None,
                     account_id=account_id,
@@ -1314,6 +1346,10 @@ class KakaoPipelineService:
             "updated_at": model.updated_at.isoformat() if model.updated_at else None,
             "latest_event_at": _text(latest_event.get("time")) or None,
             "completed_at": model.completed_at.isoformat() if model.completed_at else None,
+            "archived_at": model.archived_at.isoformat() if model.archived_at else None,
+            "archive_reason": model.archive_reason,
+            "archive_disposition": model.archive_disposition,
+            "purged_at": model.purged_at.isoformat() if model.purged_at else None,
             "post_actions": KakaoPipelineService._serialize_post_actions(
                 model,
                 context=post_actions_context,
@@ -1329,21 +1365,116 @@ class KakaoPipelineService:
             )
         return payload
 
-    def list_accounts(self, *, search: str = "", page: int = 1, page_size: int = 20) -> dict:
-        result = self.accounts.list_accounts(
-            AccountQuery(platform="chatgpt", email=_text(search), page=max(1, page), page_size=min(max(1, page_size), 100))
+    def list_accounts(
+        self,
+        *,
+        search: str = "",
+        page: int = 1,
+        page_size: int = 20,
+        view: str = "workspace",
+    ) -> dict:
+        selected_view = _text(view).lower() or "workspace"
+        if selected_view not in KAKAO_ACCOUNT_VIEWS:
+            raise ValueError("未知 Kakao 账号视图")
+
+        bounded_page = max(int(page), 1)
+        bounded_page_size = min(max(int(page_size), 1), 100)
+        conditions = [AccountModel.platform == "chatgpt"]
+        search_text = _text(search)
+        if search_text:
+            escaped = (
+                search_text.replace("\\", "\\\\")
+                .replace("%", "\\%")
+                .replace("_", "\\_")
+            )
+            search_condition = AccountModel.email.ilike(f"%{escaped}%", escape="\\")
+            if search_text.isdigit():
+                search_condition = or_(AccountModel.id == int(search_text), search_condition)
+            conditions.append(search_condition)
+
+        completed_condition = and_(
+            or_(
+                KakaoPipelineModel.state == "completed",
+                KakaoPipelineModel.final_result == "plus",
+            ),
+            or_(
+                KakaoPipelineModel.codex_post_action_armed == False,  # noqa: E712
+                KakaoPipelineModel.codex_post_action_done_at.is_not(None),
+            ),
         )
-        account_ids = [int(item.get("id") or 0) for item in result.get("items", [])]
-        pipelines: dict[int, KakaoPipelineModel] = {}
-        if account_ids:
-            with Session(engine) as session:
-                rows = session.exec(
-                    select(KakaoPipelineModel).where(KakaoPipelineModel.account_id.in_(account_ids))
+        if selected_view == "workspace":
+            conditions.extend(
+                [
+                    KakaoPipelineModel.archived_at.is_(None),
+                    or_(
+                        KakaoPipelineModel.id.is_(None),
+                        ~completed_condition,
+                    ),
+                ]
+            )
+        elif selected_view == "completed":
+            conditions.extend(
+                [
+                    KakaoPipelineModel.archived_at.is_(None),
+                    KakaoPipelineModel.id.is_not(None),
+                    completed_condition,
+                ]
+            )
+        elif selected_view == "archived":
+            conditions.append(KakaoPipelineModel.archived_at.is_not(None))
+
+        if selected_view == "archived":
+            ordering = (KakaoPipelineModel.archived_at.desc(), AccountModel.id.desc())
+        elif selected_view == "completed":
+            ordering = (
+                func.coalesce(
+                    KakaoPipelineModel.completed_at,
+                    KakaoPipelineModel.updated_at,
+                ).desc(),
+                AccountModel.id.desc(),
+            )
+        else:
+            ordering = (AccountModel.created_at.desc(), AccountModel.id.desc())
+
+        with Session(engine) as session:
+            count_statement = (
+                select(func.count(AccountModel.id))
+                .select_from(AccountModel)
+                .outerjoin(
+                    KakaoPipelineModel,
+                    KakaoPipelineModel.account_id == AccountModel.id,
+                )
+                .where(*conditions)
+            )
+            total = int(session.exec(count_statement).one())
+            account_models = session.exec(
+                select(AccountModel)
+                .outerjoin(
+                    KakaoPipelineModel,
+                    KakaoPipelineModel.account_id == AccountModel.id,
+                )
+                .where(*conditions)
+                .order_by(*ordering)
+                .offset((bounded_page - 1) * bounded_page_size)
+                .limit(bounded_page_size)
+            ).all()
+            records = self.accounts.repository._load_records(session, list(account_models))
+            page_accounts = [self.accounts._serialize(record) for record in records]
+            account_ids = [int(account.id or 0) for account in account_models]
+            pipeline_rows = (
+                session.exec(
+                    select(KakaoPipelineModel).where(
+                        KakaoPipelineModel.account_id.in_(account_ids)
+                    )
                 ).all()
-                pipelines = {int(item.account_id): item for item in rows}
+                if account_ids
+                else []
+            )
+            pipelines = {int(item.account_id): item for item in pipeline_rows}
+
         post_actions_context = self._load_post_actions_context(account_ids, pipelines)
         items = []
-        for account in result.get("items", []):
+        for account in page_accounts:
             account_id = int(account.get("id") or 0)
             view = account.get("account_view") if isinstance(account.get("account_view"), dict) else {}
             identity = view.get("identity") if isinstance(view.get("identity"), dict) else {}
@@ -1372,7 +1503,347 @@ class KakaoPipelineService:
                     ),
                 }
             )
-        return {**result, "items": items}
+        return {
+            "total": total,
+            "page": bounded_page,
+            "page_size": bounded_page_size,
+            "view": selected_view,
+            "items": items,
+        }
+
+    @staticmethod
+    def _normalize_archive_account_ids(account_ids: list[int]) -> list[int]:
+        raw_ids = list(account_ids or [])
+        if not raw_ids:
+            raise ValueError("至少选择一个账号")
+        if len(raw_ids) > MAX_ARCHIVE_BATCH_SIZE:
+            raise ValueError(f"单次最多处理 {MAX_ARCHIVE_BATCH_SIZE} 个账号")
+        normalized: list[int] = []
+        seen: set[int] = set()
+        for raw_id in raw_ids:
+            try:
+                account_id = int(raw_id)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("账号 ID 必须是正整数") from exc
+            if account_id <= 0:
+                raise ValueError("账号 ID 必须是正整数")
+            if account_id not in seen:
+                seen.add(account_id)
+                normalized.append(account_id)
+        return normalized
+
+    @staticmethod
+    def _archive_batch_result(action: str, items: list[dict]) -> dict:
+        success_count = sum(1 for item in items if item.get("ok"))
+        error_count = len(items) - success_count
+        return {
+            "ok": error_count == 0,
+            "action": action,
+            "total": len(items),
+            "success_count": success_count,
+            "error_count": error_count,
+            "items": items,
+        }
+
+    @staticmethod
+    def _load_archive_pipeline(account_id: int) -> KakaoPipelineModel | None:
+        with Session(engine) as session:
+            pipeline = session.exec(
+                select(KakaoPipelineModel).where(
+                    KakaoPipelineModel.account_id == int(account_id)
+                )
+            ).first()
+            if pipeline is not None:
+                session.expunge(pipeline)
+            return pipeline
+
+    def archive_accounts(
+        self,
+        account_ids: list[int],
+        *,
+        reason: str = "",
+        disposition: str = "auto",
+        force: bool = False,
+    ) -> dict:
+        items: list[dict] = []
+        archive_reason = _text(reason)[:1000]
+        selected_disposition = _text(disposition).lower() or "auto"
+        if selected_disposition not in ARCHIVE_DISPOSITIONS:
+            raise ValueError("未知 Kakao 归档处置类型")
+        for account_id in self._normalize_archive_account_ids(account_ids):
+            try:
+                items.append(
+                    self._archive_account(
+                        account_id,
+                        reason=archive_reason,
+                        disposition=selected_disposition,
+                        force=bool(force),
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001 - batch results are intentionally per account.
+                items.append({"account_id": account_id, "ok": False, "error": str(exc)})
+        return self._archive_batch_result("archive", items)
+
+    def _archive_account(
+        self,
+        account_id: int,
+        *,
+        reason: str,
+        disposition: str,
+        force: bool,
+    ) -> dict:
+        warnings: list[str] = []
+        active_task_ids: list[str] = []
+        changed = False
+        with _account_lock(account_id):
+            with Session(engine) as session:
+                account = session.get(AccountModel, int(account_id))
+                if account is None or account.platform != "chatgpt":
+                    raise ValueError("ChatGPT 账号不存在")
+                pipeline = self._pipeline_for_account(
+                    session,
+                    account_id,
+                    create=True,
+                    allow_archived=True,
+                )
+                assert pipeline is not None
+                linked_task_ids = [
+                    task_id
+                    for task_id in (pipeline.codex_task_id, pipeline.codex_push_task_id)
+                    if task_id
+                ]
+                active_task_ids = [
+                    task_id
+                    for task_id in linked_task_ids
+                    if (
+                        (task := session.get(TaskModel, task_id)) is not None
+                        and task.status in TASK_ACTIVE_STATUSES
+                    )
+                ]
+                if pipeline.archived_at is not None:
+                    if not (force and active_task_ids):
+                        return {
+                            "account_id": account_id,
+                            "ok": True,
+                            "changed": False,
+                            "pipeline": self._serialize_pipeline(pipeline),
+                            "warnings": [],
+                        }
+                else:
+                    pipeline_active = pipeline.state in ACTIVE_STATES
+                    pipeline_uncertain = pipeline.state in ARCHIVE_UNCERTAIN_STATES
+                    if (pipeline_active or pipeline_uncertain or active_task_ids) and not force:
+                        raise ValueError("Kakao 流水线或关联本地任务仍在执行；请使用 force 强制归档")
+
+                    now = _utcnow()
+                    pipeline_completed = (
+                        pipeline.state == "completed" or pipeline.final_result == "plus"
+                    )
+                    if disposition == "completed" and not pipeline_completed:
+                        raise ValueError("尚未完成的 Kakao 流水线不能归档为 completed")
+                    if disposition == "abandoned" and pipeline_completed:
+                        raise ValueError("已完成的 Kakao 流水线不能归档为 abandoned")
+                    pipeline.archived_at = now
+                    pipeline.archive_reason = reason
+                    pipeline.archive_disposition = (
+                        ("completed" if pipeline_completed else "abandoned")
+                        if disposition == "auto"
+                        else disposition
+                    )
+                    pipeline.updated_at = now
+                    if (pipeline_active or pipeline_uncertain) and force:
+                        warnings.append(
+                            "已强制归档；远端供应商/扫码任务或最终结果无法从本地取消或确认，可能仍会继续执行"
+                        )
+                    _append_event(
+                        pipeline,
+                        "Kakao 流水线已归档",
+                        level="warning" if warnings else "info",
+                        detail={
+                            "reason": reason,
+                            "disposition": pipeline.archive_disposition,
+                            "forced": bool(force),
+                        },
+                    )
+                    session.add(pipeline)
+                    session.commit()
+                    changed = True
+
+            if force and active_task_ids:
+                from application.tasks import request_cancel
+
+                for task_id in active_task_ids:
+                    try:
+                        request_cancel(task_id)
+                    except Exception as exc:  # noqa: BLE001 - archive already blocks further advancement.
+                        warnings.append(f"关联本地任务 {task_id} 取消失败: {exc}")
+
+            pipeline = self._load_archive_pipeline(account_id)
+            assert pipeline is not None
+            return {
+                "account_id": account_id,
+                "ok": True,
+                "changed": changed,
+                "pipeline": self._serialize_pipeline(pipeline),
+                "warnings": warnings,
+            }
+
+    def restore_accounts(self, account_ids: list[int]) -> dict:
+        items: list[dict] = []
+        for account_id in self._normalize_archive_account_ids(account_ids):
+            try:
+                items.append(self._restore_account(account_id))
+            except Exception as exc:  # noqa: BLE001 - batch results are intentionally per account.
+                items.append({"account_id": account_id, "ok": False, "error": str(exc)})
+        return self._archive_batch_result("restore", items)
+
+    def _restore_account(self, account_id: int) -> dict:
+        with _account_lock(account_id):
+            with Session(engine) as session:
+                pipeline = self._pipeline_for_account(
+                    session,
+                    account_id,
+                    allow_archived=True,
+                )
+                if pipeline is None or pipeline.archived_at is None:
+                    raise ValueError("Kakao 流水线未归档")
+                if pipeline.purged_at is not None:
+                    raise ValueError("Kakao 归档已清除详情，不能恢复")
+                disposition = pipeline.archive_disposition
+                pipeline.archived_at = None
+                pipeline.archive_reason = ""
+                pipeline.archive_disposition = ""
+                pipeline.updated_at = _utcnow()
+                _append_event(
+                    pipeline,
+                    "Kakao 流水线已从归档恢复",
+                    detail={"previous_disposition": disposition},
+                )
+                session.add(pipeline)
+                session.commit()
+                return {
+                    "account_id": account_id,
+                    "ok": True,
+                    "changed": True,
+                    "pipeline": self._serialize_pipeline(pipeline),
+                    "warnings": [],
+                }
+
+    def purge_archived_accounts(self, account_ids: list[int]) -> dict:
+        items: list[dict] = []
+        for account_id in self._normalize_archive_account_ids(account_ids):
+            try:
+                items.append(self._purge_archived_account(account_id))
+            except Exception as exc:  # noqa: BLE001 - batch results are intentionally per account.
+                items.append({"account_id": account_id, "ok": False, "error": str(exc)})
+        return self._archive_batch_result("purge", items)
+
+    def _purge_archived_account(self, account_id: int) -> dict:
+        with _account_lock(account_id):
+            with Session(engine) as session:
+                pipeline = self._pipeline_for_account(
+                    session,
+                    account_id,
+                    allow_archived=True,
+                )
+                if pipeline is None or pipeline.archived_at is None:
+                    raise ValueError("只能清除已归档的 Kakao 流水线")
+                if pipeline.purged_at is not None:
+                    return {
+                        "account_id": account_id,
+                        "ok": True,
+                        "changed": False,
+                        "pipeline": self._serialize_pipeline(pipeline),
+                        "warnings": [],
+                    }
+
+                active_task_ids = [
+                    task_id
+                    for task_id in (pipeline.codex_task_id, pipeline.codex_push_task_id)
+                    if task_id
+                    and (
+                        (task := session.get(TaskModel, task_id)) is not None
+                        and task.status in TASK_ACTIVE_STATUSES
+                    )
+                ]
+                if active_task_ids:
+                    raise ValueError("关联本地任务仍在取消或执行，请稍后再清除")
+
+                self._clear_pipeline_for_purge(pipeline)
+                session.add(pipeline)
+                session.commit()
+                return {
+                    "account_id": account_id,
+                    "ok": True,
+                    "changed": True,
+                    "pipeline": self._serialize_pipeline(pipeline),
+                    "warnings": [],
+                }
+
+    @staticmethod
+    def _clear_pipeline_for_purge(pipeline: KakaoPipelineModel) -> None:
+        now = _utcnow()
+        pipeline.state = "idle"
+        pipeline.payment_method = "kakao_pay"
+        pipeline.supplier_setting_id = None
+        pipeline.supplier_name = ""
+        pipeline.supplier_base_url = ""
+        pipeline.supplier_cdk_key = ""
+        pipeline.supplier_order_id = ""
+        pipeline.supplier_customer_token = ""
+        pipeline.supplier_poll_url = ""
+        pipeline.supplier_status = ""
+        pipeline.set_supplier_response({})
+        pipeline.supplier_processing_started_at = None
+        pipeline.supplier_deadline_at = None
+        pipeline.payment_url = ""
+        pipeline.scanner_setting_id = None
+        pipeline.scanner_driver = "customer_api"
+        pipeline.scanner_name = ""
+        pipeline.scanner_base_url = ""
+        pipeline.scanner_cdk_key = ""
+        pipeline.scanner_order_id = ""
+        pipeline.scanner_customer_token = ""
+        pipeline.scanner_poll_url = ""
+        pipeline.scanner_status = ""
+        pipeline.set_scanner_response({})
+        pipeline.scan_url = ""
+        pipeline.scan_expires_at = ""
+        pipeline.scanner_submit_attempts = 0
+        pipeline.scanner_compensation_attempted = False
+        pipeline.scanner_poll_failures = 0
+        pipeline.scanner_recovery_reason = ""
+        pipeline.scanner_recovery_check_count = 0
+        pipeline.scanner_recovery_started_at = None
+        pipeline.scanner_recovery_next_check_at = None
+        pipeline.scanner_recovery_deadline_at = None
+        pipeline.scanner_processing_started_at = None
+        pipeline.scanner_deadline_at = None
+        pipeline.plus_status = ""
+        pipeline.final_result = ""
+        pipeline.completion_source = ""
+        pipeline.plus_check_count = 0
+        pipeline.plus_check_started_at = None
+        pipeline.plus_next_check_at = None
+        pipeline.plus_check_deadline_at = None
+        pipeline.plus_check_paused_at = None
+        pipeline.codex_post_action_armed = False
+        pipeline.codex_task_id = ""
+        pipeline.codex_attempt_count = 0
+        pipeline.codex_interrupted_retry_count = 0
+        pipeline.codex_skipped_at = None
+        pipeline.codex_enqueue_error = ""
+        pipeline.codex_push_task_id = ""
+        pipeline.codex_push_attempt_count = 0
+        pipeline.codex_push_skip_reason = ""
+        pipeline.codex_push_enqueue_error = ""
+        pipeline.codex_post_action_done_at = None
+        pipeline.last_error_code = ""
+        pipeline.last_error_message = ""
+        pipeline.set_events([])
+        pipeline.completed_at = None
+        pipeline.purged_at = now
+        pipeline.updated_at = now
 
     @staticmethod
     def _post_action_run_key(pipeline: KakaoPipelineModel) -> str:
@@ -1391,7 +1862,9 @@ class KakaoPipelineService:
     @staticmethod
     def _post_actions_need_background(session: Session, pipeline: KakaoPipelineModel) -> bool:
         if (
-            pipeline.state != "completed"
+            pipeline.archived_at is not None
+            or pipeline.purged_at is not None
+            or pipeline.state != "completed"
             or pipeline.final_result != "plus"
             or not bool(pipeline.codex_post_action_armed)
         ):
@@ -1769,6 +2242,7 @@ class KakaoPipelineService:
             bounded_limit = min(max(int(limit), 1), 500)
             remote_rows = session.exec(
                 select(KakaoPipelineModel)
+                .where(KakaoPipelineModel.archived_at.is_(None))
                 .where(KakaoPipelineModel.state.in_(REMOTE_BACKGROUND_POLL_STATES))
                 .where(
                     or_(
@@ -1798,6 +2272,7 @@ class KakaoPipelineService:
             if remaining > 0:
                 post_rows = session.exec(
                     select(KakaoPipelineModel)
+                    .where(KakaoPipelineModel.archived_at.is_(None))
                     .where(KakaoPipelineModel.state == "completed")
                     .where(KakaoPipelineModel.final_result == "plus")
                     .where(KakaoPipelineModel.codex_post_action_armed == True)  # noqa: E712
@@ -1926,7 +2401,7 @@ class KakaoPipelineService:
 
     def get_account_pipeline(self, account_id: int) -> dict:
         with Session(engine) as session:
-            model = self._pipeline_for_account(session, account_id)
+            model = self._pipeline_for_account(session, account_id, allow_archived=True)
             if model is None:
                 raise ValueError("账号还没有 Kakao 操作记录")
             return self._serialize_pipeline(model, detail=True)
@@ -1955,6 +2430,7 @@ class KakaoPipelineService:
         enable_post_actions: bool = False,
     ) -> dict:
         with _account_lock(account_id):
+            self._ensure_account_pipeline_mutable(account_id)
             if self._account_is_plus(account_id):
                 raise ValueError("当前账号已经是 Plus，无需再次提链扫码")
             _, access_token, _ = self._account_credentials(account_id)

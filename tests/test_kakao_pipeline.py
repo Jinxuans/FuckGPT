@@ -1724,33 +1724,35 @@ def test_kakao_account_list_uses_local_accounts_without_exposing_tokens(client):
 
 
 def test_kakao_account_list_exposes_phone_and_codex_status_without_secrets(monkeypatch):
+    from domain.accounts import AccountRecord
+
+    account_id = _create_account("status@test.com")
     service = KakaoPipelineService()
     monkeypatch.setattr(
-        service.accounts,
-        "list_accounts",
-        lambda _query: {
-            "total": 1,
-            "items": [
-                {
-                    "id": 321,
-                    "email": "status@test.com",
-                    "account_view": {
-                        "identity": {"email": "status@test.com"},
-                        "status": {"validity": "valid", "checked_at": "2026-08-01T08:00:00"},
-                        "subscription": {"plan": "plus", "state": "subscribed"},
-                        "security": {
-                            "phone_bound": True,
-                            "phone_number_masked": "+86****1234",
-                        },
-                        "codex": {
-                            "authorized": True,
-                            "has_access_token": True,
-                            "access_token": "must-not-leak",
-                        },
+        service.accounts.repository,
+        "_load_records",
+        lambda _session, _models: [
+            AccountRecord(
+                id=account_id,
+                platform="chatgpt",
+                email="status@test.com",
+                password="must-not-leak-password",
+                account_view={
+                    "identity": {"email": "status@test.com"},
+                    "status": {"validity": "valid", "checked_at": "2026-08-01T08:00:00"},
+                    "subscription": {"plan": "plus", "state": "subscribed"},
+                    "security": {
+                        "phone_bound": True,
+                        "phone_number_masked": "+86****1234",
                     },
-                }
-            ],
-        },
+                    "codex": {
+                        "authorized": True,
+                        "has_access_token": True,
+                        "access_token": "must-not-leak",
+                    },
+                },
+            )
+        ],
     )
 
     payload = service.list_accounts()
@@ -2377,3 +2379,362 @@ def test_kakao_reset_protects_and_force_cancels_active_codex_task():
         auth = session.get(AccountCodexAuthModel, account_id)
         assert task is not None and task.status == "cancelled"
         assert auth is not None and auth.has_access_token is True
+
+
+def test_kakao_archive_views_use_sql_pagination_and_only_hydrate_current_page(monkeypatch):
+    from sqlmodel import Session
+
+    from core.db import engine
+
+    idle_id = _create_account("archive-idle@test.com")
+    failed_id = _create_account("archive-failed@test.com")
+    completed_id = _create_account("archive-completed@test.com")
+    completed_older_result_id = _create_account("archive-completed-older@test.com")
+    tail_pending_id = _create_account("archive-tail-pending@test.com")
+    archived_id = _create_account("archive-hidden@test.com")
+    purged_id = _create_account("archive-purged@test.com")
+    now = datetime.now(timezone.utc)
+    with Session(engine) as session:
+        session.add(KakaoPipelineModel(account_id=failed_id, state="supplier_failed"))
+        session.add(
+            KakaoPipelineModel(
+                account_id=completed_id,
+                state="completed",
+                final_result="plus",
+                completed_at=now,
+            )
+        )
+        session.add(
+            KakaoPipelineModel(
+                account_id=completed_older_result_id,
+                state="completed",
+                final_result="plus",
+                completed_at=now - timedelta(minutes=5),
+            )
+        )
+        session.add(
+            KakaoPipelineModel(
+                account_id=tail_pending_id,
+                state="completed",
+                final_result="plus",
+                completed_at=now,
+                codex_post_action_armed=True,
+                codex_post_action_done_at=None,
+            )
+        )
+        session.add(
+            KakaoPipelineModel(
+                account_id=archived_id,
+                state="supplier_failed",
+                archived_at=now,
+                archive_disposition="abandoned",
+            )
+        )
+        session.add(
+            KakaoPipelineModel(
+                account_id=purged_id,
+                state="idle",
+                archived_at=now - timedelta(minutes=5),
+                archive_disposition="abandoned",
+                purged_at=now,
+            )
+        )
+        session.commit()
+
+    service = KakaoPipelineService()
+    original_load = service.accounts.repository._load_records
+    hydrated: list[list[int]] = []
+
+    def tracked_load(session, models):
+        hydrated.append([int(model.id or 0) for model in models])
+        return original_load(session, models)
+
+    monkeypatch.setattr(service.accounts.repository, "_load_records", tracked_load)
+
+    workspace = service.list_accounts()
+    completed = service.list_accounts(view="completed")
+    archived = service.list_accounts(view="archived")
+    all_page = service.list_accounts(view="all", page=2, page_size=2)
+
+    assert {item["id"] for item in workspace["items"]} == {
+        idle_id,
+        failed_id,
+        tail_pending_id,
+    }
+    assert [item["id"] for item in completed["items"]] == [
+        completed_id,
+        completed_older_result_id,
+    ]
+    assert [item["id"] for item in archived["items"]] == [archived_id, purged_id]
+    assert all_page["total"] == 7
+    assert len(all_page["items"]) == 2
+    assert len(hydrated[-1]) == 2
+    assert service.list_accounts(search=str(completed_id), view="all")["items"][0]["id"] == completed_id
+    assert service.list_accounts(search="ARCHIVE-COMPLETED@TEST", view="all")["total"] == 1
+
+
+def test_kakao_archive_schema_helpers_migrate_legacy_table_idempotently(monkeypatch):
+    from sqlalchemy import create_engine, inspect
+    from sqlmodel import SQLModel
+
+    from core import db as db_module
+
+    legacy_engine = create_engine("sqlite://")
+    with legacy_engine.begin() as connection:
+        connection.exec_driver_sql(
+            "CREATE TABLE kakao_pipelines ("
+            "id INTEGER PRIMARY KEY, "
+            "account_id INTEGER NOT NULL UNIQUE, "
+            "state TEXT NOT NULL DEFAULT 'idle', "
+            "final_result TEXT NOT NULL DEFAULT '', "
+            "updated_at DATETIME"
+            ")"
+        )
+
+    monkeypatch.setattr(db_module, "engine", legacy_engine)
+    SQLModel.metadata.create_all(legacy_engine)
+    for column_name, column_type in (
+        ("archived_at", "DATETIME"),
+        ("archive_reason", "TEXT DEFAULT ''"),
+        ("archive_disposition", "TEXT DEFAULT ''"),
+        ("purged_at", "DATETIME"),
+    ):
+        db_module._ensure_column("kakao_pipelines", column_name, column_type)
+    for _ in range(2):
+        db_module._ensure_index(
+            "kakao_pipelines",
+            "ix_kakao_pipelines_archive_state_updated",
+            ("archived_at", "state", "final_result", "updated_at", "id"),
+        )
+        db_module._ensure_index(
+            "kakao_pipelines",
+            "ix_kakao_pipelines_archive_purged",
+            ("archived_at", "purged_at"),
+        )
+    SQLModel.metadata.create_all(legacy_engine)
+
+    inspector = inspect(legacy_engine)
+    columns = {item["name"] for item in inspector.get_columns("kakao_pipelines")}
+    indexes = [item["name"] for item in inspector.get_indexes("kakao_pipelines")]
+    assert {"archived_at", "archive_reason", "archive_disposition", "purged_at"} <= columns
+    assert indexes.count("ix_kakao_pipelines_archive_state_updated") == 1
+    assert indexes.count("ix_kakao_pipelines_archive_purged") == 1
+
+
+def test_kakao_archive_creates_idle_row_and_restore_preserves_account():
+    from sqlmodel import Session
+
+    from core.db import AccountModel, engine
+
+    account_id = _create_account("archive-create-idle@test.com")
+    service = KakaoPipelineService()
+
+    archived = service.archive_accounts([account_id], reason="operator cleanup")
+
+    assert archived["ok"] is True
+    assert archived["items"][0]["pipeline"]["archive_disposition"] == "abandoned"
+    assert service.list_accounts(view="workspace")["total"] == 0
+    assert service.list_accounts(view="archived")["items"][0]["id"] == account_id
+
+    restored = service.restore_accounts([account_id])
+
+    assert restored["ok"] is True
+    assert restored["items"][0]["pipeline"]["archived_at"] is None
+    assert service.list_accounts(view="workspace")["items"][0]["id"] == account_id
+    with Session(engine) as session:
+        assert session.get(AccountModel, account_id) is not None
+
+
+def test_kakao_archive_active_requires_force_and_purge_waits_for_local_task():
+    from sqlmodel import Session
+
+    from core.db import engine
+
+    account_id = _create_account("archive-active@test.com")
+    task_id = "archive-running-task"
+    with Session(engine) as session:
+        session.add(TaskModel(id=task_id, type="codex_oauth_batch", status="running"))
+        session.add(
+            KakaoPipelineModel(
+                account_id=account_id,
+                state="scanner_processing",
+                scanner_order_id="remote-order",
+                codex_task_id=task_id,
+            )
+        )
+        session.commit()
+
+    service = KakaoPipelineService()
+    refused = service.archive_accounts([account_id])
+    assert refused["ok"] is False
+    assert "force" in refused["items"][0]["error"]
+
+    forced = service.archive_accounts([account_id], force=True)
+    assert forced["ok"] is True
+    assert forced["items"][0]["warnings"]
+    with Session(engine) as session:
+        task = session.get(TaskModel, task_id)
+        assert task is not None and task.status == "cancel_requested"
+
+    blocked_purge = service.purge_archived_accounts([account_id])
+    assert blocked_purge["ok"] is False
+    assert "稍后再清除" in blocked_purge["items"][0]["error"]
+
+
+def test_kakao_force_archive_retries_cancel_for_already_archived_task(monkeypatch):
+    from application import tasks as task_module
+    from core.db import engine
+    from sqlmodel import Session
+
+    account_id = _create_account("archive-retry-cancel@test.com")
+    task_id = "archive-retry-running-task"
+    with Session(engine) as session:
+        session.add(TaskModel(id=task_id, type="codex_oauth_batch", status="running"))
+        session.add(
+            KakaoPipelineModel(
+                account_id=account_id,
+                state="completed",
+                final_result="plus",
+                codex_task_id=task_id,
+            )
+        )
+        session.commit()
+
+    real_request_cancel = task_module.request_cancel
+    attempts: list[str] = []
+
+    def fail_once(current_task_id: str):
+        attempts.append(current_task_id)
+        if len(attempts) == 1:
+            raise RuntimeError("temporary cancel failure")
+        return real_request_cancel(current_task_id)
+
+    monkeypatch.setattr(task_module, "request_cancel", fail_once)
+    service = KakaoPipelineService()
+
+    first = service.archive_accounts([account_id], force=True)
+    assert first["ok"] is True
+    assert first["items"][0]["changed"] is True
+    assert "取消失败" in first["items"][0]["warnings"][-1]
+
+    retried = service.archive_accounts([account_id], force=True)
+    assert retried["ok"] is True
+    assert retried["items"][0]["changed"] is False
+    assert attempts == [task_id, task_id]
+    with Session(engine) as session:
+        task = session.get(TaskModel, task_id)
+        assert task is not None and task.status == "cancel_requested"
+
+
+def test_kakao_purge_keeps_tombstone_and_clears_sensitive_details():
+    from sqlmodel import Session
+
+    from core.db import AccountModel, engine
+
+    account_id = _create_account("archive-purge@test.com")
+    now = datetime.now(timezone.utc)
+    with Session(engine) as session:
+        pipeline = KakaoPipelineModel(
+            account_id=account_id,
+            state="supplier_failed",
+            supplier_base_url="https://supplier.example",
+            supplier_cdk_key="secret-cdk",
+            supplier_customer_token="secret-token",
+            supplier_order_id="secret-order",
+            payment_url="https://pay.example/secret",
+            scanner_cdk_key="scanner-secret",
+            codex_task_id="old-task-detail",
+            archived_at=now,
+            archive_reason="privacy cleanup",
+            archive_disposition="abandoned",
+        )
+        pipeline.set_supplier_response({"customerToken": "response-secret"})
+        pipeline.set_scanner_response({"secret": "scanner-response-secret"})
+        pipeline.set_events([{"message": "secret event"}])
+        session.add(pipeline)
+        session.commit()
+
+    service = KakaoPipelineService()
+    purged = service.purge_archived_accounts([account_id])
+
+    assert purged["ok"] is True
+    detail = service.get_account_pipeline(account_id)
+    assert detail["purged_at"] is not None
+    assert detail["archived_at"] is not None
+    assert detail["archive_reason"] == "privacy cleanup"
+    assert detail["state"] == "idle"
+    assert detail["events"] == []
+    assert detail["supplier_response"] == {}
+    assert detail["scanner_response"] == {}
+    assert "secret" not in str(detail).lower()
+    assert service.restore_accounts([account_id])["ok"] is False
+    with Session(engine) as session:
+        assert session.get(AccountModel, account_id) is not None
+        tombstone = session.exec(
+            select(KakaoPipelineModel).where(KakaoPipelineModel.account_id == account_id)
+        ).one()
+        assert tombstone.supplier_cdk_key == ""
+        assert tombstone.codex_task_id == ""
+
+
+def test_archived_pipeline_is_not_reconciled_and_original_operations_reject_it():
+    from sqlmodel import Session
+
+    from core.db import engine
+
+    account_id = _create_account("archive-guard@test.com")
+    with Session(engine) as session:
+        session.add(
+            KakaoPipelineModel(
+                account_id=account_id,
+                state="supplier_processing",
+                supplier_order_id="must-not-poll",
+                archived_at=datetime.now(timezone.utc),
+                archive_disposition="abandoned",
+            )
+        )
+        session.commit()
+
+    service = KakaoPipelineService()
+
+    assert service.list_background_work() == []
+    assert service.get_account_pipeline(account_id)["archived_at"] is not None
+    with pytest.raises(ValueError, match="已归档"):
+        service.advance_background(account_id, expected_state="supplier_processing")
+    with pytest.raises(ValueError, match="已归档"):
+        service.start_extraction(account_id)
+    with pytest.raises(ValueError, match="已归档"):
+        service.reset(account_id, force=True)
+
+
+def test_kakao_archive_api_supports_archive_restore_and_purge(client):
+    account_id = _create_account("archive-api@test.com")
+
+    archived = client.post(
+        "/api/kakao-pipeline/archive",
+        json={
+            "account_ids": [account_id],
+            "reason": "api archive",
+            "disposition": "auto",
+        },
+    )
+    assert archived.status_code == 200
+    assert archived.json()["items"][0]["pipeline"]["archive_disposition"] == "abandoned"
+
+    restored = client.post(
+        "/api/kakao-pipeline/archive/restore",
+        json={"account_ids": [account_id]},
+    )
+    assert restored.status_code == 200
+    assert restored.json()["items"][0]["pipeline"]["archived_at"] is None
+
+    client.post(
+        "/api/kakao-pipeline/archive",
+        json={"account_ids": [account_id], "disposition": "abandoned"},
+    )
+    purged = client.post(
+        "/api/kakao-pipeline/archive/purge",
+        json={"account_ids": [account_id]},
+    )
+    assert purged.status_code == 200
+    assert purged.json()["items"][0]["pipeline"]["purged_at"] is not None
