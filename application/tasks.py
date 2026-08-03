@@ -80,6 +80,21 @@ _task_locks: dict[str, threading.Lock] = {}
 _task_locks_guard = threading.Lock()
 
 
+def _shutdown_task_pool(
+    pool: ThreadPoolExecutor,
+    *,
+    cancel_futures: bool = False,
+) -> None:
+    """Keep the parent task alive until every started child worker exits.
+
+    The runtime accounts concurrency and account locks by the parent task
+    thread.  ``wait=False`` would let that thread disappear while already
+    running futures continue in the background, prematurely releasing both
+    protections after a cancellation request.
+    """
+    pool.shutdown(wait=True, cancel_futures=cancel_futures)
+
+
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -137,7 +152,11 @@ def _task_account_keys(task_type: str, payload: dict[str, Any]) -> list[str]:
         account_id = int(payload.get("account_id", 0) or 0)
         if account_id > 0:
             return [f"account:{account_id}"]
-    if task_type in {TASK_TYPE_CODEX_OAUTH_BATCH, TASK_TYPE_RELOGIN_BATCH}:
+    if task_type in {
+        TASK_TYPE_ACCOUNT_CHECK_ALL,
+        TASK_TYPE_CODEX_OAUTH_BATCH,
+        TASK_TYPE_RELOGIN_BATCH,
+    }:
         return [
             f"account:{int(item)}"
             for item in payload.get("account_ids", [])
@@ -171,6 +190,21 @@ def _workflow_child_scope(task_type: str, platform: str, payload: dict[str, Any]
 
 
 def _task_scope(task_type: str, platform: str, payload: dict[str, Any], *, task_id: str = "") -> str:
+    if task_type == TASK_TYPE_CODEX_OAUTH_BATCH:
+        account_ids = sorted(
+            {
+                int(item)
+                for item in payload.get("account_ids", [])
+                if int(item or 0) > 0
+            }
+        )
+        if len(account_ids) == 1:
+            return f"{platform}:{task_type}:account:{account_ids[0]}"
+        if account_ids:
+            # One scope cannot represent several independent accounts.  Give
+            # a multi-account batch its own scope; account keys below still
+            # prevent any overlapping account from running concurrently.
+            return f"{platform}:{task_type}:batch:{task_id or 'pending'}"
     if _is_workflow_child_task(payload):
         return _workflow_child_scope(task_type, platform, payload, task_id=task_id)
     if task_type == TASK_TYPE_PLATFORM_ACTION and str(payload.get("action_id") or "") == "codex_oauth_authorize":
@@ -643,10 +677,13 @@ def _request_cancel_mutation(task: TaskModel) -> None:
 
 def claim_next_runnable_task(
     *,
+    running_type_counts: dict[str, int] | None = None,
     running_scope_counts: dict[str, int] | None = None,
     busy_account_keys: set[str] | None = None,
-    max_parallel_per_scope: int = 1,
+    max_parallel_per_type: int = 10,
+    max_parallel_per_scope: int = 10,
 ) -> Optional[dict[str, Any]]:
+    running_type_counts = dict(running_type_counts or {})
     running_scope_counts = dict(running_scope_counts or {})
     busy_account_keys = set(busy_account_keys or set())
     with Session(engine) as session:
@@ -657,9 +694,12 @@ def claim_next_runnable_task(
         ).all()
         for task in tasks:
             payload = task.get_payload()
+            task_type = str(task.type or "")
             platform = task.platform or str(payload.get("platform", "") or "")
-            account_keys = _task_account_keys(task.type, payload)
-            scope = _task_scope(task.type, platform, payload, task_id=task.id)
+            account_keys = _task_account_keys(task_type, payload)
+            scope = _task_scope(task_type, platform, payload, task_id=task.id)
+            if running_type_counts.get(task_type, 0) >= max_parallel_per_type:
+                continue
             if scope and running_scope_counts.get(scope, 0) >= max_parallel_per_scope:
                 continue
             if account_keys and busy_account_keys.intersection(account_keys):
@@ -669,7 +709,7 @@ def claim_next_runnable_task(
             task.updated_at = _utcnow()
             session.add(task)
             session.commit()
-            return {"id": task.id, "platform": platform, "type": task.type, "scope": scope, "account_keys": account_keys}
+            return {"id": task.id, "platform": platform, "type": task_type, "scope": scope, "account_keys": account_keys}
     return None
 
 
@@ -811,22 +851,46 @@ class TaskLogger:
         _mutate_task(self.task_id, _update)
 
     def finish(self, status: str, *, error: str = "") -> None:
-        current_status = self._status()
-        if current_status in TERMINAL_TASK_STATUSES and current_status != status:
-            return
+        outcome: dict[str, Any] = {
+            "applied": False,
+            "status": status,
+            "error": error,
+        }
+
         def _update(task: TaskModel) -> None:
-            task.status = status
+            current_status = str(task.status or "")
+            if current_status in TERMINAL_TASK_STATUSES and current_status != status:
+                return
+
+            final_status = status
+            final_error = error
+            if current_status == TASK_STATUS_CANCEL_REQUESTED:
+                final_status = TASK_STATUS_CANCELLED
+                if status != TASK_STATUS_CANCELLED or not final_error:
+                    final_error = str(task.error or "任务已取消")
+
+            task.status = final_status
             task.finished_at = _utcnow()
-            if error:
-                task.error = error
+            if final_error:
+                task.error = final_error
+            outcome.update(
+                applied=True,
+                status=final_status,
+                error=final_error,
+            )
 
         _mutate_task(self.task_id, _update)
-        event_level = "error" if status == TASK_STATUS_FAILED else ("warning" if status in {TASK_STATUS_INTERRUPTED, TASK_STATUS_CANCELLED} else "info")
+        if not outcome["applied"]:
+            return
+
+        final_status = str(outcome["status"])
+        final_error = str(outcome["error"] or "")
+        event_level = "error" if final_status == TASK_STATUS_FAILED else ("warning" if final_status in {TASK_STATUS_INTERRUPTED, TASK_STATUS_CANCELLED} else "info")
         self.log(
-            f"任务结束: {status}",
+            f"任务结束: {final_status}",
             level=event_level,
             event_type="state",
-            detail={"status": status, "error": error},
+            detail={"status": final_status, "error": final_error},
         )
 
 
@@ -1369,7 +1433,7 @@ def _execute_configured_account_check_task(payload: dict[str, Any], logger: Task
                 completed += 1
                 logger.set_progress(completed, total)
     finally:
-        pool.shutdown(wait=not cancelled, cancel_futures=cancelled)
+        _shutdown_task_pool(pool, cancel_futures=cancelled)
         worker_proxy_manager.clear_scope(task_id)
 
     logger.set_result_data(results)
@@ -1827,7 +1891,7 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
         return
     finally:
         if pool is not None:
-            pool.shutdown(wait=not cancel_pool, cancel_futures=cancel_pool)
+            _shutdown_task_pool(pool, cancel_futures=cancel_pool)
         if hasattr(shared_mailbox, "shutdown_prefetch"):
             try:
                 shared_mailbox.shutdown_prefetch()
@@ -2077,7 +2141,7 @@ def _execute_codex_oauth_batch_task(payload: dict[str, Any], logger: TaskLogger)
                 next_index += 1
     finally:
         if pool is not None:
-            pool.shutdown(wait=not cancel_pool, cancel_futures=cancel_pool)
+            _shutdown_task_pool(pool, cancel_futures=cancel_pool)
         from core.worker_proxy import worker_proxy_manager
 
         worker_proxy_manager.clear_scope(task_id)
@@ -2193,7 +2257,7 @@ def _execute_relogin_batch_task(payload: dict[str, Any], logger: TaskLogger) -> 
                 next_index += 1
     finally:
         if pool is not None:
-            pool.shutdown(wait=not cancel_pool, cancel_futures=cancel_pool)
+            _shutdown_task_pool(pool, cancel_futures=cancel_pool)
         from core.worker_proxy import worker_proxy_manager
 
         worker_proxy_manager.clear_scope(task_id)
@@ -2214,6 +2278,10 @@ def _execute_account_push_task(payload: dict[str, Any], logger: TaskLogger) -> N
     from application.account_pushes import AccountPushService
     from domain.accounts import AccountExportSelection
 
+    if logger.is_cancel_requested():
+        logger.finish(TASK_STATUS_CANCELLED, error="任务已取消")
+        return
+
     platform = str(payload.get("platform") or "chatgpt")
     account_ids = [
         int(item)
@@ -2230,10 +2298,17 @@ def _execute_account_push_task(payload: dict[str, Any], logger: TaskLogger) -> N
             payload_format=payload_format,
         )
     except Exception as exc:  # noqa: BLE001
+        if logger.is_cancel_requested():
+            logger.finish(TASK_STATUS_CANCELLED, error="任务已取消")
+            return
         error = str(exc)
         logger.record_error(error)
         logger.log(f"账号后台推送失败: {error}", level="error")
         logger.finish(TASK_STATUS_FAILED, error=error)
+        return
+
+    if logger.is_cancel_requested():
+        logger.finish(TASK_STATUS_CANCELLED, error="任务已取消")
         return
 
     for item in result.get("results", []):

@@ -7,11 +7,8 @@ import threading
 import time
 
 from application.tasks import (
-    TASK_STATUS_CANCEL_REQUESTED,
-    TERMINAL_TASK_STATUSES,
     claim_next_runnable_task,
     execute_task,
-    get_task,
     mark_incomplete_tasks_interrupted,
 )
 
@@ -37,23 +34,38 @@ class TaskRuntime:
     def __init__(
         self,
         *,
+        max_parallel_per_type: int | None = None,
+        # Backward-compatible constructor alias.  It no longer represents a
+        # global limit; callers should migrate to ``max_parallel_per_type``.
         max_parallel_tasks: int | None = None,
         max_parallel_per_scope: int | None = None,
         poll_interval: float = 0.5,
     ):
-        self.max_parallel_tasks = _bounded_int(
-            max_parallel_tasks if max_parallel_tasks is not None else os.environ.get("TASK_MAX_PARALLEL"),
+        configured_per_type = max_parallel_per_type
+        if configured_per_type is None:
+            configured_per_type = max_parallel_tasks
+        if configured_per_type is None:
+            configured_per_type = os.environ.get("TASK_MAX_PARALLEL_PER_TYPE")
+        if configured_per_type in (None, ""):
+            # Preserve the old setting as a per-type limit.  It no longer
+            # limits the sum of unrelated task types.
+            configured_per_type = os.environ.get("TASK_MAX_PARALLEL")
+        self.max_parallel_per_type = _bounded_int(
+            configured_per_type,
             10,
             minimum=1,
-            maximum=100,
+            maximum=10,
         )
+        # Read-only compatibility for callers that still inspect the old
+        # attribute.  Its meaning is now explicitly per task type.
+        self.max_parallel_tasks = self.max_parallel_per_type
         self.max_parallel_per_scope = _bounded_int(
             max_parallel_per_scope
             if max_parallel_per_scope is not None
             else os.environ.get("TASK_MAX_PARALLEL_PER_SCOPE"),
-            1,
+            10,
             minimum=1,
-            maximum=50,
+            maximum=10,
         )
         self.poll_interval = poll_interval
         self._running = False
@@ -83,11 +95,13 @@ class TaskRuntime:
     def _loop(self) -> None:
         while self._running:
             self._reap_workers()
-            available_slots, running_scope_counts, busy_account_keys = self._accounting_snapshot()
-            while available_slots > 0 and self._running:
+            running_type_counts, running_scope_counts, busy_account_keys = self._accounting_snapshot()
+            while self._running:
                 task_info = claim_next_runnable_task(
+                    running_type_counts=running_type_counts,
                     running_scope_counts=running_scope_counts,
                     busy_account_keys=busy_account_keys,
+                    max_parallel_per_type=self.max_parallel_per_type,
                     max_parallel_per_scope=self.max_parallel_per_scope,
                 )
                 if not task_info:
@@ -107,39 +121,40 @@ class TaskRuntime:
                         scope=str(task_info.get("scope", "") or ""),
                         account_keys=set(task_info.get("account_keys") or []),
                     )
+                    task_type = str(task_info.get("type", "") or "")
+                    running_type_counts[task_type] = running_type_counts.get(task_type, 0) + 1
                     if task_info.get("scope"):
                         scope = str(task_info["scope"])
                         running_scope_counts[scope] = running_scope_counts.get(scope, 0) + 1
                     busy_account_keys.update(set(task_info.get("account_keys") or []))
                 worker.start()
-                available_slots -= 1
             time.sleep(self.poll_interval)
         self._reap_workers()
 
-    def _accounting_snapshot(self) -> tuple[int, dict[str, int], set[str]]:
+    def _accounting_snapshot(self) -> tuple[dict[str, int], dict[str, int], set[str]]:
         with self._lock:
             workers = list(self._workers.items())
 
-        accounted = 0
+        running_type_counts: dict[str, int] = {}
         running_scope_counts: dict[str, int] = {}
         busy_account_keys: set[str] = set()
-        for task_id, state in workers:
-            task = get_task(task_id)
-            status = str((task or {}).get("status", "") or "")
-            if status == TASK_STATUS_CANCEL_REQUESTED or status in TERMINAL_TASK_STATUSES:
+        for _task_id, state in workers:
+            # A cancel-requested task may still be inside a remote call, so it
+            # keeps its type slot and account locks until the worker exits.
+            if not state.thread.is_alive():
                 continue
-            accounted += 1
+            running_type_counts[state.task_type] = running_type_counts.get(state.task_type, 0) + 1
             if state.scope:
                 running_scope_counts[state.scope] = running_scope_counts.get(state.scope, 0) + 1
             busy_account_keys.update(state.account_keys)
-        return self.max_parallel_tasks - accounted, running_scope_counts, busy_account_keys
+        return running_type_counts, running_scope_counts, busy_account_keys
 
     def _run_task(self, task_id: str) -> None:
-        try:
-            execute_task(task_id)
-        finally:
-            with self._lock:
-                self._workers.pop(task_id, None)
+        # Keep the worker registered through the thread's actual lifetime.
+        # The dispatcher reaps it only after ``is_alive()`` becomes false, so
+        # there is no window where a finishing task releases its type slot
+        # before its worker has exited.
+        execute_task(task_id)
 
     def _reap_workers(self) -> None:
         with self._lock:
