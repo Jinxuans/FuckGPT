@@ -646,6 +646,33 @@ class WorkflowDefinitionModel(SQLModel, table=True):
         self.definition_json = json.dumps(data or {}, ensure_ascii=False)
 
 
+class WorkflowInputPresetModel(SQLModel, table=True):
+    __tablename__ = "workflow_input_presets"
+    __table_args__ = (
+        UniqueConstraint("definition_key", "name", name="uq_workflow_input_preset_name"),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    definition_key: str = Field(index=True)
+    definition_version: int = Field(default=1, index=True)
+    name: str
+    is_default: bool = Field(default=False, index=True)
+    is_last_used: bool = Field(default=False, index=True)
+    input_json: str = "{}"
+    launch_mode: str = "single"
+    batch_concurrency: int = 1
+    batch_count: int = 5
+    created_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow)
+
+    def get_input(self) -> dict:
+        data = json.loads(self.input_json or "{}")
+        return data if isinstance(data, dict) else {}
+
+    def set_input(self, data: dict):
+        self.input_json = json.dumps(data or {}, ensure_ascii=False, default=str)
+
+
 class WorkflowBatchModel(SQLModel, table=True):
     __tablename__ = "workflow_batches"
 

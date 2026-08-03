@@ -46,6 +46,44 @@ export type WorkflowUiSchema = {
   sections?: WorkflowUiSection[]
 }
 
+export type WorkflowLaunchMode = 'single' | 'batch'
+
+export type WorkflowInputPreset = {
+  id: number
+  definition_key: string
+  definition_version: number
+  current_definition_version: number
+  version_mismatch: boolean
+  name: string
+  is_default: boolean
+  is_last_used: boolean
+  input: Record<string, unknown>
+  launch_mode: WorkflowLaunchMode
+  batch_concurrency: number
+  batch_count: number
+  created_at?: string
+  updated_at?: string
+}
+
+export type WorkflowInputPresetCollection = {
+  definition_key: string
+  definition_version: number
+  template_input: Record<string, unknown>
+  items: WorkflowInputPreset[]
+  last_used: WorkflowInputPreset | null
+  default_id: number | null
+}
+
+export type WorkflowInputPresetPayload = {
+  name?: string
+  definition_version: number
+  input: Record<string, unknown>
+  launch_mode: WorkflowLaunchMode
+  batch_concurrency: number
+  batch_count: number
+  is_default?: boolean
+}
+
 export type WorkflowAdapter = {
   key: string
 }
@@ -285,6 +323,48 @@ export async function saveWorkflowDefinition(definition: Record<string, unknown>
     method: 'POST',
     body: JSON.stringify({ definition }),
   }) as Promise<WorkflowDefinition>
+}
+
+export async function fetchWorkflowInputPresets(definitionKey: string, version = 0) {
+  const key = encodeURIComponent(definitionKey)
+  return apiFetch(`/workflows/definitions/${key}/presets?version=${version}`) as Promise<WorkflowInputPresetCollection>
+}
+
+export async function createWorkflowInputPreset(
+  definitionKey: string,
+  payload: WorkflowInputPresetPayload & { name: string },
+) {
+  return apiFetch(`/workflows/definitions/${encodeURIComponent(definitionKey)}/presets`, {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  }) as Promise<WorkflowInputPreset>
+}
+
+export async function updateWorkflowInputPreset(
+  definitionKey: string,
+  presetId: number,
+  payload: WorkflowInputPresetPayload & { name: string },
+) {
+  return apiFetch(`/workflows/definitions/${encodeURIComponent(definitionKey)}/presets/${presetId}`, {
+    method: 'PUT',
+    body: JSON.stringify(payload),
+  }) as Promise<WorkflowInputPreset>
+}
+
+export async function saveLastUsedWorkflowInput(
+  definitionKey: string,
+  payload: WorkflowInputPresetPayload,
+) {
+  return apiFetch(`/workflows/definitions/${encodeURIComponent(definitionKey)}/presets/last-used`, {
+    method: 'PUT',
+    body: JSON.stringify(payload),
+  }) as Promise<WorkflowInputPreset>
+}
+
+export async function deleteWorkflowInputPreset(definitionKey: string, presetId: number) {
+  return apiFetch(`/workflows/definitions/${encodeURIComponent(definitionKey)}/presets/${presetId}`, {
+    method: 'DELETE',
+  }) as Promise<{ ok: boolean }>
 }
 
 export async function fetchWorkflowRuns(params: {

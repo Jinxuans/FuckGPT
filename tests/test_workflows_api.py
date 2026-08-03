@@ -249,3 +249,84 @@ def test_workflow_template_editor_and_batch_control_api(client):
     cancelled = client.post(f"/api/workflows/batches/{batch['id']}/cancel")
     assert cancelled.status_code == 200
     assert cancelled.json()["summary"]["cancelled"] == 2
+
+
+def test_workflow_input_presets_persist_defaults_last_used_and_merge_new_template_fields(client):
+    definition_v1 = {
+        "key": "test_api_presets",
+        "version": 1,
+        "name": "Preset workflow",
+        "sample_input": {"registration": {"count": 1, "concurrency": 1}, "target": "default"},
+        "steps": [{"id": "needs", "uses": "test.api.needs_input", "input": {}}],
+    }
+    register_step_adapter(_ApiNeedsInputAdapter())
+    assert client.post("/api/workflows/definitions", json={"definition": definition_v1}).status_code == 200
+
+    created = client.post(
+        "/api/workflows/definitions/test_api_presets/presets",
+        json={
+            "name": "代理服务",
+            "definition_version": 1,
+            "input": {"registration": {"concurrency": 3}},
+            "launch_mode": "batch",
+            "batch_concurrency": 4,
+            "batch_count": 12,
+            "is_default": True,
+        },
+    )
+    assert created.status_code == 200
+    preset = created.json()
+    assert preset["is_default"] is True
+
+    last_used = client.put(
+        "/api/workflows/definitions/test_api_presets/presets/last-used",
+        json={
+            "definition_version": 1,
+            "input": {"target": "last"},
+            "launch_mode": "single",
+            "batch_concurrency": 2,
+            "batch_count": 6,
+        },
+    )
+    assert last_used.status_code == 200
+    assert last_used.json()["is_last_used"] is True
+
+    definition_v2 = {
+        **definition_v1,
+        "version": 2,
+        "sample_input": {
+            "registration": {"count": 2, "concurrency": 1, "executor_type": "headless"},
+            "target": "v2-default",
+        },
+    }
+    assert client.post("/api/workflows/definitions", json={"definition": definition_v2}).status_code == 200
+
+    listing = client.get("/api/workflows/definitions/test_api_presets/presets?version=2")
+    assert listing.status_code == 200
+    payload = listing.json()
+    assert payload["default_id"] == preset["id"]
+    assert payload["items"][0]["version_mismatch"] is True
+    assert payload["items"][0]["input"]["registration"] == {
+        "count": 2,
+        "concurrency": 3,
+        "executor_type": "headless",
+    }
+    assert payload["last_used"]["input"]["target"] == "last"
+
+    updated = client.put(
+        f"/api/workflows/definitions/test_api_presets/presets/{preset['id']}",
+        json={
+            "name": "546789",
+            "definition_version": 2,
+            "input": {"target": "scanner"},
+            "launch_mode": "single",
+            "is_default": False,
+        },
+    )
+    assert updated.status_code == 200
+    assert updated.json()["name"] == "546789"
+    assert updated.json()["version_mismatch"] is False
+
+    deleted = client.delete(f"/api/workflows/definitions/test_api_presets/presets/{preset['id']}")
+    assert deleted.status_code == 200
+    assert client.get("/api/workflows/definitions/test_api_presets/presets?version=2").json()["items"] == []

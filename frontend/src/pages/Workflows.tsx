@@ -19,7 +19,7 @@ import {
 
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
-import { formatDateTime, type Language } from '@/lib/i18n'
+import { formatDateTime, type Language, type TranslationKey } from '@/lib/i18n'
 import { useI18n } from '@/lib/i18n-context'
 import { cn } from '@/lib/utils'
 import {
@@ -28,13 +28,16 @@ import {
   WORKFLOW_STATUS_VARIANTS,
   cancelWorkflowBatch,
   cancelWorkflowRun,
+  createWorkflowInputPreset,
   createWorkflowBatch,
   createWorkflowRun,
+  deleteWorkflowInputPreset,
   fetchWorkflowAdapters,
   fetchWorkflowBatchSummary,
   fetchWorkflowBatches,
   fetchWorkflowDefinitions,
   fetchWorkflowEvents,
+  fetchWorkflowInputPresets,
   fetchWorkflowRun,
   fetchWorkflowRunSummary,
   fetchWorkflowRuns,
@@ -43,13 +46,18 @@ import {
   resumeWorkflowBatch,
   retryFailedWorkflowBatch,
   retryWorkflowStep,
+  saveLastUsedWorkflowInput,
   saveWorkflowDefinition,
+  updateWorkflowInputPreset,
   updateWorkflowStepInput,
   type WorkflowAdapter,
   type WorkflowBatch,
   type WorkflowBatchSummary,
   type WorkflowDefinition,
   type WorkflowEvent,
+  type WorkflowInputPreset,
+  type WorkflowInputPresetCollection,
+  type WorkflowInputPresetPayload,
   type WorkflowRun,
   type WorkflowRunSummary,
   type WorkflowStepRun,
@@ -398,7 +406,7 @@ function TemplateDefinitionEditor({
   adapters: WorkflowAdapter[]
   onChange: (value: string) => void
   setError: (value: string) => void
-  t: (key: any, params?: Record<string, string | number>) => string
+  t: (key: TranslationKey, params?: Record<string, string | number>) => string
 }) {
   const template = useMemo(() => {
     try {
@@ -786,6 +794,11 @@ export default function Workflows() {
   )
   const [inputText, setInputText] = useState(formatJson(DEFAULT_REGISTER_CODEX_PUSH_INPUT))
   const [inputError, setInputError] = useState('')
+  const [presetData, setPresetData] = useState<WorkflowInputPresetCollection | null>(null)
+  const [presetSelection, setPresetSelection] = useState('template')
+  const [presetDirty, setPresetDirty] = useState(false)
+  const [presetBusy, setPresetBusy] = useState(false)
+  const [presetMessage, setPresetMessage] = useState('')
   const [templateText, setTemplateText] = useState('{}')
   const [templateError, setTemplateError] = useState('')
   const [templateMessage, setTemplateMessage] = useState('')
@@ -818,6 +831,11 @@ export default function Workflows() {
   const currentPage = Math.floor(offset / PAGE_SIZE) + 1
   const selectedBatchStatus = selectedBatchSummary?.status || selectedBatch?.status || ''
   const selectedBatchTerminal = Boolean(selectedBatchSummary?.terminal || selectedBatch?.terminal)
+  const selectedInputPreset = useMemo(() => {
+    if (!presetSelection.startsWith('preset:')) return null
+    const presetId = Number(presetSelection.slice('preset:'.length) || 0)
+    return presetData?.items.find((item) => item.id === presetId) || null
+  }, [presetData, presetSelection])
 
   const loadDefinitions = useCallback(async () => {
     const items = await fetchWorkflowDefinitions()
@@ -928,13 +946,44 @@ export default function Workflows() {
 
   useEffect(() => {
     if (!selectedDefinition) return
+    let cancelled = false
     const next = workflowInputForDefinition(selectedDefinition)
     setInputObject(next)
     setInputText(formatJson(next))
     setInputError('')
+    setLaunchMode('single')
+    setBatchConcurrency(1)
+    setBatchCount(5)
+    setPresetData(null)
+    setPresetSelection('template')
+    setPresetDirty(false)
+    setPresetMessage('')
     setTemplateText(formatJson(selectedDefinition.definition || {}))
     setTemplateError('')
     setTemplateMessage('')
+    fetchWorkflowInputPresets(selectedDefinition.key, selectedDefinition.version)
+      .then((data) => {
+        if (cancelled) return
+        setPresetData(data)
+        const preferred = data.items.find((item) => item.id === data.default_id) || data.last_used
+        if (!preferred) return
+        setInputObject(cloneRecord(preferred.input))
+        setInputText(formatJson(preferred.input))
+        setLaunchMode(preferred.launch_mode)
+        setBatchConcurrency(preferred.batch_concurrency)
+        setBatchCount(preferred.batch_count)
+        setPresetSelection(preferred.is_last_used ? 'last' : `preset:${preferred.id}`)
+        setPresetDirty(false)
+        if (preferred.version_mismatch) {
+          setPresetMessage(`该配置保存于 v${preferred.definition_version}，已与当前 v${preferred.current_definition_version} 默认值合并`)
+        }
+      })
+      .catch((exc: unknown) => {
+        if (!cancelled) setPresetMessage(exc instanceof Error ? `读取运行配置失败：${exc.message}` : '读取运行配置失败')
+      })
+    return () => {
+      cancelled = true
+    }
   }, [selectedDefinition])
 
   useEffect(() => {
@@ -953,11 +1002,16 @@ export default function Workflows() {
     return () => window.clearInterval(timer)
   }, [batches, loadBatchSummary, loadBatches, loadRuns, loadSelectedRun, running, runs, selectedRun])
 
-  const setInputFromObject = (next: Record<string, unknown>) => {
+  const setInputFromObject = (
+    next: Record<string, unknown>,
+    options: { markDirty?: boolean } = {},
+  ) => {
+    const markDirty = options.markDirty ?? true
     setInputObject(next)
     setInputText(formatJson(next))
     setInputError('')
     setBatchError('')
+    if (markDirty) setPresetDirty(true)
   }
 
   const handleJsonChange = (nextText: string) => {
@@ -965,6 +1019,7 @@ export default function Workflows() {
     try {
       setInputObject(parseJsonObject(nextText))
       setInputError('')
+      setPresetDirty(true)
     } catch {
       setInputError(t('workflows.invalidJson'))
     }
@@ -975,7 +1030,133 @@ export default function Workflows() {
   }
 
   const resetInput = () => {
-    setInputFromObject(workflowInputForDefinition(selectedDefinition))
+    const templateInput = presetData?.template_input || workflowInputForDefinition(selectedDefinition)
+    setInputFromObject(cloneRecord(templateInput), { markDirty: false })
+    setLaunchMode('single')
+    setBatchConcurrency(1)
+    setBatchCount(5)
+    setPresetSelection('template')
+    setPresetDirty(false)
+    setPresetMessage('已恢复模板默认值')
+  }
+
+  const applyInputPreset = (selection: string) => {
+    if (!selectedDefinition) return
+    let preset: WorkflowInputPreset | null = null
+    if (selection === 'last') {
+      preset = presetData?.last_used || null
+    } else if (selection.startsWith('preset:')) {
+      const presetId = Number(selection.slice('preset:'.length) || 0)
+      preset = presetData?.items.find((item) => item.id === presetId) || null
+    }
+    if (preset) {
+      setInputFromObject(cloneRecord(preset.input), { markDirty: false })
+      setLaunchMode(preset.launch_mode)
+      setBatchConcurrency(preset.batch_concurrency)
+      setBatchCount(preset.batch_count)
+      setPresetSelection(selection)
+      setPresetDirty(false)
+      setPresetMessage(
+        preset.version_mismatch
+          ? `该配置保存于 v${preset.definition_version}，已与当前 v${preset.current_definition_version} 默认值合并`
+          : '',
+      )
+      return
+    }
+    resetInput()
+  }
+
+  const currentPresetPayload = (): WorkflowInputPresetPayload => {
+    if (!selectedDefinition) throw new Error('请先选择工作流')
+    return {
+      definition_version: selectedDefinition.version,
+      input: parseJsonObject(inputText),
+      launch_mode: launchMode,
+      batch_concurrency: batchConcurrency,
+      batch_count: batchCount,
+    }
+  }
+
+  const reloadPresetData = async () => {
+    if (!selectedDefinition) return null
+    const data = await fetchWorkflowInputPresets(selectedDefinition.key, selectedDefinition.version)
+    setPresetData(data)
+    return data
+  }
+
+  const saveInputPreset = async (saveAs: boolean) => {
+    if (!selectedDefinition || presetBusy) return
+    const existing = saveAs ? null : selectedInputPreset
+    const requestedName = existing?.name || window.prompt('运行配置名称', '')?.trim()
+    if (!requestedName) return
+    setPresetBusy(true)
+    setPresetMessage('')
+    try {
+      const payload = {
+        ...currentPresetPayload(),
+        name: requestedName,
+        is_default: existing?.is_default ?? false,
+      }
+      const saved = existing
+        ? await updateWorkflowInputPreset(selectedDefinition.key, existing.id, payload)
+        : await createWorkflowInputPreset(selectedDefinition.key, payload)
+      await reloadPresetData()
+      setPresetSelection(`preset:${saved.id}`)
+      setPresetDirty(false)
+      setPresetMessage(`运行配置“${saved.name}”已保存`)
+    } catch (exc: unknown) {
+      setPresetMessage(exc instanceof Error ? `保存失败：${exc.message}` : '保存失败')
+    } finally {
+      setPresetBusy(false)
+    }
+  }
+
+  const setDefaultInputPreset = async () => {
+    if (!selectedDefinition || !selectedInputPreset || presetBusy) return
+    setPresetBusy(true)
+    setPresetMessage('')
+    try {
+      const saved = await updateWorkflowInputPreset(selectedDefinition.key, selectedInputPreset.id, {
+        ...currentPresetPayload(),
+        name: selectedInputPreset.name,
+        is_default: true,
+      })
+      await reloadPresetData()
+      setPresetSelection(`preset:${saved.id}`)
+      setPresetDirty(false)
+      setPresetMessage(`“${saved.name}”已设为默认配置`)
+    } catch (exc: unknown) {
+      setPresetMessage(exc instanceof Error ? `设置默认失败：${exc.message}` : '设置默认失败')
+    } finally {
+      setPresetBusy(false)
+    }
+  }
+
+  const removeInputPreset = async () => {
+    if (!selectedDefinition || !selectedInputPreset || presetBusy) return
+    if (!window.confirm(`确认删除运行配置“${selectedInputPreset.name}”？`)) return
+    setPresetBusy(true)
+    setPresetMessage('')
+    try {
+      await deleteWorkflowInputPreset(selectedDefinition.key, selectedInputPreset.id)
+      const data = await reloadPresetData()
+      const preferred = data?.items.find((item) => item.id === data.default_id) || data?.last_used || null
+      if (preferred) {
+        setInputFromObject(cloneRecord(preferred.input), { markDirty: false })
+        setLaunchMode(preferred.launch_mode)
+        setBatchConcurrency(preferred.batch_concurrency)
+        setBatchCount(preferred.batch_count)
+        setPresetSelection(preferred.is_last_used ? 'last' : `preset:${preferred.id}`)
+      } else {
+        resetInput()
+      }
+      setPresetDirty(false)
+      setPresetMessage('运行配置已删除')
+    } catch (exc: unknown) {
+      setPresetMessage(exc instanceof Error ? `删除失败：${exc.message}` : '删除失败')
+    } finally {
+      setPresetBusy(false)
+    }
   }
 
   const resetTemplate = () => {
@@ -1061,6 +1242,18 @@ export default function Workflows() {
         setSelectedBatchId('')
         setSelectedRunId(run.id)
         setSelectedRun(run)
+      }
+      try {
+        await saveLastUsedWorkflowInput(selectedDefinition.key, {
+          ...currentPresetPayload(),
+          input: parsedInput,
+        })
+        await reloadPresetData()
+        setPresetSelection('last')
+        setPresetDirty(false)
+        setPresetMessage('已自动记住本次运行配置')
+      } catch (exc: unknown) {
+        setPresetMessage(exc instanceof Error ? `任务已启动，但记住配置失败：${exc.message}` : '任务已启动，但记住配置失败')
       }
       setOffset(0)
       await Promise.all([loadBatches(), loadRuns()])
@@ -1279,6 +1472,50 @@ export default function Workflows() {
                 </p>
               )}
 
+              <div className="space-y-2 rounded-md border border-[var(--border-soft)] bg-[var(--bg-pane)]/35 p-3">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-xs font-semibold text-[var(--text-primary)]">运行配置</span>
+                  <span className={cn(
+                    'text-[11px]',
+                    presetDirty ? 'text-amber-500' : 'text-[var(--text-muted)]',
+                  )}>
+                    {presetDirty ? '有未保存修改' : '已保存'}
+                  </span>
+                </div>
+                <select
+                  className="control-surface control-surface-compact"
+                  value={presetSelection}
+                  disabled={presetBusy}
+                  onChange={(event) => applyInputPreset(event.target.value)}
+                >
+                  <option value="template">模板默认值</option>
+                  {presetData?.last_used && <option value="last">上次使用</option>}
+                  {(presetData?.items || []).map((preset) => (
+                    <option key={preset.id} value={`preset:${preset.id}`}>
+                      {preset.is_default ? '★ ' : ''}{preset.name}{preset.version_mismatch ? `（v${preset.definition_version}）` : ''}
+                    </option>
+                  ))}
+                </select>
+                <div className="flex flex-wrap gap-2">
+                  <Button variant="outline" size="sm" disabled={presetBusy || Boolean(inputError)} onClick={() => void saveInputPreset(false)}>
+                    <Save className="mr-1 h-3.5 w-3.5" /> 保存
+                  </Button>
+                  <Button variant="outline" size="sm" disabled={presetBusy || Boolean(inputError)} onClick={() => void saveInputPreset(true)}>
+                    另存为
+                  </Button>
+                  <Button variant="outline" size="sm" disabled={presetBusy || !selectedInputPreset || selectedInputPreset.is_default} onClick={() => void setDefaultInputPreset()}>
+                    设为默认
+                  </Button>
+                  <Button variant="outline" size="sm" disabled={presetBusy || !selectedInputPreset} onClick={() => void removeInputPreset()} className="text-red-400 hover:text-red-300">
+                    删除
+                  </Button>
+                  <Button variant="ghost" size="sm" disabled={presetBusy} onClick={resetInput}>
+                    恢复模板默认
+                  </Button>
+                </div>
+                {presetMessage && <p className="text-[11px] leading-5 text-[var(--text-muted)]">{presetMessage}</p>}
+              </div>
+
               <WorkflowInputFields
                 sections={uiSections}
                 value={inputObject}
@@ -1293,7 +1530,10 @@ export default function Workflows() {
                   <select
                     className="control-surface control-surface-compact"
                     value={launchMode}
-                    onChange={(event) => setLaunchMode(event.target.value as LaunchMode)}
+                    onChange={(event) => {
+                      setLaunchMode(event.target.value as LaunchMode)
+                      setPresetDirty(true)
+                    }}
                   >
                     <option value="single">{t('workflows.launchMode.single')}</option>
                     <option value="batch">{t('workflows.launchMode.batch')}</option>
@@ -1310,7 +1550,10 @@ export default function Workflows() {
                       min={1}
                       max={50}
                       value={batchConcurrency}
-                      onChange={(event) => setBatchConcurrency(Math.min(Math.max(Number(event.target.value || 1), 1), 50))}
+                      onChange={(event) => {
+                        setBatchConcurrency(Math.min(Math.max(Number(event.target.value || 1), 1), 50))
+                        setPresetDirty(true)
+                      }}
                     />
                   </label>
                 )}
@@ -1329,7 +1572,10 @@ export default function Workflows() {
                         min={1}
                         max={200}
                         value={batchCount}
-                        onChange={(event) => setBatchCount(Math.min(Math.max(Number(event.target.value || 1), 1), 200))}
+                        onChange={(event) => {
+                          setBatchCount(Math.min(Math.max(Number(event.target.value || 1), 1), 200))
+                          setPresetDirty(true)
+                        }}
                       />
                     </label>
                     <div className="text-xs leading-5 text-[var(--text-muted)]">
