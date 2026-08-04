@@ -16,7 +16,7 @@ import requests
 
 T = TypeVar("T")
 
-_RETRYABLE_HTTP_STATUS_CODES = {408, 425, 429, 500, 502, 503, 504}
+_RETRYABLE_HTTP_STATUS_CODES = {408, 425, 429, 500, 502, 503, 504, 509}
 _RETRYABLE_OS_ERROR_CODES = {
     54,     # ECONNRESET (macOS)
     104,    # ECONNRESET (Linux)
@@ -33,6 +33,9 @@ _RETRYABLE_MESSAGE_TOKENS = (
     "unable to connect to proxy",
     "cannot connect to proxy",
     "proxy connection failed",
+    "connect tunnel failed",
+    "curl: (56)",
+    "response 509",
     "err_proxy_connection_failed",
     "err_tunnel_connection_failed",
     "err_connection_reset",
