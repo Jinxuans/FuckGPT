@@ -459,7 +459,7 @@ class ChatGPTPlatform(BasePlatform):
     name = "chatgpt"
     display_name = "ChatGPT"
     version = "1.0.0"
-    supported_executors = ["protocol", "browser_protocol", "headless", "headed"]
+    supported_executors = ["protocol", "browser_protocol", "browser"]
     supported_identity_modes = ["mailbox"]
     supported_oauth_providers = []
 
@@ -624,9 +624,20 @@ class ChatGPTPlatform(BasePlatform):
             post_codex_oauth = _truthy(ctx.extra.get("auto_codex_oauth_after_register"))
             codex_phone_callback = self._build_codex_phone_callback(ctx.proxy) if post_codex_oauth else None
             keep_browser_open = _truthy(ctx.extra.get("codex_oauth_keep_browser_open"))
+            browser_visible = _truthy(ctx.extra.get("browser_visible"))
             browser_protocol_headed = (
                 ctx.executor_type == "browser_protocol"
-                and _truthy(ctx.extra.get("browser_protocol_headed"))
+                and (
+                    browser_visible
+                    or _truthy(ctx.extra.get("browser_protocol_headed"))
+                )
+            )
+            browser_headed = (
+                ctx.executor_type == "browser"
+                and (
+                    browser_visible
+                    or _truthy(ctx.extra.get("browser_headed"))
+                )
             )
             identity_metadata = dict(getattr(ctx.identity, "metadata", {}) or {})
             allocation_id = str(identity_metadata.get("mailbox_allocation_id") or "")
@@ -665,6 +676,8 @@ class ChatGPTPlatform(BasePlatform):
 
             if browser_protocol_headed:
                 ctx.log("Browser Protocol 已启用可视浏览器窗口")
+            elif browser_headed:
+                ctx.log("浏览器模式已启用可视浏览器窗口")
 
             return ChatGPTBrowserRegister(
                 headless=(
@@ -672,6 +685,10 @@ class ChatGPTPlatform(BasePlatform):
                     or (
                         ctx.executor_type == "browser_protocol"
                         and not browser_protocol_headed
+                    )
+                    or (
+                        ctx.executor_type == "browser"
+                        and not browser_headed
                     )
                 ),
                 proxy=ctx.proxy,

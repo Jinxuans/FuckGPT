@@ -480,14 +480,14 @@ function RegisterModal({
   const [platformProxyMode, setPlatformProxyMode] = useState('direct')
   const [platformProxyValue, setPlatformProxyValue] = useState('')
   const [preferPasswordRegistration, setPreferPasswordRegistration] = useState(true)
-  const [browserProtocolVisible, setBrowserProtocolVisible] = useState(false)
+  const [browserVisible, setBrowserVisible] = useState(false)
   const [autoCodexOAuth, setAutoCodexOAuth] = useState(false)
   const [codexOAuthBrowserMode, setCodexOAuthBrowserMode] = useState('headless')
   const [keepCodexBrowserOpen, setKeepCodexBrowserOpen] = useState(false)
   const [startError, setStartError] = useState('')
   const [selection, setSelection] = useState({
     identityProvider: 'mailbox',
-    executorType: 'headless',
+    executorType: 'browser',
   })
   const [taskId, setTaskId] = useState<string | null>(null)
   const [done, setDone] = useState(false)
@@ -546,8 +546,10 @@ function RegisterModal({
         language,
       )
         .filter(option => !option.disabled)
-      const preferredExecutor = supportedExecutors.includes('headless')
-        ? 'headless'
+      const preferredExecutor = supportedExecutors.includes('browser')
+        ? 'browser'
+        : supportedExecutors.includes('headless')
+          ? 'headless'
         : supportedExecutors[0] || ''
       const executorType = validExecutorOptions.some(option => option.value === current.executorType)
         ? current.executorType
@@ -600,8 +602,11 @@ function RegisterModal({
       if (platformMeta?.name === 'chatgpt' && selection.executorType !== 'protocol') {
         extra.prefer_password_registration = preferPasswordRegistration
       }
-      if (platformMeta?.name === 'chatgpt' && selection.executorType === 'browser_protocol') {
-        extra.browser_protocol_headed = browserProtocolVisible
+      if (
+        platformMeta?.name === 'chatgpt'
+        && ['browser_protocol', 'browser'].includes(selection.executorType)
+      ) {
+        extra.browser_visible = browserVisible
       }
       if (selection.identityProvider === 'mailbox') {
         if (!defaultMailboxProvider?.provider_key) {
@@ -733,21 +738,21 @@ function RegisterModal({
                   </div>
                 ) : null}
 
-                {platformMeta?.name === 'chatgpt' && selection.executorType === 'browser_protocol' ? (
+                {platformMeta?.name === 'chatgpt' && ['browser_protocol', 'browser'].includes(selection.executorType) ? (
                   <div className="rounded-xl border border-[var(--border)] bg-[var(--bg-pane)]/45 px-4 py-3">
                     <label className="flex cursor-pointer items-start gap-3">
                       <input
                         type="checkbox"
-                        checked={browserProtocolVisible}
-                        onChange={(event) => setBrowserProtocolVisible(event.target.checked)}
+                        checked={browserVisible}
+                        onChange={(event) => setBrowserVisible(event.target.checked)}
                         className="mt-0.5 h-4 w-4 accent-[var(--accent)]"
                       />
                       <span>
                         <span className="block text-sm font-medium text-[var(--text-primary)]">
-                          {t('accounts.browserProtocolVisible')}
+                          {t('accounts.browserVisible')}
                         </span>
                         <span className="mt-1 block text-xs text-[var(--text-muted)]">
-                          {t('accounts.browserProtocolVisibleHint')}
+                          {t('accounts.browserVisibleHint')}
                         </span>
                       </span>
                     </label>
@@ -845,7 +850,7 @@ function RegisterModal({
                   <div>{t('accounts.identitySummary')}: <span className="text-[var(--text-primary)]">{selectedRegistration?.label || '-'}</span></div>
                   <div className="mt-1">{t('accounts.executorSummary')}: <span className="text-[var(--text-primary)]">
                     {selectedExecutor?.label || '-'}
-                    {selection.executorType === 'browser_protocol' && browserProtocolVisible ? ` · ${t('accounts.visibleWindow')}` : ''}
+                    {['browser_protocol', 'browser'].includes(selection.executorType) && browserVisible ? ` · ${t('accounts.visibleWindow')}` : ''}
                   </span></div>
                   <div className="mt-1">{t('accounts.verificationSummary')}: <span className="text-[var(--text-primary)]">{
                     selection.executorType === 'protocol'

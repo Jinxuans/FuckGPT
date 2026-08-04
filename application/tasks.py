@@ -843,7 +843,7 @@ def _build_platform_instance(
     from core.base_identity import normalize_identity_provider
     from core.base_mailbox import create_mailbox
 
-    executor_type = str(payload.get("executor_type", "headless") or "headless")
+    executor_type = str(payload.get("executor_type", "browser") or "browser")
     captcha_solver = str(payload.get("captcha_solver", "auto") or "auto")
     extra = dict(payload.get("extra") or {})
     extra["_log_fn"] = logger.log
@@ -1692,11 +1692,18 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
                     pass
                 browser_mode = str(extra.get("codex_oauth_browser_mode") or "").strip().lower()
                 keep_browser_open = str(extra.get("codex_oauth_keep_browser_open") or "").strip().lower()
+                browser_visible = str(extra.get("browser_visible") or "").strip().lower() in {
+                    "1", "true", "yes", "on", "是", "开启", "启用",
+                }
                 codex_action = platform.execute_action(
                     "codex_oauth_authorize",
                     account,
                     {
-                        "browser_mode": browser_mode or ("headed" if str(payload.get("executor_type") or "") == "headed" else "headless"),
+                        "browser_mode": browser_mode or (
+                            "headed"
+                            if str(payload.get("executor_type") or "") == "headed" or browser_visible
+                            else "headless"
+                        ),
                         "keep_browser_open": keep_browser_open,
                     },
                 )

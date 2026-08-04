@@ -206,6 +206,9 @@ def test_builtin_workflow_template_exposes_proxy_inputs():
     register_builtin_workflow_components()
     definition = next(item for item in registered_workflow_definitions() if item["key"] == "register_codex_push")
 
+    registration = definition["sample_input"]["registration"]
+    assert registration["executor_type"] == "browser"
+    assert registration["extra"]["browser_visible"] is False
     assert definition["sample_input"]["registration"]["platform_proxy_mode"] == "direct"
     assert definition["sample_input"]["registration"]["platform_proxy_value"] == ""
     assert definition["sample_input"]["codex"]["platform_proxy_mode"] == "direct"
@@ -218,8 +221,20 @@ def test_builtin_workflow_template_exposes_proxy_inputs():
     }
     assert "registration.platform_proxy_mode" in field_paths
     assert "registration.platform_proxy_value" in field_paths
+    assert "registration.extra.browser_visible" in field_paths
     assert "codex.platform_proxy_mode" in field_paths
     assert "codex.platform_proxy_value" in field_paths
+
+    executor_field = next(
+        field
+        for section in definition["ui_schema"]["sections"]
+        for field in section["fields"]
+        if field["path"] == "registration.executor_type"
+    )
+    assert [option["value"] for option in executor_field["options"]] == [
+        "browser_protocol",
+        "browser",
+    ]
 
 
 def test_step_transition_adds_error_category_and_operator_hint():

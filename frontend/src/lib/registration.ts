@@ -61,6 +61,11 @@ export function buildExecutorOptions(
       return option
     }
 
+    if (executor === 'browser') {
+      option.description = translate('executor.browserDescription', language)
+      return option
+    }
+
     option.description = translate('executor.headedDescription', language)
     return option
   })

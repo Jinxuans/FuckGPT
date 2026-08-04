@@ -36,7 +36,7 @@ class Account:
 @dataclass
 class RegisterConfig:
     """注册任务配置"""
-    executor_type: str = "protocol"   # protocol | browser_protocol | headless | headed
+    executor_type: str = "protocol"   # protocol | browser_protocol | browser | legacy headless/headed
     captcha_solver: str = "auto"  # auto | <provider_key> | manual
     proxy: Optional[str] = None
     extra: dict = field(default_factory=dict)
@@ -159,7 +159,7 @@ class BasePlatform(ABC):
             password_provided=bool(password),
         )
 
-        if (self.config.executor_type or "") in ("browser_protocol", "headless", "headed"):
+        if (self.config.executor_type or "") in ("browser_protocol", "browser", "headless", "headed"):
             browser_label = (
                 "Browser Protocol"
                 if self.config.executor_type == "browser_protocol"
@@ -351,9 +351,15 @@ class BasePlatform(ABC):
         t = self.config.executor_type
         if t == "protocol":
             return ProtocolExecutor(proxy=self.config.proxy)
-        elif t in {"browser_protocol", "headless"}:
+        elif t in {"browser_protocol", "browser", "headless"}:
             from .executors.playwright import PlaywrightExecutor
-            return PlaywrightExecutor(proxy=self.config.proxy, headless=True)
+            visible = str((self.config.extra or {}).get("browser_visible") or "").strip().lower() in {
+                "1", "true", "yes", "on", "是", "开启", "启用",
+            }
+            return PlaywrightExecutor(
+                proxy=self.config.proxy,
+                headless=(t == "headless" or not visible),
+            )
         elif t == "headed":
             from .executors.playwright import PlaywrightExecutor
             return PlaywrightExecutor(proxy=self.config.proxy, headless=False)
@@ -379,7 +385,7 @@ class BasePlatform(ABC):
         if candidates:
             return candidates[0]
 
-        if self.config.executor_type in {"browser_protocol", "headless", "headed"}:
+        if self.config.executor_type in {"browser_protocol", "browser", "headless", "headed"}:
             raise RuntimeError("浏览器模式未配置默认验证码 provider，请先在设置页启用并设为默认")
         raise RuntimeError("协议模式未配置可用的验证码 provider，请先启用并配置至少一个验证码 provider")
 
@@ -390,7 +396,7 @@ class BasePlatform(ABC):
                 raise RuntimeError(f"{requested} 未配置，无法创建验证码解决器")
             return [requested]
 
-        if self.config.executor_type in {"browser_protocol", "headless", "headed"}:
+        if self.config.executor_type in {"browser_protocol", "browser", "headless", "headed"}:
             try:
                 from infrastructure.provider_settings_repository import ProviderSettingsRepository
 
