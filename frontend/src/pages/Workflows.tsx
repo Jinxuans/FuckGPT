@@ -93,6 +93,7 @@ const DEFAULT_REGISTER_CODEX_PUSH_INPUT = {
     },
   },
   codex: {
+    oauth_mode: 'browser',
     browser_mode: 'headless',
     keep_browser_open: 'false',
     platform_proxy_mode: 'direct',
@@ -124,6 +125,7 @@ const DEFAULT_REGISTER_KAKAO_CODEX_PUSH_INPUT = {
     auto_submit_scanner: true,
   },
   codex: {
+    oauth_mode: 'browser',
     browser_mode: 'headless',
     keep_browser_open: 'false',
     platform_proxy_mode: 'direct',

@@ -393,6 +393,7 @@ def register_kakao_workflow_components() -> None:
                     "auto_submit_scanner": True,
                 },
                 "codex": {
+                    "oauth_mode": "browser",
                     "browser_mode": "headless",
                     "keep_browser_open": "false",
                     "platform_proxy_mode": "direct",
@@ -493,6 +494,17 @@ def register_kakao_workflow_components() -> None:
                     {
                         "title": "Codex",
                         "fields": [
+                            {
+                                "path": "codex.oauth_mode",
+                                "label": "授权模式",
+                                "type": "select",
+                                "options": [
+                                    {"label": "浏览器模式", "value": "browser"},
+                                    {"label": "浏览器协议模式（Fetch 优先）", "value": "browser_protocol"},
+                                    {"label": "协议模式（复用已有会话）", "value": "protocol"},
+                                ],
+                                "helper": "协议模式不启动浏览器，需要账号已保存可复用 session/cookies。",
+                            },
                             {
                                 "path": "codex.browser_mode",
                                 "label": "浏览器模式",

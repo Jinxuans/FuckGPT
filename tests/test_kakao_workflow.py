@@ -393,6 +393,7 @@ def test_kakao_workflow_components_register_adapter_and_template():
     assert kakao_definition["sample_input"]["registration"]["executor_type"] == "browser"
     assert kakao_definition["sample_input"]["registration"]["platform_proxy_mode"] == "direct"
     assert kakao_definition["sample_input"]["registration"]["extra"]["browser_visible"] is False
+    assert kakao_definition["sample_input"]["codex"]["oauth_mode"] == "browser"
     assert kakao_definition["sample_input"]["codex"]["platform_proxy_mode"] == "direct"
     field_paths = {
         field["path"]
@@ -402,6 +403,7 @@ def test_kakao_workflow_components_register_adapter_and_template():
     assert "registration.platform_proxy_mode" in field_paths
     assert "registration.platform_proxy_value" in field_paths
     assert "registration.extra.browser_visible" in field_paths
+    assert "codex.oauth_mode" in field_paths
     assert "codex.platform_proxy_mode" in field_paths
     assert "codex.platform_proxy_value" in field_paths
 
@@ -422,6 +424,12 @@ def test_kakao_workflow_components_register_adapter_and_template():
         for option in registration_fields["registration.executor_type"]["options"]
     ]
     assert executor_values == ["browser_protocol", "browser"]
+    codex_section = next(section for section in kakao_definition["ui_schema"]["sections"] if section["title"] == "Codex")
+    codex_fields = {field["path"]: field for field in codex_section["fields"]}
+    assert [
+        option["value"]
+        for option in codex_fields["codex.oauth_mode"]["options"]
+    ] == ["browser", "browser_protocol", "protocol"]
 
 
 def test_kakao_workflow_template_is_visible_from_api(client):
