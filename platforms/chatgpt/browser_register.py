@@ -313,7 +313,12 @@ def _build_proxy_config(proxy: Optional[str]) -> Optional[dict]:
     parsed = urlparse(proxy)
     if not parsed.scheme or not parsed.hostname or not parsed.port:
         return {"server": proxy}
-    config = {"server": f"{parsed.scheme}://{parsed.hostname}:{parsed.port}"}
+    config = {
+        "server": f"{parsed.scheme}://{parsed.hostname}:{parsed.port}",
+        # OAuth callbacks are served by the local process and must never be
+        # sent through the remote registration proxy.
+        "bypass": "localhost,127.0.0.1",
+    }
     if parsed.username:
         config["username"] = parsed.username
     if parsed.password:

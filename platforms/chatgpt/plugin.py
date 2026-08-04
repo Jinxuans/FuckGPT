@@ -1,4 +1,5 @@
 """ChatGPT / Codex CLI 平台插件"""
+import json
 import secrets
 import time
 from datetime import datetime, timezone
@@ -585,7 +586,11 @@ class ChatGPTPlatform(BasePlatform):
             "id_token": result.get("id_token", ""),
             "session_token": result.get("session_token", ""),
             "workspace_id": result.get("workspace_id", ""),
-            "cookies": result.get("cookies", ""),
+            "cookies": (
+                json.dumps(result.get("cookies"), ensure_ascii=False, separators=(",", ":"))
+                if isinstance(result.get("cookies"), (dict, list))
+                else result.get("cookies", "")
+            ),
             "profile": result.get("profile", {}),
             "expires_at": result.get("expires_at", ""),
             "registration_auth_mode": result.get("registration_auth_mode", ""),

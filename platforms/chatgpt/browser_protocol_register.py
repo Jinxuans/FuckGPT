@@ -88,29 +88,44 @@ def _wait_for_public_sentinel_sdk(page, log, timeout: float = 20) -> None:
 
 def _browser_sentinel_headers(page, flow: str, log) -> dict[str, str]:
     _wait_for_public_sentinel_sdk(page, log)
-    result = page.evaluate(
-        """
-        async (flow) => {
-          const sdk = window.SentinelSDK;
-          const parse = (value) => {
-            if (value === null || value === undefined || value === '') return null;
-            if (typeof value !== 'string') return value;
-            try { return JSON.parse(value); } catch { return value; }
-          };
-          const token = parse(await sdk.token(flow));
-          let so = null;
-          if (typeof sdk.sessionObserverToken === 'function') {
-            try { so = parse(await sdk.sessionObserverToken(flow)); } catch {}
-          }
-          return { token, so };
-        }
-        """,
-        flow,
-    )
-    token = result.get("token") if isinstance(result, dict) else None
+    result = None
+    token = None
+    missing: list[str] = []
+    for attempt in range(1, 4):
+        result = page.evaluate(
+            """
+            async (flow) => {
+              const sdk = window.SentinelSDK;
+              const parse = (value) => {
+                if (value === null || value === undefined || value === '') return null;
+                if (typeof value !== 'string') return value;
+                try { return JSON.parse(value); } catch { return value; }
+              };
+              const token = parse(await sdk.token(flow));
+              let so = null;
+              if (typeof sdk.sessionObserverToken === 'function') {
+                try { so = parse(await sdk.sessionObserverToken(flow)); } catch {}
+              }
+              return { token, so };
+            }
+            """,
+            flow,
+        )
+        token = result.get("token") if isinstance(result, dict) else None
+        if isinstance(token, dict):
+            missing = [key for key in ("p", "c", "id", "flow") if not str(token.get(key) or "")]
+            if not missing:
+                break
+        else:
+            missing = ["token"]
+        if attempt < 3:
+            log(
+                f"Browser Protocol Sentinel token 不完整，重新生成 "
+                f"({attempt}/3): {', '.join(missing)}"
+            )
+            time.sleep(1)
     if not isinstance(token, dict):
         raise RuntimeError("Browser Protocol Sentinel SDK 未返回 token 对象")
-    missing = [key for key in ("p", "c", "id", "flow") if not str(token.get(key) or "")]
     if missing:
         raise RuntimeError("Browser Protocol Sentinel token 缺少字段: " + ", ".join(missing))
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import base64
 import hashlib
 import json
@@ -9,6 +10,7 @@ import secrets
 import sys
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -50,6 +52,10 @@ CODEX_CALLBACK_PORT = 1455
 CODEX_REDIRECT_URI = f"http://localhost:{CODEX_CALLBACK_PORT}/auth/callback"
 CODEX_SCOPE = "openid email profile offline_access"
 CODEX_USER_AGENT = "codex_cli_rs/0.144.1 (Windows 10.0.0; x86_64)"
+CODEX_AUTH_BROWSER_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
+)
 DEFAULT_CODEX_AUTH_DIR = Path("data") / "codex_auths"
 CODEX_OAUTH_MODE_BROWSER = "browser"
 CODEX_OAUTH_MODE_BROWSER_PROTOCOL = "browser_protocol"
@@ -298,6 +304,7 @@ ACCOUNT_CHOOSER_SUBMIT_GRACE_SECONDS = 15
 EMAIL_SUBMIT_GRACE_SECONDS = 45
 PASSWORDLESS_LOGIN_GRACE_SECONDS = 20
 CODEX_BROWSER_LOGIN_MAX_ATTEMPTS = 2
+CODEX_PROTOCOL_LOGIN_MAX_ATTEMPTS = 4
 CODEX_CONSENT_STALL_RECOVERY_THRESHOLD = 3
 CODEX_CONSENT_STALL_MAX_RECOVERIES = 2
 
@@ -395,7 +402,12 @@ def _normalize_cookie_mapping(cookies: Any) -> dict[str, str]:
         try:
             return _normalize_cookie_mapping(json.loads(text))
         except Exception:
-            pass
+            try:
+                # Older account rows stored ``str(dict)`` rather than JSON.
+                # Keep them readable while all new writes use canonical JSON.
+                return _normalize_cookie_mapping(ast.literal_eval(text))
+            except (ValueError, SyntaxError):
+                pass
 
     parsed: dict[str, str] = {}
     for part in text.split(";"):
@@ -452,10 +464,15 @@ def _callback_from_redirect_url(url: str) -> dict[str, str] | None:
 
 
 def _seed_requests_session_cookies(session: Any, cookie_map: dict[str, str]) -> None:
+    stable_names = {"oai-did", "oaicom-stable-id"}
+    session_names = {"__Secure-next-auth.session-token"}
     for name, value in cookie_map.items():
-        session.cookies.set(name, value)
-        for domain in ("auth.openai.com", ".openai.com", "chatgpt.com", ".chatgpt.com", "chat.openai.com", ".chat.openai.com"):
-            session.cookies.set(name, value, domain=domain, path="/")
+        if name in stable_names:
+            for domain in ("auth.openai.com", "chatgpt.com", "chat.openai.com"):
+                session.cookies.set(name, value, domain=domain, path="/")
+        elif name in session_names:
+            for domain in ("chatgpt.com", "chat.openai.com"):
+                session.cookies.set(name, value, domain=domain, path="/")
 
 
 def _seed_browser_session_cookies(
@@ -469,20 +486,32 @@ def _seed_browser_session_cookies(
     if not cookie_map:
         return False
     cookie_entries: list[dict[str, Any]] = []
+    stable_names = {"oai-did", "oaicom-stable-id"}
+    session_names = {"__Secure-next-auth.session-token"}
     for name, value in cookie_map.items():
-        for url in CODEX_OAUTH_COOKIE_URLS:
+        if name in stable_names:
+            urls = CODEX_OAUTH_COOKIE_URLS
+        elif name in session_names:
+            urls = CODEX_OAUTH_COOKIE_URLS[1:]
+        else:
+            # OAuth state, CSRF and auth-session cookies are bound to the old
+            # authorization transaction. Re-injecting them causes invalid_state.
+            continue
+        for url in urls:
             cookie_entries.append(
                 {
                     "name": name,
                     "value": value,
                     "url": url,
-                    "path": "/",
                     "secure": url.startswith("https://"),
                 }
             )
     try:
         page.context.add_cookies(cookie_entries)
-        log(f"Codex OAuth 已注入可复用会话 Cookie: {len(cookie_map)} 项")
+        if not cookie_entries:
+            return False
+        page.context.add_cookies(cookie_entries)
+        log(f"Codex OAuth 已注入稳定设备/会话 Cookie: {len(cookie_entries)} 项")
         return True
     except Exception as exc:
         log(f"Codex OAuth 注入会话 Cookie 失败，将继续常规浏览器流程: {exc}")
@@ -640,6 +669,737 @@ def _request_codex_oauth_callback_via_browser_fetch(
     status = int(result.get("status") or 0)
     log(f"Codex OAuth 浏览器协议模式: Fetch 返回 HTTP {status}，继续交互状态机")
     return None
+
+
+@dataclass
+class _CodexOAuthHTTPResult:
+    status: int
+    url: str
+    headers: dict[str, str]
+    text: str
+    data: dict[str, Any]
+
+    @property
+    def ok(self) -> bool:
+        return 200 <= self.status < 400
+
+
+def _json_object(text: str) -> dict[str, Any]:
+    try:
+        value = json.loads(str(text or ""))
+        return value if isinstance(value, dict) else {}
+    except Exception:
+        return {}
+
+
+class _CurlCodexOAuthTransport:
+    """Clean curl_cffi transport for the complete Auth API state machine."""
+
+    kind = CODEX_OAUTH_MODE_PROTOCOL
+
+    def __init__(
+        self,
+        *,
+        proxy: str | None,
+        session_token: str,
+        cookies: Any,
+        log: Callable[[str], None],
+        timeout: int,
+    ):
+        self.log = log
+        self.timeout = min(max(int(timeout or 0), 30), 300)
+        self.proxies = {"http": proxy, "https": proxy} if proxy else None
+        session_kwargs: dict[str, Any] = {"impersonate": "chrome136"}
+        if self.proxies:
+            session_kwargs["proxies"] = self.proxies
+        self.session = curl_requests.Session(**session_kwargs)
+        self.session.headers.update(
+            {
+                "Accept-Language": "en-US,en;q=0.9",
+                "User-Agent": CODEX_AUTH_BROWSER_USER_AGENT,
+            }
+        )
+        cookie_map = _codex_oauth_session_cookie_map(
+            session_token=session_token,
+            cookies=cookies,
+        )
+        _seed_requests_session_cookies(self.session, cookie_map)
+        self.device_id = str(cookie_map.get("oai-did") or uuid.uuid4())
+        if not cookie_map.get("oai-did"):
+            self.session.cookies.set("oai-did", self.device_id, domain="auth.openai.com", path="/")
+
+        from .protocol_register import OpenAISentinelClient
+
+        self.sentinel = OpenAISentinelClient(
+            self.session,
+            user_agent=CODEX_AUTH_BROWSER_USER_AGENT,
+            proxy=proxy,
+            use_browser_runtime=True,
+        )
+
+    def _result(self, response: Any) -> _CodexOAuthHTTPResult:
+        text = str(getattr(response, "text", "") or "")
+        headers = {
+            str(name).lower(): str(value)
+            for name, value in dict(getattr(response, "headers", {}) or {}).items()
+        }
+        return _CodexOAuthHTTPResult(
+            status=int(getattr(response, "status_code", 0) or 0),
+            url=str(getattr(response, "url", "") or ""),
+            headers=headers,
+            text=text,
+            data=_json_object(text),
+        )
+
+    def get(self, url: str) -> _CodexOAuthHTTPResult:
+        response = self.session.get(
+            url,
+            allow_redirects=False,
+            proxies=self.proxies,
+            timeout=self.timeout,
+            headers={
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            },
+        )
+        return self._result(response)
+
+    def post_json(
+        self,
+        url: str,
+        payload: dict[str, Any] | None,
+        *,
+        referer: str,
+        headers: dict[str, str] | None = None,
+    ) -> _CodexOAuthHTTPResult:
+        request_headers = {
+            "Accept": "application/json",
+            "Origin": "https://auth.openai.com",
+            "Referer": referer,
+            **dict(headers or {}),
+        }
+        kwargs: dict[str, Any] = {
+            "headers": request_headers,
+            "allow_redirects": False,
+            "proxies": self.proxies,
+            "timeout": self.timeout,
+        }
+        if payload is not None:
+            kwargs["json"] = payload
+            request_headers["Content-Type"] = "application/json"
+        response = self.session.post(url, **kwargs)
+        return self._result(response)
+
+    def sentinel_headers(self, flow: str) -> dict[str, str]:
+        return self.sentinel.build_headers(self.device_id, flow)
+
+    def close(self) -> None:
+        self.sentinel.close()
+
+
+class _BrowserFetchCodexOAuthTransport:
+    """Auth API transport whose application requests all run in Camoufox Fetch."""
+
+    kind = CODEX_OAUTH_MODE_BROWSER_PROTOCOL
+
+    def __init__(self, page, *, log: Callable[[str], None], timeout: int):
+        self.page = page
+        self.log = log
+        # ``timeout`` is the whole OAuth budget, not a per-request allowance.
+        # A stalled Fetch must yield so the outer attempt can rebuild state.
+        self.timeout_ms = min(max(int(timeout or 0) * 1000, 30_000), 60_000)
+
+    @staticmethod
+    def _result(value: dict[str, Any]) -> _CodexOAuthHTTPResult:
+        text = str(value.get("text") or "")
+        data = value.get("data") if isinstance(value.get("data"), dict) else _json_object(text)
+        return _CodexOAuthHTTPResult(
+            status=int(value.get("status") or 0),
+            url=str(value.get("url") or ""),
+            headers={str(k).lower(): str(v) for k, v in dict(value.get("headers") or {}).items()},
+            text=text,
+            data=data,
+        )
+
+    def get(self, url: str) -> _CodexOAuthHTTPResult:
+        from .browser_register import _browser_fetch
+
+        return self._result(
+            _browser_fetch(
+                self.page,
+                url,
+                method="GET",
+                headers={"accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"},
+                redirect="follow",
+                timeout_ms=self.timeout_ms,
+            )
+        )
+
+    def post_json(
+        self,
+        url: str,
+        payload: dict[str, Any] | None,
+        *,
+        referer: str,
+        headers: dict[str, str] | None = None,
+    ) -> _CodexOAuthHTTPResult:
+        del referer
+        from .browser_register import _browser_fetch
+
+        request_headers = {"accept": "application/json", **dict(headers or {})}
+        body = None
+        if payload is not None:
+            request_headers["content-type"] = "application/json"
+            body = json.dumps(payload, separators=(",", ":"))
+        return self._result(
+            _browser_fetch(
+                self.page,
+                url,
+                method="POST",
+                headers=request_headers,
+                body=body,
+                redirect="follow",
+                timeout_ms=self.timeout_ms,
+            )
+        )
+
+    def sentinel_headers(self, flow: str) -> dict[str, str]:
+        from .browser_protocol_register import _browser_sentinel_headers
+
+        return _browser_sentinel_headers(self.page, flow, self.log)
+
+    def complete_external(
+        self,
+        url: str,
+        callback_server: _OAuthCallbackServer,
+    ) -> dict[str, str] | None:
+        """Use navigation only for the final external redirect.
+
+        Firefox Fetch blocks the auth-origin -> localhost hop as a private
+        network/CORS request before it reaches the callback listener. The Auth
+        API state transition still ran in Fetch; navigation merely delivers
+        its final external_url to the local Codex callback.
+        """
+        observed: list[dict[str, str]] = []
+        observed_paths: list[str] = []
+
+        def observe_request(request) -> None:
+            try:
+                request_url = str(getattr(request, "url", "") or "")
+                parsed_request = urlparse(request_url)
+                observed_paths.append(
+                    f"{parsed_request.hostname or '-'}{parsed_request.path or '/'}"
+                )
+                callback = _callback_from_redirect_url(request_url)
+                if callback:
+                    observed.append(callback)
+            except Exception:
+                pass
+
+        listener_added = False
+        context_listener_added = False
+        context = getattr(self.page, "context", None)
+        try:
+            if context is not None and hasattr(context, "on"):
+                context.on("request", observe_request)
+                context_listener_added = True
+            elif hasattr(self.page, "on"):
+                self.page.on("request", observe_request)
+                listener_added = True
+            try:
+                self.page.goto(url, wait_until="commit", timeout=self.timeout_ms)
+            except Exception as exc:
+                if not callback_server.event.is_set() and not observed:
+                    self.log(f"Codex OAuth 浏览器协议最终回调导航状态: {exc}")
+            expects_local_callback = "localhost" in url.lower() and "redirect_uri" in url.lower()
+            if expects_local_callback and not observed and not callback_server.event.is_set():
+                try:
+                    fresh_page = context.new_page() if context is not None else None
+                    if fresh_page is not None:
+                        self.log("Codex OAuth 浏览器协议: 使用同 Context 新页投递最终 authorize 回调")
+                        fresh_page.goto(url, wait_until="commit", timeout=min(self.timeout_ms, 30_000))
+                except Exception as exc:
+                    if not observed and not callback_server.event.is_set():
+                        self.log(f"Codex OAuth 浏览器协议新页回调导航状态: {exc}")
+            matching_observed = [
+                item
+                for item in observed
+                if str(item.get("state") or "") == str(callback_server.state or "")
+            ]
+            if matching_observed:
+                self.log("Codex OAuth 浏览器协议已从网络请求事件捕获 localhost 回调")
+                return matching_observed[-1]
+            if observed:
+                self.log(f"Codex OAuth 浏览器协议忽略非当前 state 的 localhost 回调: {len(observed)} 条")
+            if callback_server.event.wait(5):
+                return callback_server.wait(1)
+            if observed_paths:
+                self.log(
+                    "Codex OAuth 浏览器协议回调前网络路径: "
+                    + " -> ".join(observed_paths[-8:])
+                )
+            return _callback_from_redirect_url(str(getattr(self.page, "url", "") or ""))
+        finally:
+            if listener_added:
+                try:
+                    self.page.remove_listener("request", observe_request)
+                except Exception:
+                    pass
+            if context_listener_added:
+                try:
+                    context.remove_listener("request", observe_request)
+                except Exception:
+                    pass
+
+    def prepare_auth_origin(self) -> None:
+        current = str(getattr(self.page, "url", "") or "")
+        if current.startswith("https://auth.openai.com/"):
+            return
+        _goto_with_retry(
+            self.page,
+            "https://auth.openai.com/robots.txt",
+            wait_until="domcontentloaded",
+            timeout=30_000,
+            log=self.log,
+        )
+
+    def close(self) -> None:
+        return None
+
+
+def _oauth_payload(result: _CodexOAuthHTTPResult) -> dict[str, Any]:
+    payload = result.data if isinstance(result.data, dict) else {}
+    nested = payload.get("data")
+    if "page" not in payload and isinstance(nested, dict):
+        return nested
+    return payload
+
+
+def _oauth_page(payload: dict[str, Any]) -> dict[str, Any]:
+    page = payload.get("page")
+    return page if isinstance(page, dict) else {}
+
+
+def _oauth_page_type(payload: dict[str, Any]) -> str:
+    return str(_oauth_page(payload).get("type") or payload.get("page_type") or "").strip()
+
+
+def _oauth_page_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    page_payload = _oauth_page(payload).get("payload")
+    return page_payload if isinstance(page_payload, dict) else {}
+
+
+def _oauth_continue_url(payload: dict[str, Any]) -> str:
+    page_payload = _oauth_page_payload(payload)
+    return str(
+        payload.get("continue_url")
+        or payload.get("redirect_url")
+        or page_payload.get("continue_url")
+        or page_payload.get("url")
+        or ""
+    ).strip()
+
+
+def _oauth_error_text(result: _CodexOAuthHTTPResult) -> str:
+    payload = _oauth_payload(result)
+    error = payload.get("error")
+    if isinstance(error, dict):
+        code = str(error.get("code") or "").strip()
+        message = str(error.get("message") or "").strip()
+        if code and message:
+            return f"{code}: {message}"
+        if code or message:
+            return code or message
+    if isinstance(error, str) and error.strip():
+        return error.strip()
+    page_payload = _oauth_page_payload(payload)
+    if page_payload.get("errors"):
+        return json.dumps(page_payload["errors"], ensure_ascii=False)[:500]
+    snippet = re.sub(r"\s+", " ", result.text[:300]).strip()
+    return snippet or f"HTTP {result.status}"
+
+
+def _callback_from_oauth_result(
+    result: _CodexOAuthHTTPResult,
+    callback_server: _OAuthCallbackServer,
+) -> dict[str, str] | None:
+    if callback_server.event.is_set():
+        return callback_server.wait(1)
+    candidates = [result.url, result.headers.get("location", "")]
+    payload = _oauth_payload(result)
+    page_payload = _oauth_page_payload(payload)
+    candidates.extend(
+        str(value or "")
+        for value in (
+            payload.get("continue_url"),
+            payload.get("redirect_url"),
+            payload.get("url"),
+            page_payload.get("continue_url"),
+            page_payload.get("redirect_url"),
+            page_payload.get("url"),
+        )
+    )
+    for candidate in candidates:
+        callback = _callback_from_redirect_url(candidate.replace("&amp;", "&"))
+        if callback:
+            return callback
+    match = re.search(
+        rf"https?://(?:localhost|127\.0\.0\.1):{CODEX_CALLBACK_PORT}/(?:auth/callback|success)\?[^\"'\s<>]+",
+        result.text,
+    )
+    return _callback_from_redirect_url(match.group(0).replace("&amp;", "&")) if match else None
+
+
+def _follow_oauth_get(
+    transport: Any,
+    url: str,
+    *,
+    callback_server: _OAuthCallbackServer,
+    max_redirects: int = 16,
+) -> tuple[_CodexOAuthHTTPResult, dict[str, str] | None]:
+    current = str(url or "").strip()
+    result = _CodexOAuthHTTPResult(0, current, {}, "", {})
+    for _ in range(max_redirects):
+        result = transport.get(current)
+        callback = _callback_from_oauth_result(result, callback_server)
+        if callback:
+            return result, callback
+        location = str(result.headers.get("location") or "").strip()
+        if 300 <= result.status < 400 and location:
+            current = urljoin(current, location)
+            continue
+        return result, None
+    raise RuntimeError("Codex OAuth 授权重定向次数过多")
+
+
+def _workspace_id_from_payload(payload: dict[str, Any]) -> str:
+    auth_session = payload.get("oai-client-auth-session")
+    values = [
+        payload,
+        _oauth_page_payload(payload),
+        auth_session if isinstance(auth_session, dict) else {},
+    ]
+    for value in values:
+        current = str(value.get("current_workspace_id") or "").strip()
+        workspaces = value.get("workspaces")
+        if current:
+            return current
+        if isinstance(workspaces, list):
+            for workspace in workspaces:
+                if isinstance(workspace, dict) and str(workspace.get("id") or "").strip():
+                    return str(workspace["id"]).strip()
+    return ""
+
+
+def _organization_selection_from_payload(payload: dict[str, Any]) -> tuple[str, str]:
+    auth_session = payload.get("oai-client-auth-session")
+    for value in (
+        payload,
+        _oauth_page_payload(payload),
+        auth_session if isinstance(auth_session, dict) else {},
+    ):
+        orgs = value.get("orgs") or value.get("organizations")
+        if not isinstance(orgs, list):
+            continue
+        for org in orgs:
+            if not isinstance(org, dict):
+                continue
+            org_id = str(org.get("id") or org.get("org_id") or "").strip()
+            projects = org.get("projects")
+            project_id = ""
+            if isinstance(projects, list):
+                for project in projects:
+                    if isinstance(project, dict) and str(project.get("id") or "").strip():
+                        project_id = str(project["id"]).strip()
+                        break
+            if org_id:
+                return org_id, project_id
+    return "", ""
+
+
+def _callback_value(callback: Callable[[], str] | None, label: str) -> str:
+    if not callable(callback):
+        raise RuntimeError(f"Codex OAuth 遇到 {label}，但未配置回调")
+    value = str(callback() or "").strip()
+    if not value:
+        raise RuntimeError(f"Codex OAuth {label} 回调未返回数据")
+    return value
+
+
+def _normalize_protocol_phone_number(value: str) -> str:
+    text = str(value or "").strip()
+    if text.startswith("+"):
+        return "+" + re.sub(r"\D", "", text[1:])
+    digits = re.sub(r"\D", "", text)
+    return f"+{digits}" if digits else ""
+
+
+def _drive_codex_oauth_protocol_state_machine(
+    transport: Any,
+    *,
+    auth_url: str,
+    email: str,
+    password: str,
+    registration_auth_mode: str,
+    callback_server: _OAuthCallbackServer,
+    log: Callable[[str], None],
+    otp_callback: Callable[[], str] | None,
+    phone_callback: Callable[[], str] | None,
+) -> dict[str, str]:
+    """Drive login, OTP, phone, consent and callback with one transport."""
+
+    api = "https://auth.openai.com/api/accounts"
+    result, callback = _follow_oauth_get(
+        transport,
+        auth_url,
+        callback_server=callback_server,
+    )
+    if callback:
+        return callback
+    if result.status >= 400:
+        raise RuntimeError(f"Codex OAuth 授权初始化失败: {_oauth_error_text(result)}")
+
+    payload = _oauth_payload(result)
+    page_type = _oauth_page_type(payload)
+    # The authorize redirect normally ends at HTML /log-in. The first JSON
+    # state is obtained by submitting the identifier with its Sentinel proof.
+    if not page_type:
+        identifier_headers = transport.sentinel_headers("authorize_continue")
+        result = transport.post_json(
+            f"{api}/authorize/continue",
+            {"username": {"kind": "email", "value": email}},
+            referer="https://auth.openai.com/log-in",
+            headers=identifier_headers,
+        )
+
+    last_page_type = ""
+    phone_number = ""
+    phone_sent = False
+    phone_attempts = 0
+    try:
+        phone_attempt_limit = max(int(getattr(phone_callback, "phone_max_attempts", 3) or 1), 1)
+    except (TypeError, ValueError):
+        phone_attempt_limit = 3
+    email_otp_attempts = 0
+    phone_otp_attempts = 0
+    external_resume_count = 0
+
+    for _ in range(32):
+        callback = _callback_from_oauth_result(result, callback_server)
+        if callback:
+            return callback
+        payload = _oauth_payload(result)
+        page_type = _oauth_page_type(payload)
+        continue_url = _oauth_continue_url(payload)
+        if page_type and page_type != last_page_type:
+            log(f"Codex OAuth {transport.kind} 状态: {page_type}")
+            last_page_type = page_type
+
+        if result.status >= 400 or payload.get("error"):
+            error_text = _oauth_error_text(result)
+            effective_page_type = page_type or last_page_type
+            if effective_page_type == "add_phone" and phone_attempts < phone_attempt_limit:
+                if hasattr(phone_callback, "mark_send_failed"):
+                    phone_callback.mark_send_failed(error_text)
+                if hasattr(phone_callback, "reset"):
+                    phone_callback.reset()
+                phone_number = ""
+                phone_sent = False
+                log(
+                    f"Codex OAuth add_phone 号码未通过，换号重试 "
+                    f"({phone_attempts + 1}/{phone_attempt_limit}): {error_text[:180]}"
+                )
+                result = _CodexOAuthHTTPResult(
+                    200,
+                    "https://auth.openai.com/add-phone",
+                    {},
+                    "",
+                    {"page": {"type": "add_phone"}},
+                )
+                continue
+            if page_type == "email_otp_verification" and email_otp_attempts < 3:
+                log(f"Codex OAuth 邮箱验证码未通过，继续取件: {error_text[:180]}")
+            elif page_type == "phone_otp_verification" and phone_otp_attempts < 3:
+                if hasattr(phone_callback, "mark_code_failed"):
+                    phone_callback.mark_code_failed(error_text)
+                log(f"Codex OAuth 手机验证码未通过，继续取码: {error_text[:180]}")
+            else:
+                if phone_sent and hasattr(phone_callback, "mark_send_failed"):
+                    phone_callback.mark_send_failed(error_text)
+                raise RuntimeError(f"Codex OAuth {transport.kind} 状态请求失败: {error_text}")
+
+        if page_type in {"login_start", "login_or_signup_start"}:
+            result = transport.post_json(
+                f"{api}/authorize/continue",
+                {"username": {"kind": "email", "value": email}},
+                referer="https://auth.openai.com/log-in",
+                headers=transport.sentinel_headers("authorize_continue"),
+            )
+            continue
+
+        if page_type == "login_password":
+            if password:
+                result = transport.post_json(
+                    f"{api}/password/verify",
+                    {"password": password},
+                    referer="https://auth.openai.com/log-in/password",
+                    headers=transport.sentinel_headers("password_verify"),
+                )
+            elif str(registration_auth_mode or "").strip().lower() == "email_otp":
+                result = transport.post_json(
+                    f"{api}/passwordless/send-otp",
+                    None,
+                    referer="https://auth.openai.com/log-in/password",
+                )
+            else:
+                raise RuntimeError("Codex OAuth 登录状态需要账号密码")
+            continue
+
+        if page_type in {"email_otp_verification", "email_otp_verification_registration"}:
+            email_otp_attempts += 1
+            code = _callback_value(otp_callback, "邮箱验证码")
+            result = transport.post_json(
+                f"{api}/email-otp/validate",
+                {"code": code},
+                referer="https://auth.openai.com/email-verification",
+            )
+            continue
+
+        if page_type == "add_phone":
+            phone_attempts += 1
+            phone_number = _normalize_protocol_phone_number(
+                _callback_value(phone_callback, "add_phone")
+            )
+            log(f"Codex OAuth {transport.kind}: 提交手机号 {_mask_phone_number(phone_number)}")
+            result = transport.post_json(
+                f"{api}/add-phone/send",
+                {"phone_number": phone_number},
+                referer="https://auth.openai.com/add-phone",
+            )
+            if result.ok and not _oauth_payload(result).get("error"):
+                phone_sent = True
+                if hasattr(phone_callback, "mark_send_succeeded"):
+                    phone_callback.mark_send_succeeded()
+            continue
+
+        if page_type == "phone_otp_verification":
+            if not phone_number and not phone_sent:
+                raise RuntimeError("Codex OAuth 进入手机验证页，但当前进程没有已提交的号码")
+            phone_otp_attempts += 1
+            code = _callback_value(phone_callback, "手机验证码")
+            result = transport.post_json(
+                f"{api}/phone-otp/validate",
+                {"code": code},
+                referer="https://auth.openai.com/phone-verification",
+                headers=transport.sentinel_headers("verify_phone_otp"),
+            )
+            if result.ok and not _oauth_payload(result).get("error"):
+                if hasattr(phone_callback, "report_success"):
+                    phone_callback.report_success()
+            continue
+
+        if page_type == "sign_in_with_chatgpt_codex_consent":
+            workspace_id = _workspace_id_from_payload(payload)
+            if not workspace_id:
+                raise RuntimeError("Codex OAuth Consent 状态缺少 workspace_id")
+            result = transport.post_json(
+                f"{api}/workspace/select",
+                {"workspace_id": workspace_id},
+                referer="https://auth.openai.com/sign-in-with-chatgpt/codex/consent",
+            )
+            continue
+
+        if page_type == "sign_in_with_chatgpt_codex_org":
+            org_id, project_id = _organization_selection_from_payload(payload)
+            if not org_id:
+                raise RuntimeError("Codex OAuth Organization 状态缺少 org_id")
+            result = transport.post_json(
+                f"{api}/organization/select",
+                {"org_id": org_id, "project_id": project_id},
+                referer="https://auth.openai.com/sign-in-with-chatgpt/codex/organization",
+            )
+            continue
+
+        if page_type == "external_url" and continue_url:
+            external_target = urlparse(continue_url)
+            is_chatgpt_session_hop = (external_target.hostname or "").lower() in {
+                "chatgpt.com",
+                "chat.openai.com",
+            }
+            if hasattr(transport, "complete_external"):
+                log(
+                    "Codex OAuth browser_protocol: 交付最终 external_url 到本地回调 "
+                    f"target={external_target.scheme}://{external_target.hostname or '-'}"
+                    f"{external_target.path or '/'}"
+                )
+                callback = transport.complete_external(continue_url, callback_server)
+                if callback:
+                    return callback
+                if is_chatgpt_session_hop:
+                    external_resume_count += 1
+                    if external_resume_count > 3:
+                        raise RuntimeError("Codex OAuth ChatGPT 会话回调循环次数过多")
+                    log("Codex OAuth browser_protocol: ChatGPT 会话已建立，恢复 Codex authorize")
+                    if hasattr(transport, "prepare_auth_origin"):
+                        transport.prepare_auth_origin()
+                    result, callback = _follow_oauth_get(
+                        transport,
+                        auth_url,
+                        callback_server=callback_server,
+                    )
+                    if callback:
+                        return callback
+                    if result.status == 0:
+                        # A completed authorize request redirects to localhost;
+                        # Fetch reports only NetworkError for that CORS hop.
+                        callback = transport.complete_external(auth_url, callback_server)
+                        if callback:
+                            return callback
+                    continue
+                raise RuntimeError("Codex OAuth browser_protocol external_url 未到达本地回调")
+            result, callback = _follow_oauth_get(
+                transport,
+                continue_url,
+                callback_server=callback_server,
+            )
+            if callback:
+                return callback
+            if is_chatgpt_session_hop:
+                external_resume_count += 1
+                if external_resume_count > 3:
+                    raise RuntimeError("Codex OAuth ChatGPT 会话回调循环次数过多")
+                result, callback = _follow_oauth_get(
+                    transport,
+                    auth_url,
+                    callback_server=callback_server,
+                )
+                if callback:
+                    return callback
+            continue
+
+        if page_type in {"error", "account_deactivated"}:
+            raise RuntimeError(f"Codex OAuth 认证状态异常: {_oauth_error_text(result)}")
+
+        if continue_url:
+            direct_callback = _callback_from_redirect_url(continue_url)
+            if direct_callback:
+                return direct_callback
+            result, callback = _follow_oauth_get(
+                transport,
+                urljoin("https://auth.openai.com", continue_url),
+                callback_server=callback_server,
+            )
+            if callback:
+                return callback
+            continue
+
+        if callback_server.event.wait(0.5):
+            return callback_server.wait(1)
+        raise RuntimeError(
+            f"Codex OAuth {transport.kind} 未识别状态: "
+            f"page={page_type or '-'} HTTP {result.status} {_oauth_error_text(result)[:240]}"
+        )
+
+    raise RuntimeError(f"Codex OAuth {transport.kind} 状态转换次数过多")
 
 
 def _decode_jwt_payload(token: str) -> dict[str, Any]:
@@ -2431,6 +3191,35 @@ def _is_codex_browser_login_timeout(exc: Exception) -> bool:
     return "Codex OAuth 浏览器登录超时" in str(exc or "")
 
 
+def _is_codex_protocol_retryable(exc: Exception) -> bool:
+    message = str(exc or "").lower()
+    return any(
+        marker in message
+        for marker in (
+            "invalid_state",
+            "just a moment",
+            "cloudflare",
+            "timeout",
+            "timed out",
+            "connection reset",
+            "connection aborted",
+            "connect error",
+            "sslerror",
+            "tls connect error",
+            "curl: (35)",
+            "proxyerror",
+            "proxy error",
+            "temporarily unavailable",
+            "sentinel token",
+            "http 429",
+            "http 500",
+            "http 502",
+            "http 503",
+            "http 504",
+        )
+    )
+
+
 def perform_codex_oauth_login_on_page(
     page,
     *,
@@ -2627,10 +3416,19 @@ def perform_codex_oauth_browser_protocol_login(
             cookies=cookies,
             log=log,
         )
-        if seeded:
-            log("Codex OAuth 浏览器协议模式: 优先复用账号现有会话")
-        else:
-            log("Codex OAuth 浏览器协议模式: 未发现可复用会话，继续页面登录流程")
+        log(
+            "Codex OAuth 浏览器协议模式: "
+            + ("已注入稳定 Cookie，" if seeded else "")
+            + "所有认证请求将在 Camoufox Fetch 中执行"
+        )
+        _goto_with_retry(
+            page,
+            "https://auth.openai.com/robots.txt",
+            wait_until="domcontentloaded",
+            timeout=30_000,
+            log=log,
+        )
+        transport = _BrowserFetchCodexOAuthTransport(page, log=log, timeout=timeout)
         last_error: Exception | None = None
         for attempt_index in range(1, CODEX_BROWSER_LOGIN_MAX_ATTEMPTS + 1):
             attempt = _new_codex_oauth_attempt()
@@ -2638,29 +3436,17 @@ def perform_codex_oauth_browser_protocol_login(
             log(f"Codex OAuth 浏览器协议授权链接已生成，启动本地回调服务{suffix}")
             try:
                 with _OAuthCallbackServer(port=CODEX_CALLBACK_PORT, state=attempt.state, log=log) as callback_server:
-                    callback = None
-                    if seeded:
-                        callback = _request_codex_oauth_callback_via_browser_fetch(
-                            page,
-                            attempt.auth_url,
-                            callback_server=callback_server,
-                            log=log,
-                            timeout=timeout,
-                        )
-                    if callback is None:
-                        callback = _drive_codex_oauth_page(
-                            page,
-                            auth_url=attempt.auth_url,
-                            email=email,
-                            password=password,
-                            callback_server=callback_server,
-                            log=log,
-                            otp_callback=otp_callback,
-                            phone_callback=phone_callback,
-                            timeout=timeout,
-                            registration_auth_mode=registration_auth_mode,
-                            allow_session_only=has_session and not password,
-                        )
+                    callback = _drive_codex_oauth_protocol_state_machine(
+                        transport,
+                        auth_url=attempt.auth_url,
+                        email=email,
+                        password=password,
+                        registration_auth_mode=registration_auth_mode,
+                        callback_server=callback_server,
+                        log=log,
+                        otp_callback=otp_callback,
+                        phone_callback=phone_callback,
+                    )
                 result = _finalize_codex_oauth_callback(
                     callback,
                     expected_state=attempt.state,
@@ -2674,9 +3460,15 @@ def perform_codex_oauth_browser_protocol_login(
                 return result
             except Exception as exc:
                 last_error = exc
-                if not _is_codex_browser_login_timeout(exc) or attempt_index >= CODEX_BROWSER_LOGIN_MAX_ATTEMPTS:
+                if (
+                    attempt_index >= CODEX_BROWSER_LOGIN_MAX_ATTEMPTS
+                    or not (
+                        _is_codex_browser_login_timeout(exc)
+                        or _is_codex_protocol_retryable(exc)
+                    )
+                ):
                     raise
-                log("Codex OAuth 浏览器登录超时，重新生成授权链接重试")
+                log(f"Codex OAuth 浏览器协议链遇到瞬时异常，重新生成授权链重试: {exc}")
         raise RuntimeError(f"Codex OAuth 授权失败: {last_error}")
     finally:
         if keep_open:
@@ -2700,28 +3492,41 @@ def perform_codex_oauth_protocol_login(
     session_token: str = "",
     cookies: Any = None,
 ) -> dict[str, Any]:
-    del password, registration_auth_mode, otp_callback, phone_callback
     log = log_fn or (lambda _message: None)
     email = str(email or "").strip()
+    password = str(password or "")
+    normalized_auth_mode = str(registration_auth_mode or "").strip().lower()
+    has_session = has_codex_oauth_reusable_session(session_token=session_token, cookies=cookies)
     if not email:
         raise RuntimeError("Codex OAuth 需要账号邮箱")
-    if not has_codex_oauth_reusable_session(session_token=session_token, cookies=cookies):
-        raise RuntimeError("Codex OAuth 协议模式需要账号已有可复用 session_token 或 cookies")
+    if not password and normalized_auth_mode != "email_otp" and not has_session:
+        raise RuntimeError("Codex OAuth 协议模式需要账号密码、邮箱验证码账号或可复用会话")
 
     last_error: Exception | None = None
-    for attempt_index in range(1, CODEX_BROWSER_LOGIN_MAX_ATTEMPTS + 1):
+    for attempt_index in range(1, CODEX_PROTOCOL_LOGIN_MAX_ATTEMPTS + 1):
         attempt = _new_codex_oauth_attempt()
-        suffix = f" ({attempt_index}/{CODEX_BROWSER_LOGIN_MAX_ATTEMPTS})" if attempt_index > 1 else ""
-        log(f"Codex OAuth 协议授权链接已生成，尝试复用已有会话{suffix}")
+        suffix = f" ({attempt_index}/{CODEX_PROTOCOL_LOGIN_MAX_ATTEMPTS})" if attempt_index > 1 else ""
+        log(f"Codex OAuth 纯协议授权链已生成，curl_cffi 启动完整状态机{suffix}")
+        transport = _CurlCodexOAuthTransport(
+            proxy=proxy,
+            session_token=session_token,
+            cookies=cookies,
+            log=log,
+            timeout=timeout,
+        )
         try:
-            callback = _request_codex_oauth_callback_via_protocol(
-                attempt.auth_url,
-                session_token=session_token,
-                cookies=cookies,
-                proxy=proxy,
-                log=log,
-                timeout=timeout,
-            )
+            with _OAuthCallbackServer(port=CODEX_CALLBACK_PORT, state=attempt.state, log=log) as callback_server:
+                callback = _drive_codex_oauth_protocol_state_machine(
+                    transport,
+                    auth_url=attempt.auth_url,
+                    email=email,
+                    password=password,
+                    registration_auth_mode=registration_auth_mode,
+                    callback_server=callback_server,
+                    log=log,
+                    otp_callback=otp_callback,
+                    phone_callback=phone_callback,
+                )
             result = _finalize_codex_oauth_callback(
                 callback,
                 expected_state=attempt.state,
@@ -2735,9 +3540,14 @@ def perform_codex_oauth_protocol_login(
             return result
         except Exception as exc:
             last_error = exc
-            if attempt_index >= CODEX_BROWSER_LOGIN_MAX_ATTEMPTS:
+            if (
+                attempt_index >= CODEX_PROTOCOL_LOGIN_MAX_ATTEMPTS
+                or not _is_codex_protocol_retryable(exc)
+            ):
                 raise
             log(f"Codex OAuth 协议模式授权失败，重新生成授权链接重试: {exc}")
+        finally:
+            transport.close()
     raise RuntimeError(f"Codex OAuth 授权失败: {last_error}")
 
 

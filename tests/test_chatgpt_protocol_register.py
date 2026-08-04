@@ -1623,8 +1623,8 @@ def test_sentinel_runtime_uses_camoufox_and_releases_it(monkeypatch):
             events.append("goto")
 
         def evaluate(self, expression, *args):
-            if expression == "typeof window.SentinelSDK":
-                return "object"
+            if "typeof sdk.__D" in expression:
+                return True
             if expression == "code => window.eval(code)":
                 evaluated_code.append(args[0])
             return None
@@ -1670,13 +1670,42 @@ def test_sentinel_runtime_uses_camoufox_and_releases_it(monkeypatch):
         "password": "pass",
     }
     assert evaluated_code
-    assert evaluated_code[0].startswith("window.SentinelSDK=")
+    assert evaluated_code[0].startswith("window.__ProtocolSentinelSDK=")
     assert "t.___n=_n,t.__Nt=Nt,t.__D=D,t.__jt=jt" in evaluated_code[0]
 
     runtime.close()
     runtime.close()
     assert events.count("enter") == 1
     assert events.count("exit") == 1
+
+
+def test_sentinel_runtime_reinstalls_isolated_sdk_when_reference_is_cleared():
+    events = []
+
+    class _Page:
+        ready = False
+
+        def evaluate(self, expression, *args):
+            if expression == "code => window.eval(code)":
+                events.append(("install", args[0]))
+                self.ready = True
+                return None
+            if "typeof sdk.__D" in expression:
+                events.append(("probe", args[0]))
+                return self.ready
+            raise AssertionError(expression)
+
+    runtime = _SentinelBrowserRuntime.__new__(_SentinelBrowserRuntime)
+    runtime._page = _Page()
+    runtime._patched_sdk_code = "window.__ProtocolSentinelSDK={};"
+
+    runtime._ensure_sdk_runtime()
+
+    assert events == [
+        ("probe", "__ProtocolSentinelSDK"),
+        ("install", "window.__ProtocolSentinelSDK={};"),
+        ("probe", "__ProtocolSentinelSDK"),
+    ]
 
 
 def test_sentinel_runtime_releases_failed_camoufox_startup(monkeypatch):
