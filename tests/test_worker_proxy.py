@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import pytest
+import requests
 
+from core.network_retry import is_retryable_network_error
 from core.worker_proxy import (
     ProxyAcquireError,
     ProxyProbeError,
@@ -10,6 +12,26 @@ from core.worker_proxy import (
     WorkerProxyPolicy,
     probe_proxy,
 )
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Failed to perform, curl: (56) receive failure",
+        "CONNECT tunnel failed",
+        "proxy CONNECT failed, response 509",
+    ],
+)
+def test_curl_proxy_tunnel_failures_are_retryable(message):
+    assert is_retryable_network_error(RuntimeError(message)) is True
+
+
+def test_proxy_http_509_is_retryable():
+    response = requests.Response()
+    response.status_code = 509
+    error = requests.exceptions.HTTPError("proxy returned 509", response=response)
+
+    assert is_retryable_network_error(error) is True
 
 
 def _policy(attempts: int = 4) -> WorkerProxyPolicy:
