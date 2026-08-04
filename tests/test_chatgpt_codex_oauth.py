@@ -18,6 +18,8 @@ from platforms.chatgpt.codex_oauth import (
     CODEX_REDIRECT_URI,
     CODEX_SCOPE,
     PKCECodes,
+    _BrowserFetchCodexOAuthTransport,
+    _CodexOAuthHTTPResult,
     _OAuthCallbackBroker,
     _OAuthCallbackServer,
     _observe_callback_request_on_page,
@@ -28,6 +30,7 @@ from platforms.chatgpt.codex_oauth import (
     _submit_add_phone_number,
     build_codex_authorize_url,
     _drive_codex_oauth_page,
+    _drive_codex_oauth_protocol_state_machine,
     _handle_account_chooser,
     _handle_add_phone_challenge,
     _account_chooser_submission_pending,
@@ -37,7 +40,10 @@ from platforms.chatgpt.codex_oauth import (
     _request_codex_oauth_callback_via_protocol,
     _is_incorrect_password_error,
     _is_whatsapp_fallback_prompt,
+    _normalize_cookie_mapping,
+    _normalize_protocol_phone_number,
     _select_text_message_delivery,
+    _workspace_id_from_payload,
     has_codex_oauth_reusable_session,
     normalize_codex_oauth_mode,
     perform_codex_oauth_login_on_page,
@@ -291,6 +297,228 @@ def test_codex_oauth_mode_helpers_normalize_aliases():
     assert normalize_codex_oauth_mode("协议") == "protocol"
     assert has_codex_oauth_reusable_session(session_token="session-token")
     assert has_codex_oauth_reusable_session(cookies="login_session=abc; other=1")
+
+
+def test_codex_oauth_cookie_parser_accepts_legacy_python_dict_text():
+    assert _normalize_cookie_mapping("{'oai-did': 'device-1', 'login_session': 'old'}") == {
+        "oai-did": "device-1",
+        "login_session": "old",
+    }
+
+
+def test_codex_oauth_reads_workspace_from_real_client_auth_session_shape():
+    assert _workspace_id_from_payload(
+        {
+            "page": {"type": "sign_in_with_chatgpt_codex_consent"},
+            "oai-client-auth-session": {
+                "workspaces": [{"id": "workspace-real", "kind": "personal"}],
+            },
+        }
+    ) == "workspace-real"
+    assert _normalize_protocol_phone_number("569 5785 7721") == "+56957857721"
+
+
+def test_codex_oauth_protocol_state_machine_drives_password_otp_consent_callback():
+    calls = []
+
+    class Transport:
+        kind = "protocol"
+
+        def get(self, url):
+            calls.append(("GET", url, None))
+            return _CodexOAuthHTTPResult(200, "https://auth.openai.com/log-in", {}, "<html>", {})
+
+        def sentinel_headers(self, flow):
+            calls.append(("SENTINEL", flow, None))
+            return {"openai-sentinel-token": flow}
+
+        def post_json(self, url, payload, *, referer, headers=None):
+            calls.append(("POST", url, payload))
+            if url.endswith("/authorize/continue"):
+                data = {"page": {"type": "login_password"}}
+            elif url.endswith("/password/verify"):
+                data = {"page": {"type": "email_otp_verification"}}
+            elif url.endswith("/email-otp/validate"):
+                data = {
+                    "page": {
+                        "type": "sign_in_with_chatgpt_codex_consent",
+                        "payload": {
+                            "current_workspace_id": "workspace-1",
+                            "workspaces": [{"id": "workspace-1"}],
+                        },
+                    }
+                }
+            elif url.endswith("/workspace/select"):
+                return _CodexOAuthHTTPResult(
+                    302,
+                    url,
+                    {
+                        "location": (
+                            "http://localhost:1455/auth/callback?"
+                            "code=code-1&state=state-1"
+                        )
+                    },
+                    "",
+                    {},
+                )
+            else:
+                raise AssertionError(url)
+            return _CodexOAuthHTTPResult(200, url, {}, "", data)
+
+    callback = _drive_codex_oauth_protocol_state_machine(
+        Transport(),
+        auth_url="https://auth.openai.com/oauth/authorize?state=state-1",
+        email="user@example.com",
+        password="Password123!",
+        registration_auth_mode="password",
+        callback_server=_OAuthCallbackServer(port=0, state="state-1"),
+        log=lambda _message: None,
+        otp_callback=lambda: "123456",
+        phone_callback=None,
+    )
+
+    assert callback["code"] == "code-1"
+    assert [(method, url.rsplit("/", 1)[-1]) for method, url, _ in calls if method == "POST"] == [
+        ("POST", "continue"),
+        ("POST", "verify"),
+        ("POST", "validate"),
+        ("POST", "select"),
+    ]
+    assert ("SENTINEL", "authorize_continue", None) in calls
+    assert ("SENTINEL", "password_verify", None) in calls
+
+
+def test_codex_oauth_protocol_state_machine_drives_add_phone_and_phone_otp():
+    calls = []
+
+    class PhoneCallback:
+        values = iter(["+15555550123", "654321"])
+
+        def __init__(self):
+            self.sent = False
+            self.completed = False
+
+        def __call__(self):
+            return next(self.values)
+
+        def mark_send_succeeded(self):
+            self.sent = True
+
+        def report_success(self):
+            self.completed = True
+
+    class Transport:
+        kind = "browser_protocol"
+
+        def get(self, url):
+            return _CodexOAuthHTTPResult(200, "https://auth.openai.com/log-in", {}, "<html>", {})
+
+        def sentinel_headers(self, flow):
+            calls.append(("sentinel", flow))
+            return {"openai-sentinel-token": flow}
+
+        def post_json(self, url, payload, *, referer, headers=None):
+            calls.append((url, payload))
+            if url.endswith("/authorize/continue"):
+                data = {"page": {"type": "email_otp_verification"}}
+            elif url.endswith("/email-otp/validate"):
+                data = {"page": {"type": "add_phone"}}
+            elif url.endswith("/add-phone/send"):
+                data = {"page": {"type": "phone_otp_verification"}}
+            elif url.endswith("/phone-otp/validate"):
+                data = {
+                    "page": {
+                        "type": "sign_in_with_chatgpt_codex_consent",
+                        "payload": {"workspaces": [{"id": "workspace-1"}]},
+                    }
+                }
+            elif url.endswith("/workspace/select"):
+                return _CodexOAuthHTTPResult(
+                    302,
+                    url,
+                    {"location": "http://localhost:1455/auth/callback?code=ok&state=s"},
+                    "",
+                    {},
+                )
+            else:
+                raise AssertionError(url)
+            return _CodexOAuthHTTPResult(200, url, {}, "", data)
+
+    phone = PhoneCallback()
+    callback = _drive_codex_oauth_protocol_state_machine(
+        Transport(),
+        auth_url="https://auth.openai.com/oauth/authorize?state=s",
+        email="user@example.com",
+        password="",
+        registration_auth_mode="email_otp",
+        callback_server=_OAuthCallbackServer(port=0, state="s"),
+        log=lambda _message: None,
+        otp_callback=lambda: "123456",
+        phone_callback=phone,
+    )
+
+    assert callback["code"] == "ok"
+    assert phone.sent is True
+    assert phone.completed is True
+    assert ("sentinel", "verify_phone_otp") in calls
+
+
+def test_browser_fetch_oauth_transport_executes_get_and_post_inside_page(monkeypatch):
+    calls = []
+    page = object()
+
+    def fake_fetch(actual_page, url, **kwargs):
+        calls.append((actual_page, url, kwargs))
+        return {"status": 200, "ok": True, "url": url, "headers": {}, "text": "{}", "data": {}}
+
+    monkeypatch.setattr("platforms.chatgpt.browser_register._browser_fetch", fake_fetch)
+    transport = _BrowserFetchCodexOAuthTransport(page, log=lambda _message: None, timeout=60)
+
+    transport.get("https://auth.openai.com/oauth/authorize")
+    transport.post_json(
+        "https://auth.openai.com/api/accounts/authorize/continue",
+        {"username": {"kind": "email", "value": "user@example.com"}},
+        referer="https://auth.openai.com/log-in",
+    )
+
+    assert all(item[0] is page for item in calls)
+    assert calls[0][2]["method"] == "GET"
+    assert calls[1][2]["method"] == "POST"
+    assert calls[1][2]["redirect"] == "follow"
+
+
+def test_browser_fetch_transport_selects_callback_matching_current_state():
+    handlers = []
+
+    class Request:
+        def __init__(self, url):
+            self.url = url
+
+    class Context:
+        def on(self, event, handler):
+            assert event == "request"
+            handlers.append(handler)
+
+        def remove_listener(self, event, handler):
+            handlers.remove(handler)
+
+    class Page:
+        context = Context()
+        url = "https://auth.openai.com/"
+
+        def goto(self, url, **kwargs):
+            for handler in list(handlers):
+                handler(Request("http://localhost:1455/auth/callback?code=old&state=old-state"))
+                handler(Request("http://localhost:1455/auth/callback?code=current&state=current-state"))
+
+    transport = _BrowserFetchCodexOAuthTransport(Page(), log=lambda _message: None, timeout=60)
+    callback = transport.complete_external(
+        "https://auth.openai.com/api/oauth/oauth2/auth",
+        _OAuthCallbackServer(port=0, state="current-state"),
+    )
+
+    assert callback["code"] == "current"
+    assert callback["state"] == "current-state"
 
 
 def test_codex_oauth_protocol_uses_chrome_tls_and_follows_callback_redirect(monkeypatch):
@@ -2142,6 +2370,7 @@ def test_chatgpt_registration_result_keeps_post_codex_oauth_data():
             "codex_refresh_token": "codex-refresh",
             "codex_id_token": "codex-id",
             "codex_auth_path": "data/codex_auths/codex-test.json",
+            "cookies": {"oai-did": "device-1"},
             "post_codex_oauth": {"ok": True},
         }
     )
@@ -2151,4 +2380,5 @@ def test_chatgpt_registration_result_keeps_post_codex_oauth_data():
     assert mapped.extra["codex_refresh_token"] == "codex-refresh"
     assert mapped.extra["codex_id_token"] == "codex-id"
     assert mapped.extra["codex_auth_path"] == "data/codex_auths/codex-test.json"
+    assert mapped.extra["cookies"] == '{"oai-did":"device-1"}'
     assert mapped.extra["post_codex_oauth"] == {"ok": True}

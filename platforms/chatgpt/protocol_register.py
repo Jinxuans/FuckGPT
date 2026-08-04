@@ -205,6 +205,7 @@ class _SentinelBrowserRuntime:
 
     _sdk_lock = threading.Lock()
     _sdk_code: str | None = None
+    _sdk_global = "__ProtocolSentinelSDK"
 
     def __init__(self, session, *, user_agent: str, proxy: str | None):
         from camoufox.sync_api import Camoufox
@@ -213,6 +214,7 @@ class _SentinelBrowserRuntime:
         self._camoufox = None
         self._browser = None
         self._page = None
+        self._patched_sdk_code = ""
         launch_options = {
             "headless": True,
             "locale": "en-US",
@@ -273,14 +275,40 @@ class _SentinelBrowserRuntime:
             raise RuntimeError("Sentinel SDK 全局声明发生变化，无法安装 VM token 运行时")
         patched_sdk_code = sdk_code.replace(hook, replacement).replace(
             sdk_declaration,
-            "window.SentinelSDK=",
+            f"window.{self._sdk_global}=",
             1,
         )
-        self._page.evaluate(
-            "code => window.eval(code)", patched_sdk_code
+        self._patched_sdk_code = patched_sdk_code
+        self._install_sdk_runtime()
+
+    def _sdk_runtime_ready(self) -> bool:
+        return bool(
+            self._page.evaluate(
+                """globalName => {
+                    const sdk = window[globalName];
+                    return Boolean(
+                        sdk
+                        && typeof sdk === "object"
+                        && typeof sdk.token === "function"
+                        && typeof sdk.__D === "function"
+                        && typeof sdk.___n === "function"
+                    );
+                }""",
+                self._sdk_global,
+            )
         )
-        if self._page.evaluate("typeof window.SentinelSDK") != "object":
-            raise RuntimeError("Sentinel SDK 初始化失败")
+
+    def _install_sdk_runtime(self) -> None:
+        self._page.evaluate("code => window.eval(code)", self._patched_sdk_code)
+        if not self._sdk_runtime_ready():
+            raise RuntimeError("Sentinel SDK 初始化失败：内部 VM 接口缺失")
+
+    def _ensure_sdk_runtime(self) -> None:
+        # The auth page loads its own public Sentinel SDK after DOMContentLoaded.
+        # Keep the patched runtime under a private global and reinstall it if page
+        # scripts or a navigation ever clear that isolated reference.
+        if not self._sdk_runtime_ready():
+            self._install_sdk_runtime()
 
     @classmethod
     def create(cls, *args, **kwargs):
@@ -305,9 +333,10 @@ class _SentinelBrowserRuntime:
         return "syntaxerror" in lowered or "typeerror" in lowered or "error:" in lowered
 
     def vm_tokens(self, chat_req: dict, cached_proof: str) -> dict[str, str]:
+        self._ensure_sdk_runtime()
         result = self._page.evaluate(
-            """async ({ chatReq, cachedProof }) => {
-                const sdk = window.SentinelSDK;
+            """async ({ chatReq, cachedProof, globalName }) => {
+                const sdk = window[globalName];
                 sdk.__D(chatReq, cachedProof);
                 const turnstile = chatReq.turnstile || {};
                 const t = turnstile.dx
@@ -324,7 +353,11 @@ class _SentinelBrowserRuntime:
                 }
                 return { t, so, soFallback };
             }""",
-            {"chatReq": chat_req, "cachedProof": cached_proof},
+            {
+                "chatReq": chat_req,
+                "cachedProof": cached_proof,
+                "globalName": self._sdk_global,
+            },
         )
         t_value = str((result or {}).get("t") or "")
         if (chat_req.get("turnstile", {}).get("required") and not t_value):
@@ -339,9 +372,10 @@ class _SentinelBrowserRuntime:
         return {"t": t_value, "so": so_value}
 
     def token_headers(self, flow: str) -> dict[str, str]:
+        self._ensure_sdk_runtime()
         result = self._page.evaluate(
-            """async flow => {
-                const sdk = window.SentinelSDK;
+            """async ({ flow, globalName }) => {
+                const sdk = window[globalName];
                 const token = await sdk.token(flow);
                 let so = null;
                 if (typeof sdk.sessionObserverToken === "function") {
@@ -349,7 +383,7 @@ class _SentinelBrowserRuntime:
                 }
                 return { token, so };
             }""",
-            flow,
+            {"flow": flow, "globalName": self._sdk_global},
         )
         token = result.get("token") if isinstance(result, dict) else None
         if isinstance(token, str):
