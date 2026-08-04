@@ -113,6 +113,7 @@ const DEFAULT_REGISTER_KAKAO_CODEX_PUSH_INPUT = {
     platform_proxy_value: '',
     extra: {
       identity_provider: 'mailbox',
+      browser_protocol_headed: false,
     },
   },
   kakao: {
