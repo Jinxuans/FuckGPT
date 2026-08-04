@@ -90,7 +90,7 @@ type MailboxPayload = {
 };
 
 type MailboxRegistrationOptions = {
-  executorType: "browser_protocol" | "headless" | "headed";
+  executorType: "browser_protocol" | "browser";
   visibleWindow: boolean;
   proxyMode: "direct" | "proxy_service" | "manual";
   proxyValue: string;
@@ -292,10 +292,10 @@ function MailboxRegisterConfigModal({
       try {
         const saved = JSON.parse(window.localStorage.getItem(MAILBOX_REGISTER_OPTIONS_KEY) || "{}");
         return {
-          executorType: ["browser_protocol", "headless", "headed"].includes(saved.executorType)
+          executorType: ["browser_protocol", "browser"].includes(saved.executorType)
             ? saved.executorType
-            : "headless",
-          visibleWindow: Boolean(saved.visibleWindow),
+            : "browser",
+          visibleWindow: Boolean(saved.visibleWindow) || saved.executorType === "headed",
           proxyMode: ["direct", "proxy_service", "manual"].includes(saved.proxyMode) ? saved.proxyMode : "direct",
           proxyValue: String(saved.proxyValue || ""),
         };
@@ -303,7 +303,7 @@ function MailboxRegisterConfigModal({
         // Ignore invalid legacy browser storage and fall back to safe defaults.
       }
     }
-    return { executorType: "headless", visibleWindow: false, proxyMode: "direct", proxyValue: "" };
+    return { executorType: "browser", visibleWindow: false, proxyMode: "direct", proxyValue: "" };
   });
   const [starting, setStarting] = useState(false);
   const [error, setError] = useState("");
@@ -350,11 +350,10 @@ function MailboxRegisterConfigModal({
               className="control-surface control-surface-compact appearance-none"
             >
               <option value="browser_protocol">浏览器协议模式</option>
-              <option value="headless">后台浏览器自动</option>
-              <option value="headed">可视浏览器自动</option>
+              <option value="browser">浏览器模式</option>
             </select>
           </div>
-          {options.executorType === "browser_protocol" ? (
+          {(["browser_protocol", "browser"] as const).includes(options.executorType) ? (
             <label className="flex cursor-pointer items-start gap-3 rounded-xl border border-[var(--border)] bg-[var(--bg-pane)]/45 px-4 py-3">
               <input
                 type="checkbox"
@@ -364,7 +363,7 @@ function MailboxRegisterConfigModal({
               />
               <span>
                 <span className="block text-sm font-medium text-[var(--text-primary)]">显示浏览器窗口</span>
-                <span className="mt-1 block text-xs text-[var(--text-muted)]">注册链路保持不变，仅将 Camoufox 从后台运行切换为可视窗口。</span>
+                <span className="mt-1 block text-xs text-[var(--text-muted)]">关闭时后台运行，开启后显示 Camoufox 自动化窗口。</span>
               </span>
             </label>
           ) : null}
@@ -808,7 +807,7 @@ export default function MailboxResources() {
           mail_provider: resource.provider,
           mailbox_address_id: resource.mailbox_address_id,
           prefer_password_registration: true,
-          browser_protocol_headed: options.executorType === "browser_protocol" && options.visibleWindow,
+          browser_visible: options.visibleWindow,
         },
       }),
     });

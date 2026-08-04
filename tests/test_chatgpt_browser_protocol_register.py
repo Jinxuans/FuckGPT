@@ -18,6 +18,12 @@ def test_browser_protocol_request_is_accepted_by_api_schema():
     assert request.executor_type == "browser_protocol"
 
 
+def test_unified_browser_request_is_accepted_by_api_schema():
+    request = RegisterTaskRequest(executor_type="browser")
+
+    assert request.executor_type == "browser"
+
+
 def test_browser_protocol_adapter_builds_headless_fetch_worker():
     platform = ChatGPTPlatform(
         config=RegisterConfig(
@@ -51,7 +57,7 @@ def test_browser_protocol_adapter_can_build_visible_fetch_worker():
             executor_type="browser_protocol",
             extra={
                 "identity_provider": "mailbox",
-                "browser_protocol_headed": True,
+                "browser_visible": True,
             },
         )
     )
@@ -73,6 +79,42 @@ def test_browser_protocol_adapter_can_build_visible_fetch_worker():
     assert worker.headless is False
     assert worker.flow_mode == "browser_protocol"
     assert "Browser Protocol 已启用可视浏览器窗口" in logs
+
+
+def test_unified_browser_adapter_selects_window_visibility():
+    def build_worker(visible: bool):
+        logs = []
+        platform = ChatGPTPlatform(
+            config=RegisterConfig(
+                executor_type="browser",
+                extra={
+                    "identity_provider": "mailbox",
+                    "browser_visible": visible,
+                },
+            )
+        )
+        context = RegistrationContext(
+            platform_name="chatgpt",
+            platform_display_name="ChatGPT",
+            platform=platform,
+            identity=SimpleNamespace(email="user@example.com", metadata={}),
+            config=platform.config,
+            email="user@example.com",
+            password="StrongPass123!",
+            log_fn=logs.append,
+        )
+        artifacts = RegistrationArtifacts(otp_callback=lambda: "123456")
+        adapter = platform.build_browser_registration_adapter()
+        return adapter.browser_worker_builder(context, artifacts), logs
+
+    hidden_worker, hidden_logs = build_worker(False)
+    visible_worker, visible_logs = build_worker(True)
+
+    assert hidden_worker.headless is True
+    assert visible_worker.headless is False
+    assert hidden_worker.flow_mode == visible_worker.flow_mode == "dom"
+    assert "浏览器模式已启用可视浏览器窗口" not in hidden_logs
+    assert "浏览器模式已启用可视浏览器窗口" in visible_logs
 
 
 def test_browser_protocol_flow_mode_survives_isolated_process_config(monkeypatch):

@@ -29,3 +29,6 @@ def test_chatgpt_exposes_protocol_registration(client):
     chatgpt = next(item for item in platforms if item["name"] == "chatgpt")
     assert "protocol" in chatgpt["supported_executors"]
     assert "browser_protocol" in chatgpt["supported_executors"]
+    assert "browser" in chatgpt["supported_executors"]
+    assert "headless" not in chatgpt["supported_executors"]
+    assert "headed" not in chatgpt["supported_executors"]
