@@ -624,6 +624,10 @@ class ChatGPTPlatform(BasePlatform):
             post_codex_oauth = _truthy(ctx.extra.get("auto_codex_oauth_after_register"))
             codex_phone_callback = self._build_codex_phone_callback(ctx.proxy) if post_codex_oauth else None
             keep_browser_open = _truthy(ctx.extra.get("codex_oauth_keep_browser_open"))
+            browser_protocol_headed = (
+                ctx.executor_type == "browser_protocol"
+                and _truthy(ctx.extra.get("browser_protocol_headed"))
+            )
             identity_metadata = dict(getattr(ctx.identity, "metadata", {}) or {})
             allocation_id = str(identity_metadata.get("mailbox_allocation_id") or "")
 
@@ -659,8 +663,17 @@ class ChatGPTPlatform(BasePlatform):
                         reason=reason,
                     )
 
+            if browser_protocol_headed:
+                ctx.log("Browser Protocol 已启用可视浏览器窗口")
+
             return ChatGPTBrowserRegister(
-                headless=(ctx.executor_type in {"browser_protocol", "headless"}),
+                headless=(
+                    ctx.executor_type == "headless"
+                    or (
+                        ctx.executor_type == "browser_protocol"
+                        and not browser_protocol_headed
+                    )
+                ),
                 proxy=ctx.proxy,
                 otp_callback=artifacts.otp_callback,
                 post_codex_oauth=post_codex_oauth,

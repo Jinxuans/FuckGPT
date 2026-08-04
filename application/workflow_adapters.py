@@ -231,7 +231,10 @@ def register_builtin_workflow_components() -> None:
                 "executor_type": "headless",
                 "platform_proxy_mode": "direct",
                 "platform_proxy_value": "",
-                "extra": {"identity_provider": "mailbox"},
+                "extra": {
+                    "identity_provider": "mailbox",
+                    "browser_protocol_headed": False,
+                },
             },
             "codex": {
                 "browser_mode": "headless",
@@ -252,7 +255,12 @@ def register_builtin_workflow_components() -> None:
                         "executor_type": {"type": "string", "enum": ["browser_protocol", "headless", "headed"]},
                         "platform_proxy_mode": {"type": "string", "enum": ["direct", "manual", "proxy_service"]},
                         "platform_proxy_value": {"type": "string"},
-                        "extra": {"type": "object"},
+                        "extra": {
+                            "type": "object",
+                            "properties": {
+                                "browser_protocol_headed": {"type": "boolean"},
+                            },
+                        },
                     },
                 },
                 "codex": {
@@ -289,6 +297,12 @@ def register_builtin_workflow_components() -> None:
                                 {"label": "无头模式", "value": "headless"},
                                 {"label": "可视模式", "value": "headed"},
                             ],
+                        },
+                        {
+                            "path": "registration.extra.browser_protocol_headed",
+                            "label": "浏览器协议模式显示窗口",
+                            "type": "boolean",
+                            "helper": "仅在浏览器协议模式下生效。",
                         },
                         {
                             "path": "registration.platform_proxy_mode",

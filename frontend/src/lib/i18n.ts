@@ -443,6 +443,10 @@ const ZH_MESSAGES = {
   "accounts.preferPasswordRegistration": "优先使用密码注册",
   "accounts.preferPasswordRegistrationHint":
     "默认开启，浏览器会主动进入密码创建页。关闭后保留邮箱验证码入口；若服务端仍要求密码，流程会继续自动处理。",
+  "accounts.browserProtocolVisible": "显示浏览器窗口",
+  "accounts.browserProtocolVisibleHint":
+    "协议请求仍由同一 Camoufox 页面执行，仅把后台窗口切换为可视，方便观察完整链路。",
+  "accounts.visibleWindow": "可视窗口",
 
   "advanced.solver.statusChecking": "检测中",
   "advanced.solver.running": "运行中",
@@ -542,6 +546,8 @@ const ZH_MESSAGES = {
   "registration.mailboxDescription": "使用{label}自动收验证码并完成注册",
   "registration.oauthDescription": "使用 {label} 账号自动创建平台账号",
   "executor.protocolDescription": "不打开浏览器，直接通过协议流程自动注册",
+  "executor.browserProtocolDescription":
+    "同一 Camoufox 页面内执行协议请求，默认后台运行，可勾选显示窗口",
   "executor.oauthRequiresBrowser": "第三方账号注册必须通过浏览器自动化完成",
   "executor.headlessMailboxDescription": "浏览器在后台自动执行，界面不可见",
   "executor.headlessOauthDescription":
@@ -1004,6 +1010,10 @@ const EN_MESSAGES: Record<TranslationKey, string> = {
   "accounts.preferPasswordRegistration": "Prefer password registration",
   "accounts.preferPasswordRegistrationHint":
     "Enabled by default. The browser proactively opens the password creation page. When disabled, it keeps the email-code entry path; a server-requested password step is still handled automatically.",
+  "accounts.browserProtocolVisible": "Show browser window",
+  "accounts.browserProtocolVisibleHint":
+    "Protocol requests still run in the same Camoufox page; only the background window becomes visible for observing the flow.",
+  "accounts.visibleWindow": "Visible window",
 
   "advanced.solver.statusChecking": "Checking",
   "advanced.solver.running": "Running",
@@ -1109,6 +1119,8 @@ const EN_MESSAGES: Record<TranslationKey, string> = {
     "Use a {label} account to create the platform account automatically",
   "executor.protocolDescription":
     "Register through the protocol flow without opening a browser",
+  "executor.browserProtocolDescription":
+    "Run protocol requests in one Camoufox page, hidden by default with an optional visible window",
   "executor.oauthRequiresBrowser":
     "OAuth account registration must use browser automation",
   "executor.headlessMailboxDescription":

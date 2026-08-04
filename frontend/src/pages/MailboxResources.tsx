@@ -91,6 +91,7 @@ type MailboxPayload = {
 
 type MailboxRegistrationOptions = {
   executorType: "browser_protocol" | "headless" | "headed";
+  visibleWindow: boolean;
   proxyMode: "direct" | "proxy_service" | "manual";
   proxyValue: string;
 };
@@ -294,6 +295,7 @@ function MailboxRegisterConfigModal({
           executorType: ["browser_protocol", "headless", "headed"].includes(saved.executorType)
             ? saved.executorType
             : "headless",
+          visibleWindow: Boolean(saved.visibleWindow),
           proxyMode: ["direct", "proxy_service", "manual"].includes(saved.proxyMode) ? saved.proxyMode : "direct",
           proxyValue: String(saved.proxyValue || ""),
         };
@@ -301,7 +303,7 @@ function MailboxRegisterConfigModal({
         // Ignore invalid legacy browser storage and fall back to safe defaults.
       }
     }
-    return { executorType: "headless", proxyMode: "direct", proxyValue: "" };
+    return { executorType: "headless", visibleWindow: false, proxyMode: "direct", proxyValue: "" };
   });
   const [starting, setStarting] = useState(false);
   const [error, setError] = useState("");
@@ -352,6 +354,20 @@ function MailboxRegisterConfigModal({
               <option value="headed">可视浏览器自动</option>
             </select>
           </div>
+          {options.executorType === "browser_protocol" ? (
+            <label className="flex cursor-pointer items-start gap-3 rounded-xl border border-[var(--border)] bg-[var(--bg-pane)]/45 px-4 py-3">
+              <input
+                type="checkbox"
+                checked={options.visibleWindow}
+                onChange={(event) => setOptions((current) => ({ ...current, visibleWindow: event.target.checked }))}
+                className="mt-0.5 h-4 w-4 accent-[var(--accent)]"
+              />
+              <span>
+                <span className="block text-sm font-medium text-[var(--text-primary)]">显示浏览器窗口</span>
+                <span className="mt-1 block text-xs text-[var(--text-muted)]">注册链路保持不变，仅将 Camoufox 从后台运行切换为可视窗口。</span>
+              </span>
+            </label>
+          ) : null}
           <div>
             <label className="mb-1 block text-xs text-[var(--text-muted)]">ChatGPT/Codex 代理</label>
             <select
@@ -792,6 +808,7 @@ export default function MailboxResources() {
           mail_provider: resource.provider,
           mailbox_address_id: resource.mailbox_address_id,
           prefer_password_registration: true,
+          browser_protocol_headed: options.executorType === "browser_protocol" && options.visibleWindow,
         },
       }),
     });

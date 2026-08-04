@@ -44,6 +44,37 @@ def test_browser_protocol_adapter_builds_headless_fetch_worker():
     assert worker.flow_mode == "browser_protocol"
 
 
+def test_browser_protocol_adapter_can_build_visible_fetch_worker():
+    logs = []
+    platform = ChatGPTPlatform(
+        config=RegisterConfig(
+            executor_type="browser_protocol",
+            extra={
+                "identity_provider": "mailbox",
+                "browser_protocol_headed": True,
+            },
+        )
+    )
+    context = RegistrationContext(
+        platform_name="chatgpt",
+        platform_display_name="ChatGPT",
+        platform=platform,
+        identity=SimpleNamespace(email="user@example.com", metadata={}),
+        config=platform.config,
+        email="user@example.com",
+        password="StrongPass123!",
+        log_fn=logs.append,
+    )
+    artifacts = RegistrationArtifacts(otp_callback=lambda: "123456")
+
+    adapter = platform.build_browser_registration_adapter()
+    worker = adapter.browser_worker_builder(context, artifacts)
+
+    assert worker.headless is False
+    assert worker.flow_mode == "browser_protocol"
+    assert "Browser Protocol 已启用可视浏览器窗口" in logs
+
+
 def test_browser_protocol_flow_mode_survives_isolated_process_config(monkeypatch):
     captured = {}
 

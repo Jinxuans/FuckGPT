@@ -480,6 +480,7 @@ function RegisterModal({
   const [platformProxyMode, setPlatformProxyMode] = useState('direct')
   const [platformProxyValue, setPlatformProxyValue] = useState('')
   const [preferPasswordRegistration, setPreferPasswordRegistration] = useState(true)
+  const [browserProtocolVisible, setBrowserProtocolVisible] = useState(false)
   const [autoCodexOAuth, setAutoCodexOAuth] = useState(false)
   const [codexOAuthBrowserMode, setCodexOAuthBrowserMode] = useState('headless')
   const [keepCodexBrowserOpen, setKeepCodexBrowserOpen] = useState(false)
@@ -598,6 +599,9 @@ function RegisterModal({
       }
       if (platformMeta?.name === 'chatgpt' && selection.executorType !== 'protocol') {
         extra.prefer_password_registration = preferPasswordRegistration
+      }
+      if (platformMeta?.name === 'chatgpt' && selection.executorType === 'browser_protocol') {
+        extra.browser_protocol_headed = browserProtocolVisible
       }
       if (selection.identityProvider === 'mailbox') {
         if (!defaultMailboxProvider?.provider_key) {
@@ -729,6 +733,27 @@ function RegisterModal({
                   </div>
                 ) : null}
 
+                {platformMeta?.name === 'chatgpt' && selection.executorType === 'browser_protocol' ? (
+                  <div className="rounded-xl border border-[var(--border)] bg-[var(--bg-pane)]/45 px-4 py-3">
+                    <label className="flex cursor-pointer items-start gap-3">
+                      <input
+                        type="checkbox"
+                        checked={browserProtocolVisible}
+                        onChange={(event) => setBrowserProtocolVisible(event.target.checked)}
+                        className="mt-0.5 h-4 w-4 accent-[var(--accent)]"
+                      />
+                      <span>
+                        <span className="block text-sm font-medium text-[var(--text-primary)]">
+                          {t('accounts.browserProtocolVisible')}
+                        </span>
+                        <span className="mt-1 block text-xs text-[var(--text-muted)]">
+                          {t('accounts.browserProtocolVisibleHint')}
+                        </span>
+                      </span>
+                    </label>
+                  </div>
+                ) : null}
+
                 <div className="rounded-xl border border-[var(--border)] bg-[var(--bg-pane)]/45 px-4 py-3">
                   <label className="flex cursor-pointer items-start gap-3">
                     <input
@@ -818,7 +843,10 @@ function RegisterModal({
 
                 <div className="rounded-xl border border-[var(--border)] bg-[var(--bg-hover)] px-4 py-3 text-xs text-[var(--text-secondary)]">
                   <div>{t('accounts.identitySummary')}: <span className="text-[var(--text-primary)]">{selectedRegistration?.label || '-'}</span></div>
-                  <div className="mt-1">{t('accounts.executorSummary')}: <span className="text-[var(--text-primary)]">{selectedExecutor?.label || '-'}</span></div>
+                  <div className="mt-1">{t('accounts.executorSummary')}: <span className="text-[var(--text-primary)]">
+                    {selectedExecutor?.label || '-'}
+                    {selection.executorType === 'browser_protocol' && browserProtocolVisible ? ` · ${t('accounts.visibleWindow')}` : ''}
+                  </span></div>
                   <div className="mt-1">{t('accounts.verificationSummary')}: <span className="text-[var(--text-primary)]">{
                     selection.executorType === 'protocol'
                       ? t('accounts.protocolVerificationSummary')
