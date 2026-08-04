@@ -771,6 +771,7 @@ class ChatGPTPlatform(BasePlatform):
              ]},
             {"id": "codex_oauth_authorize", "label": "Codex OAuth 授权",
              "params": [
+                 {"key": "oauth_mode", "label": "授权模式", "type": "select", "options": ["browser", "browser_protocol", "protocol"]},
                  {"key": "browser_mode", "label": "浏览器模式", "type": "select", "options": ["headless", "headed"]},
                  {"key": "keep_browser_open", "label": "完成后保留浏览器窗口", "type": "select", "options": ["false", "true"]},
                  *proxy_params,
@@ -901,14 +902,31 @@ class ChatGPTPlatform(BasePlatform):
                 }
 
         if action_id == "codex_oauth_authorize":
-            from platforms.chatgpt.codex_oauth import perform_codex_oauth_login
+            from platforms.chatgpt import codex_oauth
 
             self.raise_if_cancelled()
             if not account.email:
                 return {"ok": False, "error": "Codex OAuth 授权需要账号邮箱"}
             registration_auth_mode = _resolve_registration_auth_mode(extra)
-            if not account.password and registration_auth_mode != "email_otp":
-                return {"ok": False, "error": "Codex OAuth 授权需要账号密码"}
+            oauth_mode = codex_oauth.normalize_codex_oauth_mode(
+                params.get("oauth_mode")
+                or params.get("executor_type")
+                or (self.config.extra or {}).get("codex_oauth_mode")
+                or "browser"
+            )
+            reusable_session = codex_oauth.has_codex_oauth_reusable_session(
+                session_token=a.session_token,
+                cookies=a.cookies,
+            )
+            if (
+                not account.password
+                and registration_auth_mode != "email_otp"
+                and not (
+                    oauth_mode in {"protocol", "browser_protocol"}
+                    and reusable_session
+                )
+            ):
+                return {"ok": False, "error": "Codex OAuth 授权需要账号密码或可复用会话"}
             browser_mode = str(params.get("browser_mode") or "").strip().lower()
             if not browser_mode:
                 browser_mode = str((self.config.extra or {}).get("codex_oauth_browser_mode") or "headed").strip().lower()
@@ -946,7 +964,9 @@ class ChatGPTPlatform(BasePlatform):
             except Exception as exc:
                 self.log(f"未绑定可用验证邮箱，Codex OAuth 如触发验证码将失败: {exc}")
             phone_callback = self._build_codex_phone_callback(proxy)
-            result = perform_codex_oauth_login(
+            self.log(f"Codex OAuth 授权模式: {oauth_mode}")
+            result = codex_oauth.perform_codex_oauth_login_with_mode(
+                oauth_mode=oauth_mode,
                 email=account.email,
                 password=account.password,
                 registration_auth_mode=registration_auth_mode,
@@ -956,6 +976,8 @@ class ChatGPTPlatform(BasePlatform):
                 otp_callback=otp_callback,
                 phone_callback=phone_callback,
                 keep_browser_open=keep_browser_open,
+                session_token=a.session_token,
+                cookies=a.cookies,
             )
             self.raise_if_cancelled()
             return {"ok": True, "data": result}

@@ -941,6 +941,7 @@ def test_codex_oauth_batch_freezes_selected_account_ids_and_params(client):
     assert set(payload["account_ids"]) == {first_id, third_id}
     assert payload["action_id"] == "codex_oauth_authorize"
     assert payload["concurrency"] == 3
+    assert payload["params"]["oauth_mode"] == "browser"
     assert payload["params"]["platform_proxy_mode"] == "manual"
 
 

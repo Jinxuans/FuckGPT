@@ -436,6 +436,11 @@ function buildActionParamDraft(action: any, acc: any) {
 
 function getActionOptionLabel(paramKey: string, value: string) {
   const labels: Record<string, Record<string, string>> = {
+    oauth_mode: {
+      browser: '浏览器模式',
+      browser_protocol: '浏览器协议模式（Fetch 优先）',
+      protocol: '协议模式（复用已有会话）',
+    },
     browser_mode: {
       headless: '后台浏览器',
       headed: '可视浏览器',
@@ -482,6 +487,7 @@ function RegisterModal({
   const [preferPasswordRegistration, setPreferPasswordRegistration] = useState(true)
   const [browserVisible, setBrowserVisible] = useState(false)
   const [autoCodexOAuth, setAutoCodexOAuth] = useState(false)
+  const [codexOAuthMode, setCodexOAuthMode] = useState('browser')
   const [codexOAuthBrowserMode, setCodexOAuthBrowserMode] = useState('headless')
   const [keepCodexBrowserOpen, setKeepCodexBrowserOpen] = useState(false)
   const [startError, setStartError] = useState('')
@@ -596,6 +602,7 @@ function RegisterModal({
       const extra: Record<string, any> = {
         identity_provider: selection.identityProvider,
         auto_codex_oauth_after_register: autoCodexOAuth,
+        codex_oauth_mode: codexOAuthMode,
         codex_oauth_browser_mode: codexOAuthBrowserMode,
         codex_oauth_keep_browser_open: keepCodexBrowserOpen,
       }
@@ -778,26 +785,44 @@ function RegisterModal({
                   </label>
                   {autoCodexOAuth ? (
                     <div className="mt-3 grid gap-2 sm:grid-cols-[160px_1fr]">
-                      <label className="text-xs text-[var(--text-muted)] sm:pt-2">Codex 浏览器模式</label>
+                      <label className="text-xs text-[var(--text-muted)] sm:pt-2">Codex 授权模式</label>
                       <select
-                        value={codexOAuthBrowserMode}
-                        onChange={(event) => setCodexOAuthBrowserMode(event.target.value)}
+                        value={codexOAuthMode}
+                        onChange={(event) => setCodexOAuthMode(event.target.value)}
                         className="control-surface control-surface-compact"
                       >
-                        <option value="headed">可视浏览器</option>
-                        <option value="headless">后台浏览器</option>
+                        <option value="browser">浏览器模式</option>
+                        <option value="browser_protocol">浏览器协议模式（Fetch 优先）</option>
+                        <option value="protocol">协议模式（复用已有会话）</option>
                       </select>
-                      {codexOAuthBrowserMode === 'headed' ? (
-                        <label className="flex items-center gap-2 text-xs text-[var(--text-muted)] sm:col-span-2">
-                          <input
-                            type="checkbox"
-                            checked={keepCodexBrowserOpen}
-                            onChange={(event) => setKeepCodexBrowserOpen(event.target.checked)}
-                            className="h-4 w-4 accent-[var(--accent)]"
-                          />
-                          完成后保留浏览器窗口
-                        </label>
-                      ) : null}
+                      {codexOAuthMode !== 'protocol' ? (
+                        <>
+                          <label className="text-xs text-[var(--text-muted)] sm:pt-2">Codex 浏览器模式</label>
+                          <select
+                            value={codexOAuthBrowserMode}
+                            onChange={(event) => setCodexOAuthBrowserMode(event.target.value)}
+                            className="control-surface control-surface-compact"
+                          >
+                            <option value="headed">可视浏览器</option>
+                            <option value="headless">后台浏览器</option>
+                          </select>
+                          {codexOAuthBrowserMode === 'headed' ? (
+                            <label className="flex items-center gap-2 text-xs text-[var(--text-muted)] sm:col-span-2">
+                              <input
+                                type="checkbox"
+                                checked={keepCodexBrowserOpen}
+                                onChange={(event) => setKeepCodexBrowserOpen(event.target.checked)}
+                                className="h-4 w-4 accent-[var(--accent)]"
+                              />
+                              完成后保留浏览器窗口
+                            </label>
+                          ) : null}
+                        </>
+                      ) : (
+                        <div className="text-xs text-[var(--text-muted)] sm:col-span-2">
+                          协议模式直接复用账号已有 session/cookies，不启动浏览器。
+                        </div>
+                      )}
                     </div>
                   ) : null}
                 </div>
@@ -2338,6 +2363,7 @@ export default function Accounts() {
   const [batchTaskStatus, setBatchTaskStatus] = useState<string | null>(null)
   const [batchProxyMode, setBatchProxyMode] = useState('direct')
   const [batchProxyValue, setBatchProxyValue] = useState('')
+  const [batchCodexOAuthMode, setBatchCodexOAuthMode] = useState('browser')
   const [batchCodexConcurrency, setBatchCodexConcurrency] = useState(2)
   const [pushTargets, setPushTargets] = useState<PushTarget[]>([])
   const loadRequestRef = useRef(0)
@@ -2722,6 +2748,16 @@ export default function Accounts() {
             {tab === 'chatgpt' && total > 0 ? (
               <>
                 <select
+                  value={batchCodexOAuthMode}
+                  onChange={e => setBatchCodexOAuthMode(e.target.value)}
+                  className="h-7 rounded-md border border-[var(--border)] bg-transparent px-2 text-xs text-[var(--text-secondary)] outline-none focus:border-[var(--text-primary)]"
+                  title="Codex OAuth 授权模式"
+                >
+                  <option value="browser">浏览器</option>
+                  <option value="browser_protocol">浏览器协议（Fetch 优先）</option>
+                  <option value="protocol">协议（复用会话）</option>
+                </select>
+                <select
                   value={batchCodexConcurrency}
                   onChange={e => setBatchCodexConcurrency(Number(e.target.value) || 1)}
                   className="h-7 rounded-md border border-[var(--border)] bg-transparent px-2 text-xs text-[var(--text-secondary)] outline-none focus:border-[var(--text-primary)]"
@@ -2758,6 +2794,7 @@ export default function Accounts() {
                           platform_proxy_value: batchProxyValue.trim(),
                           concurrency: batchCodexConcurrency,
                           params: {
+                            oauth_mode: batchCodexOAuthMode,
                             browser_mode: 'headless',
                             keep_browser_open: 'false',
                             platform_proxy_mode: batchProxyMode,

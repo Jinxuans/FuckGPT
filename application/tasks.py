@@ -379,6 +379,9 @@ def create_codex_oauth_batch_task(
 ) -> dict[str, Any]:
     normalized_ids = [int(item) for item in account_ids or [] if int(item or 0) > 0]
     source = str(source or "manual")
+    normalized_params = dict(params or {})
+    if not normalized_params.get("oauth_mode"):
+        normalized_params["oauth_mode"] = "browser"
     return create_task(
         task_type=TASK_TYPE_CODEX_OAUTH_BATCH,
         platform=platform or "chatgpt",
@@ -386,7 +389,7 @@ def create_codex_oauth_batch_task(
             "platform": platform or "chatgpt",
             "account_ids": normalized_ids,
             "action_id": "codex_oauth_authorize",
-            "params": dict(params or {}),
+            "params": normalized_params,
             "concurrency": int(concurrency or 1),
             "auto_push_after_oauth": bool(auto_push_after_oauth),
             "source": source,
@@ -1794,6 +1797,7 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
                             else "headless"
                         ),
                         "keep_browser_open": keep_browser_open,
+                        "oauth_mode": str(extra.get("codex_oauth_mode") or "browser"),
                     },
                 )
                 if logger.is_cancel_requested():
@@ -2050,6 +2054,8 @@ def _execute_codex_oauth_batch_task(payload: dict[str, Any], logger: TaskLogger)
     ]
     params = dict(payload.get("params") or {})
     auto_push_after_oauth = bool(payload.get("auto_push_after_oauth", True))
+    if not params.get("oauth_mode"):
+        params["oauth_mode"] = "browser"
     if not params.get("browser_mode"):
         params["browser_mode"] = "headless"
     if not params.get("keep_browser_open"):

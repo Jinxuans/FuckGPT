@@ -33,10 +33,15 @@ from platforms.chatgpt.codex_oauth import (
     _account_chooser_submission_pending,
     _get_invalid_session_error_page,
     _phone_input_contains,
+    _request_codex_oauth_callback_via_browser_fetch,
+    _request_codex_oauth_callback_via_protocol,
     _is_incorrect_password_error,
     _is_whatsapp_fallback_prompt,
     _select_text_message_delivery,
+    has_codex_oauth_reusable_session,
+    normalize_codex_oauth_mode,
     perform_codex_oauth_login_on_page,
+    perform_codex_oauth_login_with_mode,
 )
 from platforms.chatgpt.plugin import ChatGPTPlatform, _CodexSmsPhoneCallback, _resolve_registration_auth_mode
 
@@ -163,7 +168,7 @@ def test_chatgpt_codex_oauth_action_uses_browser_login_flow(monkeypatch):
             "codex_id_token": "id-token",
         }
 
-    monkeypatch.setattr("platforms.chatgpt.codex_oauth.perform_codex_oauth_login", fake_login)
+    monkeypatch.setattr("platforms.chatgpt.codex_oauth.perform_codex_oauth_login_with_mode", fake_login)
 
     platform = ChatGPTPlatform(config=RegisterConfig())
     result = platform.execute_action(
@@ -179,6 +184,7 @@ def test_chatgpt_codex_oauth_action_uses_browser_login_flow(monkeypatch):
     assert result["ok"] is True
     assert captured["email"] == "user@example.com"
     assert captured["password"] == "Secret123!"
+    assert captured["oauth_mode"] == "browser"
     assert captured["headless"] is False
     assert captured["keep_browser_open"] is False
     assert "phone_callback" in captured
@@ -192,7 +198,7 @@ def test_chatgpt_codex_oauth_action_can_run_headless(monkeypatch):
         captured.update(kwargs)
         return {"codex_access_token": "access-token"}
 
-    monkeypatch.setattr("platforms.chatgpt.codex_oauth.perform_codex_oauth_login", fake_login)
+    monkeypatch.setattr("platforms.chatgpt.codex_oauth.perform_codex_oauth_login_with_mode", fake_login)
 
     platform = ChatGPTPlatform(config=RegisterConfig())
     result = platform.execute_action(
@@ -212,7 +218,7 @@ def test_chatgpt_codex_oauth_action_can_keep_headed_browser_open(monkeypatch):
         captured.update(kwargs)
         return {"codex_access_token": "access-token"}
 
-    monkeypatch.setattr("platforms.chatgpt.codex_oauth.perform_codex_oauth_login", fake_login)
+    monkeypatch.setattr("platforms.chatgpt.codex_oauth.perform_codex_oauth_login_with_mode", fake_login)
 
     platform = ChatGPTPlatform(config=RegisterConfig())
     result = platform.execute_action(
@@ -224,6 +230,166 @@ def test_chatgpt_codex_oauth_action_can_keep_headed_browser_open(monkeypatch):
     assert result["ok"] is True
     assert captured["headless"] is False
     assert captured["keep_browser_open"] is True
+
+
+def test_chatgpt_codex_oauth_action_passes_browser_protocol_mode(monkeypatch):
+    captured = {}
+
+    def fake_login(**kwargs):
+        captured.update(kwargs)
+        return {"codex_access_token": "access-token"}
+
+    monkeypatch.setattr("platforms.chatgpt.codex_oauth.perform_codex_oauth_login_with_mode", fake_login)
+
+    platform = ChatGPTPlatform(config=RegisterConfig())
+    result = platform.execute_action(
+        "codex_oauth_authorize",
+        Account(
+            platform="chatgpt",
+            email="user@example.com",
+            password="Secret123!",
+            extra={"session_token": "session-token", "cookies": "login_session=login"},
+        ),
+        {"oauth_mode": "browser_protocol", "browser_mode": "headless"},
+    )
+
+    assert result["ok"] is True
+    assert captured["oauth_mode"] == "browser_protocol"
+    assert captured["session_token"] == "session-token"
+    assert captured["cookies"] == "login_session=login"
+
+
+def test_chatgpt_codex_oauth_action_protocol_mode_allows_reusable_session_without_password(monkeypatch):
+    captured = {}
+
+    def fake_login(**kwargs):
+        captured.update(kwargs)
+        return {"codex_access_token": "access-token"}
+
+    monkeypatch.setattr("platforms.chatgpt.codex_oauth.perform_codex_oauth_login_with_mode", fake_login)
+
+    platform = ChatGPTPlatform(config=RegisterConfig())
+    result = platform.execute_action(
+        "codex_oauth_authorize",
+        Account(
+            platform="chatgpt",
+            email="user@example.com",
+            password="",
+            extra={"session_token": "session-token"},
+        ),
+        {"oauth_mode": "protocol"},
+    )
+
+    assert result["ok"] is True
+    assert captured["oauth_mode"] == "protocol"
+    assert captured["password"] == ""
+
+
+def test_codex_oauth_mode_helpers_normalize_aliases():
+    assert normalize_codex_oauth_mode("") == "browser"
+    assert normalize_codex_oauth_mode("browser-protocol") == "browser_protocol"
+    assert normalize_codex_oauth_mode("协议") == "protocol"
+    assert has_codex_oauth_reusable_session(session_token="session-token")
+    assert has_codex_oauth_reusable_session(cookies="login_session=abc; other=1")
+
+
+def test_codex_oauth_protocol_uses_chrome_tls_and_follows_callback_redirect(monkeypatch):
+    captured = {}
+
+    class CookieJar:
+        def __init__(self):
+            self.items = []
+
+        def set(self, name, value, **kwargs):
+            self.items.append((name, value, kwargs))
+
+    class Response:
+        status_code = 302
+        url = "https://auth.openai.com/oauth/authorize"
+        text = ""
+        headers = {
+            "Location": "http://localhost:1455/auth/callback?code=code-test&state=state-test",
+        }
+
+    class Session:
+        def __init__(self, *, impersonate):
+            captured["impersonate"] = impersonate
+            self.cookies = CookieJar()
+            self.headers = {}
+
+        def get(self, url, **kwargs):
+            captured["url"] = url
+            captured["request"] = kwargs
+            return Response()
+
+    monkeypatch.setattr("platforms.chatgpt.codex_oauth.curl_requests.Session", Session)
+    monkeypatch.setattr(
+        "platforms.chatgpt.codex_oauth.retry_network_call",
+        lambda callback, **kwargs: callback(),
+    )
+
+    callback = _request_codex_oauth_callback_via_protocol(
+        "https://auth.openai.com/oauth/authorize?state=state-test",
+        session_token="session-token",
+        cookies="login_session=login",
+        proxy="http://proxy.test:8080",
+        log=lambda message: None,
+        timeout=60,
+    )
+
+    assert callback == {
+        "code": "code-test",
+        "state": "state-test",
+        "error": "",
+        "error_description": "",
+    }
+    assert captured["impersonate"] == "chrome136"
+    assert captured["request"]["allow_redirects"] is False
+    assert captured["request"]["proxies"] == {
+        "http": "http://proxy.test:8080",
+        "https": "http://proxy.test:8080",
+    }
+
+
+def test_codex_oauth_browser_protocol_fetch_captures_callback_url(monkeypatch):
+    logs = []
+
+    class Page:
+        url = "https://auth.openai.com/log-in"
+
+    class Event:
+        @staticmethod
+        def is_set():
+            return False
+
+    class CallbackServer:
+        event = Event()
+
+    monkeypatch.setattr(
+        "platforms.chatgpt.browser_register._browser_fetch",
+        lambda *args, **kwargs: {
+            "ok": True,
+            "status": 200,
+            "url": "http://localhost:1455/auth/callback?code=code-test&state=state-test",
+            "text": "",
+        },
+    )
+
+    callback = _request_codex_oauth_callback_via_browser_fetch(
+        Page(),
+        "https://auth.openai.com/oauth/authorize?state=state-test",
+        callback_server=CallbackServer(),
+        log=logs.append,
+        timeout=60,
+    )
+
+    assert callback == {
+        "code": "code-test",
+        "state": "state-test",
+        "error": "",
+        "error_description": "",
+    }
+    assert any("页面内 Fetch" in line for line in logs)
 
 
 def test_codex_oauth_add_phone_uses_phone_callback(monkeypatch):
