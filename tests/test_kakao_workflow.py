@@ -390,8 +390,9 @@ def test_kakao_workflow_components_register_adapter_and_template():
     assert kakao_definition["steps"][1]["needs"] == ["register"]
     assert kakao_definition["steps"][2]["needs"] == ["kakao"]
     assert kakao_definition["sample_input"]["kakao"]["auto_submit_scanner"] is True
+    assert kakao_definition["sample_input"]["registration"]["executor_type"] == "browser"
     assert kakao_definition["sample_input"]["registration"]["platform_proxy_mode"] == "direct"
-    assert kakao_definition["sample_input"]["registration"]["extra"]["browser_protocol_headed"] is False
+    assert kakao_definition["sample_input"]["registration"]["extra"]["browser_visible"] is False
     assert kakao_definition["sample_input"]["codex"]["platform_proxy_mode"] == "direct"
     field_paths = {
         field["path"]
@@ -400,7 +401,7 @@ def test_kakao_workflow_components_register_adapter_and_template():
     }
     assert "registration.platform_proxy_mode" in field_paths
     assert "registration.platform_proxy_value" in field_paths
-    assert "registration.extra.browser_protocol_headed" in field_paths
+    assert "registration.extra.browser_visible" in field_paths
     assert "codex.platform_proxy_mode" in field_paths
     assert "codex.platform_proxy_value" in field_paths
 
@@ -416,11 +417,11 @@ def test_kakao_workflow_components_register_adapter_and_template():
         if section["title"] == "注册"
     )
     registration_fields = {field["path"]: field for field in registration_section["fields"]}
-    executor_values = {
+    executor_values = [
         option["value"]
         for option in registration_fields["registration.executor_type"]["options"]
-    }
-    assert "browser_protocol" in executor_values
+    ]
+    assert executor_values == ["browser_protocol", "browser"]
 
 
 def test_kakao_workflow_template_is_visible_from_api(client):

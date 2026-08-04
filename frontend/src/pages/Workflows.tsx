@@ -108,12 +108,12 @@ const DEFAULT_REGISTER_KAKAO_CODEX_PUSH_INPUT = {
   registration: {
     count: 1,
     concurrency: 1,
-    executor_type: 'headless',
+    executor_type: 'browser',
     platform_proxy_mode: 'direct',
     platform_proxy_value: '',
     extra: {
       identity_provider: 'mailbox',
-      browser_protocol_headed: false,
+      browser_visible: false,
     },
   },
   kakao: {

@@ -377,12 +377,12 @@ def register_kakao_workflow_components() -> None:
                 "registration": {
                     "count": 1,
                     "concurrency": 1,
-                    "executor_type": "headless",
+                    "executor_type": "browser",
                     "platform_proxy_mode": "direct",
                     "platform_proxy_value": "",
                     "extra": {
                         "identity_provider": "mailbox",
-                        "browser_protocol_headed": False,
+                        "browser_visible": False,
                     },
                 },
                 "kakao": {
@@ -416,15 +416,14 @@ def register_kakao_workflow_components() -> None:
                                 "type": "select",
                                 "options": [
                                     {"label": "浏览器协议模式", "value": "browser_protocol"},
-                                    {"label": "无头模式", "value": "headless"},
-                                    {"label": "可视模式", "value": "headed"},
+                                    {"label": "浏览器模式", "value": "browser"},
                                 ],
                             },
                             {
-                                "path": "registration.extra.browser_protocol_headed",
-                                "label": "浏览器协议模式显示窗口",
+                                "path": "registration.extra.browser_visible",
+                                "label": "显示浏览器窗口",
                                 "type": "boolean",
-                                "helper": "仅在浏览器协议模式下生效。",
+                                "helper": "适用于浏览器协议模式和浏览器模式；关闭时在后台运行。",
                             },
                             {
                                 "path": "registration.platform_proxy_mode",
