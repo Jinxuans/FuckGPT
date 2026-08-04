@@ -14,9 +14,10 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable
-from urllib.parse import parse_qs, urlencode, urlparse
+from urllib.parse import parse_qs, urlencode, urljoin, urlparse
 
 import requests
+from curl_cffi import requests as curl_requests
 
 from core.network_retry import retry_network_call
 
@@ -50,6 +51,19 @@ CODEX_REDIRECT_URI = f"http://localhost:{CODEX_CALLBACK_PORT}/auth/callback"
 CODEX_SCOPE = "openid email profile offline_access"
 CODEX_USER_AGENT = "codex_cli_rs/0.144.1 (Windows 10.0.0; x86_64)"
 DEFAULT_CODEX_AUTH_DIR = Path("data") / "codex_auths"
+CODEX_OAUTH_MODE_BROWSER = "browser"
+CODEX_OAUTH_MODE_BROWSER_PROTOCOL = "browser_protocol"
+CODEX_OAUTH_MODE_PROTOCOL = "protocol"
+CODEX_OAUTH_MODES = {
+    CODEX_OAUTH_MODE_BROWSER,
+    CODEX_OAUTH_MODE_BROWSER_PROTOCOL,
+    CODEX_OAUTH_MODE_PROTOCOL,
+}
+CODEX_OAUTH_COOKIE_URLS = (
+    "https://auth.openai.com",
+    "https://chatgpt.com",
+    "https://chat.openai.com",
+)
 
 PHONE_COUNTRY_CODE_MAP = {
     "1": "United States",
@@ -342,6 +356,290 @@ def build_codex_authorize_url(state: str, pkce: PKCECodes) -> str:
         "codex_cli_simplified_flow": "true",
     }
     return f"{CODEX_AUTH_URL}?{urlencode(params)}"
+
+
+def normalize_codex_oauth_mode(value: str | None) -> str:
+    text = str(value or "").strip().lower().replace("-", "_")
+    if not text or text in {"browser", "dom", "headless", "headed", "浏览器", "浏览器模式"}:
+        return CODEX_OAUTH_MODE_BROWSER
+    if text in {"browser_protocol", "browserprotocol", "browser_fetch", "浏览器协议", "浏览器协议模式"}:
+        return CODEX_OAUTH_MODE_BROWSER_PROTOCOL
+    if text in {"protocol", "http", "direct", "协议", "协议模式"}:
+        return CODEX_OAUTH_MODE_PROTOCOL
+    raise RuntimeError(f"Codex OAuth 模式不支持: {value}")
+
+
+def _normalize_cookie_mapping(cookies: Any) -> dict[str, str]:
+    if not cookies:
+        return {}
+    if isinstance(cookies, dict):
+        return {
+            str(name).strip(): str(value)
+            for name, value in cookies.items()
+            if str(name or "").strip() and value not in (None, "")
+        }
+    if isinstance(cookies, list):
+        parsed: dict[str, str] = {}
+        for item in cookies:
+            if isinstance(item, dict):
+                name = str(item.get("name") or "").strip()
+                value = item.get("value")
+                if name and value not in (None, ""):
+                    parsed[name] = str(value)
+        return parsed
+
+    text = str(cookies or "").strip()
+    if not text:
+        return {}
+    if text[:1] in {"{", "["}:
+        try:
+            return _normalize_cookie_mapping(json.loads(text))
+        except Exception:
+            pass
+
+    parsed: dict[str, str] = {}
+    for part in text.split(";"):
+        part = part.strip()
+        if not part or "=" not in part:
+            continue
+        name, value = part.split("=", 1)
+        name = name.strip()
+        if name:
+            parsed[name] = value.strip()
+    return parsed
+
+
+def _codex_oauth_session_cookie_map(
+    *,
+    session_token: str = "",
+    cookies: Any = None,
+) -> dict[str, str]:
+    cookie_map = _normalize_cookie_mapping(cookies)
+    token = str(session_token or "").strip()
+    if token:
+        cookie_map["__Secure-next-auth.session-token"] = token
+    return {name: value for name, value in cookie_map.items() if name and value}
+
+
+def has_codex_oauth_reusable_session(
+    *,
+    session_token: str = "",
+    cookies: Any = None,
+) -> bool:
+    cookie_map = _codex_oauth_session_cookie_map(session_token=session_token, cookies=cookies)
+    return bool(
+        str(session_token or "").strip()
+        or cookie_map.get("__Secure-next-auth.session-token")
+        or cookie_map.get("login_session")
+        or cookie_map.get("oai-client-auth-session")
+    )
+
+
+def _callback_from_redirect_url(url: str) -> dict[str, str] | None:
+    parsed = urlparse(str(url or ""))
+    host = (parsed.hostname or "").lower()
+    if host not in {"localhost", "127.0.0.1"} or parsed.port != CODEX_CALLBACK_PORT:
+        return None
+    if parsed.path not in {"/auth/callback", "/success"}:
+        return None
+    query = parse_qs(parsed.query)
+    return {
+        "code": (query.get("code") or [""])[0],
+        "state": (query.get("state") or [""])[0],
+        "error": (query.get("error") or [""])[0],
+        "error_description": (query.get("error_description") or [""])[0],
+    }
+
+
+def _seed_requests_session_cookies(session: Any, cookie_map: dict[str, str]) -> None:
+    for name, value in cookie_map.items():
+        session.cookies.set(name, value)
+        for domain in ("auth.openai.com", ".openai.com", "chatgpt.com", ".chatgpt.com", "chat.openai.com", ".chat.openai.com"):
+            session.cookies.set(name, value, domain=domain, path="/")
+
+
+def _seed_browser_session_cookies(
+    page,
+    *,
+    session_token: str = "",
+    cookies: Any = None,
+    log: Callable[[str], None],
+) -> bool:
+    cookie_map = _codex_oauth_session_cookie_map(session_token=session_token, cookies=cookies)
+    if not cookie_map:
+        return False
+    cookie_entries: list[dict[str, Any]] = []
+    for name, value in cookie_map.items():
+        for url in CODEX_OAUTH_COOKIE_URLS:
+            cookie_entries.append(
+                {
+                    "name": name,
+                    "value": value,
+                    "url": url,
+                    "path": "/",
+                    "secure": url.startswith("https://"),
+                }
+            )
+    try:
+        page.context.add_cookies(cookie_entries)
+        log(f"Codex OAuth 已注入可复用会话 Cookie: {len(cookie_map)} 项")
+        return True
+    except Exception as exc:
+        log(f"Codex OAuth 注入会话 Cookie 失败，将继续常规浏览器流程: {exc}")
+        return False
+
+
+def _request_codex_oauth_callback_via_protocol(
+    auth_url: str,
+    *,
+    session_token: str = "",
+    cookies: Any = None,
+    proxy: str | None,
+    log: Callable[[str], None],
+    timeout: int,
+) -> dict[str, str]:
+    cookie_map = _codex_oauth_session_cookie_map(session_token=session_token, cookies=cookies)
+    if not cookie_map:
+        raise RuntimeError("Codex OAuth 协议模式需要账号已有可复用 session_token 或 cookies")
+
+    session = curl_requests.Session(impersonate="chrome136")
+    _seed_requests_session_cookies(session, cookie_map)
+    session.headers.update(
+        {
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "User-Agent": CODEX_USER_AGENT,
+        }
+    )
+
+    url = auth_url
+    deadline = time.time() + max(int(timeout or 0), 30)
+    proxies = {"http": proxy, "https": proxy} if proxy else None
+    for redirect_index in range(16):
+        remaining = max(deadline - time.time(), 1)
+        if remaining <= 1:
+            raise RuntimeError("Codex OAuth 协议模式等待回调超时")
+
+        def request_authorize():
+            return session.get(
+                url,
+                allow_redirects=False,
+                proxies=proxies,
+                timeout=min(max(int(remaining), 5), 30),
+            )
+
+        response = retry_network_call(
+            request_authorize,
+            max_attempts=3,
+            base_delay=1,
+            max_delay=4,
+            on_retry=lambda attempt, attempts, delay, exc: log(
+                f"Codex OAuth 协议模式网络异常，{delay:g}s 后重试 "
+                f"({attempt}/{attempts}): {exc}"
+            ),
+        )
+        callback = _callback_from_redirect_url(getattr(response, "url", "") or "")
+        if callback:
+            log("Codex OAuth 协议模式已从响应 URL 捕获回调")
+            return callback
+
+        status_code = int(getattr(response, "status_code", 0) or 0)
+        if 300 <= status_code < 400:
+            location = str(response.headers.get("Location") or "").strip()
+            if not location:
+                raise RuntimeError(f"Codex OAuth 协议模式收到 HTTP {status_code} 但缺少 Location")
+            next_url = urljoin(url, location)
+            callback = _callback_from_redirect_url(next_url)
+            if callback:
+                log("Codex OAuth 协议模式已从重定向捕获回调")
+                return callback
+            parsed = urlparse(next_url)
+            if parsed.scheme not in {"http", "https"}:
+                raise RuntimeError(f"Codex OAuth 协议模式无法处理重定向: {next_url[:120]}")
+            url = next_url
+            continue
+
+        text = str(getattr(response, "text", "") or "")
+        match = re.search(
+            rf"https?://(?:localhost|127\.0\.0\.1):{CODEX_CALLBACK_PORT}/auth/callback\?[^\"'\s<>]+",
+            text,
+        )
+        if match:
+            callback = _callback_from_redirect_url(match.group(0))
+            if callback:
+                log("Codex OAuth 协议模式已从响应正文捕获回调")
+                return callback
+        snippet = re.sub(r"\s+", " ", text[:240]).strip()
+        raise RuntimeError(
+            "Codex OAuth 协议模式未能仅凭已有会话完成授权，页面仍需要交互；"
+            f"请改用 browser_protocol 或 browser。HTTP {status_code}: {snippet}"
+        )
+
+    raise RuntimeError("Codex OAuth 协议模式重定向次数过多，未到达回调")
+
+
+def _request_codex_oauth_callback_via_browser_fetch(
+    page,
+    auth_url: str,
+    *,
+    callback_server,
+    log: Callable[[str], None],
+    timeout: int,
+) -> dict[str, str] | None:
+    """Try the session-only authorize hop with the browser network stack.
+
+    A reusable auth session can often complete the authorize redirect without
+    rendering or clicking the login UI.  The fetch still runs inside Camoufox,
+    so cookies, TLS, proxy, and the browser's HTTP fingerprint stay aligned.
+    Returning ``None`` means the response still requires an interactive page.
+    """
+    from .browser_register import _browser_fetch
+
+    current_url = str(getattr(page, "url", "") or "")
+    if not current_url.startswith("https://auth.openai.com/"):
+        _goto_with_retry(
+            page,
+            "https://auth.openai.com/",
+            wait_until="domcontentloaded",
+            timeout=30_000,
+            log=log,
+        )
+
+    log("Codex OAuth 浏览器协议模式: 在 Camoufox 页面内 Fetch 授权链接")
+    result = _browser_fetch(
+        page,
+        auth_url,
+        method="GET",
+        headers={
+            "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        },
+        redirect="follow",
+        timeout_ms=min(max(int(timeout or 0) * 1000, 30_000), 300_000),
+    )
+
+    if callback_server.event.is_set():
+        log("Codex OAuth 浏览器协议模式已从页面内 Fetch 捕获回调")
+        return callback_server.wait(1)
+
+    callback = _callback_from_redirect_url(str(result.get("url") or ""))
+    if callback:
+        log("Codex OAuth 浏览器协议模式已从 Fetch 响应 URL 捕获回调")
+        return callback
+
+    text = str(result.get("text") or "")
+    match = re.search(
+        rf"https?://(?:localhost|127\.0\.0\.1):{CODEX_CALLBACK_PORT}/auth/callback\?[^\"'\s<>]+",
+        text,
+    )
+    if match:
+        callback = _callback_from_redirect_url(match.group(0))
+        if callback:
+            log("Codex OAuth 浏览器协议模式已从 Fetch 响应正文捕获回调")
+            return callback
+
+    status = int(result.get("status") or 0)
+    log(f"Codex OAuth 浏览器协议模式: Fetch 返回 HTTP {status}，继续交互状态机")
+    return None
 
 
 def _decode_jwt_payload(token: str) -> dict[str, Any]:
@@ -1833,6 +2131,7 @@ def _drive_codex_oauth_page(
     phone_callback: Callable[[], str] | None,
     timeout: int,
     registration_auth_mode: str = "",
+    allow_session_only: bool = False,
 ) -> dict[str, str]:
     _observe_callback_request_on_page(page, callback_server, log)
     _goto_with_retry(page, auth_url, wait_until="domcontentloaded", timeout=45000, log=log)
@@ -1991,6 +2290,17 @@ def _drive_codex_oauth_page(
                 if _sleep_until_callback(callback_server, 1):
                     return callback_server.wait(1)
                 continue
+            if not password and callable(otp_callback):
+                log("Codex OAuth 当前无本地密码，改用邮箱验证码登录")
+                if not _request_oauth_email_otp(page, log, reason="本地无密码，切换邮箱验证码登录"):
+                    raise RuntimeError("Codex OAuth 无本地密码且未找到可点击的验证码登录按钮")
+                passwordless_login_requested = True
+                passwordless_login_grace_until = time.time() + PASSWORDLESS_LOGIN_GRACE_SECONDS
+                if _sleep_until_callback(callback_server, 1):
+                    return callback_server.wait(1)
+                continue
+            if not password and allow_session_only:
+                raise RuntimeError("Codex OAuth 会话复用未通过授权，且本地账号没有可继续登录的密码")
             password_result = _submit_oauth_password_direct(page, password, log)
             if not password_result.get("ok"):
                 password_error = str(password_result.get("text") or password_result.get("url") or "")
@@ -2263,3 +2573,237 @@ def perform_codex_oauth_login(
             log("Codex OAuth 浏览器窗口已保留，可手动关闭")
         else:
             browser_context.__exit__(*sys.exc_info())
+
+
+def perform_codex_oauth_browser_protocol_login(
+    *,
+    email: str,
+    password: str,
+    registration_auth_mode: str = "",
+    proxy: str | None = None,
+    headless: bool = True,
+    log_fn: Callable[[str], None] | None = None,
+    otp_callback: Callable[[], str] | None = None,
+    phone_callback: Callable[[], str] | None = None,
+    auth_dir: str | os.PathLike[str] | None = None,
+    timeout: int = 300,
+    backend_config: BrowserBackendConfig | None = None,
+    keep_browser_open: bool = False,
+    session_token: str = "",
+    cookies: Any = None,
+) -> dict[str, Any]:
+    log = log_fn or (lambda _message: None)
+    email = str(email or "").strip()
+    password = str(password or "")
+    normalized_auth_mode = str(registration_auth_mode or "").strip().lower()
+    has_session = has_codex_oauth_reusable_session(session_token=session_token, cookies=cookies)
+    if not email:
+        raise RuntimeError("Codex OAuth 需要账号邮箱")
+    if not password and normalized_auth_mode != "email_otp" and not has_session:
+        raise RuntimeError("Codex OAuth 浏览器协议模式需要账号密码、邮箱验证码账号或可复用会话")
+
+    browser_config = backend_config or BrowserBackendConfig.camoufox(headless=bool(headless))
+    launch_opts = {"headless": browser_config.is_headless}
+    if browser_config.is_camoufox:
+        proxy_config = _build_proxy_config(proxy)
+        if proxy_config:
+            launch_opts["proxy"] = proxy_config
+            launch_opts["geoip"] = True
+    _apply_camoufox_visible_window_limit(launch_opts, browser_config)
+
+    browser_context = open_browser_backend(
+        launch_opts=launch_opts,
+        config=browser_config,
+        camoufox_class=Camoufox,
+        log=log,
+    )
+    browser = browser_context.__enter__()
+    keep_open = bool(keep_browser_open and not browser_config.is_headless)
+    try:
+        page = browser.new_page()
+        seeded = _seed_browser_session_cookies(
+            page,
+            session_token=session_token,
+            cookies=cookies,
+            log=log,
+        )
+        if seeded:
+            log("Codex OAuth 浏览器协议模式: 优先复用账号现有会话")
+        else:
+            log("Codex OAuth 浏览器协议模式: 未发现可复用会话，继续页面登录流程")
+        last_error: Exception | None = None
+        for attempt_index in range(1, CODEX_BROWSER_LOGIN_MAX_ATTEMPTS + 1):
+            attempt = _new_codex_oauth_attempt()
+            suffix = f" ({attempt_index}/{CODEX_BROWSER_LOGIN_MAX_ATTEMPTS})" if attempt_index > 1 else ""
+            log(f"Codex OAuth 浏览器协议授权链接已生成，启动本地回调服务{suffix}")
+            try:
+                with _OAuthCallbackServer(port=CODEX_CALLBACK_PORT, state=attempt.state, log=log) as callback_server:
+                    callback = None
+                    if seeded:
+                        callback = _request_codex_oauth_callback_via_browser_fetch(
+                            page,
+                            attempt.auth_url,
+                            callback_server=callback_server,
+                            log=log,
+                            timeout=timeout,
+                        )
+                    if callback is None:
+                        callback = _drive_codex_oauth_page(
+                            page,
+                            auth_url=attempt.auth_url,
+                            email=email,
+                            password=password,
+                            callback_server=callback_server,
+                            log=log,
+                            otp_callback=otp_callback,
+                            phone_callback=phone_callback,
+                            timeout=timeout,
+                            registration_auth_mode=registration_auth_mode,
+                            allow_session_only=has_session and not password,
+                        )
+                result = _finalize_codex_oauth_callback(
+                    callback,
+                    expected_state=attempt.state,
+                    pkce=attempt.pkce,
+                    email=email,
+                    proxy=proxy,
+                    auth_dir=auth_dir,
+                    log=log,
+                )
+                result["codex_oauth_mode"] = CODEX_OAUTH_MODE_BROWSER_PROTOCOL
+                return result
+            except Exception as exc:
+                last_error = exc
+                if not _is_codex_browser_login_timeout(exc) or attempt_index >= CODEX_BROWSER_LOGIN_MAX_ATTEMPTS:
+                    raise
+                log("Codex OAuth 浏览器登录超时，重新生成授权链接重试")
+        raise RuntimeError(f"Codex OAuth 授权失败: {last_error}")
+    finally:
+        if keep_open:
+            keep_browser_context_open(browser_context, browser, label=f"codex-oauth-browser-protocol:{email}")
+            log("Codex OAuth 浏览器窗口已保留，可手动关闭")
+        else:
+            browser_context.__exit__(*sys.exc_info())
+
+
+def perform_codex_oauth_protocol_login(
+    *,
+    email: str,
+    password: str = "",
+    registration_auth_mode: str = "",
+    proxy: str | None = None,
+    log_fn: Callable[[str], None] | None = None,
+    otp_callback: Callable[[], str] | None = None,
+    phone_callback: Callable[[], str] | None = None,
+    auth_dir: str | os.PathLike[str] | None = None,
+    timeout: int = 300,
+    session_token: str = "",
+    cookies: Any = None,
+) -> dict[str, Any]:
+    del password, registration_auth_mode, otp_callback, phone_callback
+    log = log_fn or (lambda _message: None)
+    email = str(email or "").strip()
+    if not email:
+        raise RuntimeError("Codex OAuth 需要账号邮箱")
+    if not has_codex_oauth_reusable_session(session_token=session_token, cookies=cookies):
+        raise RuntimeError("Codex OAuth 协议模式需要账号已有可复用 session_token 或 cookies")
+
+    last_error: Exception | None = None
+    for attempt_index in range(1, CODEX_BROWSER_LOGIN_MAX_ATTEMPTS + 1):
+        attempt = _new_codex_oauth_attempt()
+        suffix = f" ({attempt_index}/{CODEX_BROWSER_LOGIN_MAX_ATTEMPTS})" if attempt_index > 1 else ""
+        log(f"Codex OAuth 协议授权链接已生成，尝试复用已有会话{suffix}")
+        try:
+            callback = _request_codex_oauth_callback_via_protocol(
+                attempt.auth_url,
+                session_token=session_token,
+                cookies=cookies,
+                proxy=proxy,
+                log=log,
+                timeout=timeout,
+            )
+            result = _finalize_codex_oauth_callback(
+                callback,
+                expected_state=attempt.state,
+                pkce=attempt.pkce,
+                email=email,
+                proxy=proxy,
+                auth_dir=auth_dir,
+                log=log,
+            )
+            result["codex_oauth_mode"] = CODEX_OAUTH_MODE_PROTOCOL
+            return result
+        except Exception as exc:
+            last_error = exc
+            if attempt_index >= CODEX_BROWSER_LOGIN_MAX_ATTEMPTS:
+                raise
+            log(f"Codex OAuth 协议模式授权失败，重新生成授权链接重试: {exc}")
+    raise RuntimeError(f"Codex OAuth 授权失败: {last_error}")
+
+
+def perform_codex_oauth_login_with_mode(
+    *,
+    email: str,
+    password: str,
+    oauth_mode: str = CODEX_OAUTH_MODE_BROWSER,
+    registration_auth_mode: str = "",
+    proxy: str | None = None,
+    headless: bool = True,
+    log_fn: Callable[[str], None] | None = None,
+    otp_callback: Callable[[], str] | None = None,
+    phone_callback: Callable[[], str] | None = None,
+    auth_dir: str | os.PathLike[str] | None = None,
+    timeout: int = 300,
+    backend_config: BrowserBackendConfig | None = None,
+    keep_browser_open: bool = False,
+    session_token: str = "",
+    cookies: Any = None,
+) -> dict[str, Any]:
+    mode = normalize_codex_oauth_mode(oauth_mode)
+    if mode == CODEX_OAUTH_MODE_BROWSER:
+        result = perform_codex_oauth_login(
+            email=email,
+            password=password,
+            registration_auth_mode=registration_auth_mode,
+            proxy=proxy,
+            headless=headless,
+            log_fn=log_fn,
+            otp_callback=otp_callback,
+            phone_callback=phone_callback,
+            auth_dir=auth_dir,
+            timeout=timeout,
+            backend_config=backend_config,
+            keep_browser_open=keep_browser_open,
+        )
+        result["codex_oauth_mode"] = CODEX_OAUTH_MODE_BROWSER
+        return result
+    if mode == CODEX_OAUTH_MODE_BROWSER_PROTOCOL:
+        return perform_codex_oauth_browser_protocol_login(
+            email=email,
+            password=password,
+            registration_auth_mode=registration_auth_mode,
+            proxy=proxy,
+            headless=headless,
+            log_fn=log_fn,
+            otp_callback=otp_callback,
+            phone_callback=phone_callback,
+            auth_dir=auth_dir,
+            timeout=timeout,
+            backend_config=backend_config,
+            keep_browser_open=keep_browser_open,
+            session_token=session_token,
+            cookies=cookies,
+        )
+    return perform_codex_oauth_protocol_login(
+        email=email,
+        password=password,
+        registration_auth_mode=registration_auth_mode,
+        proxy=proxy,
+        log_fn=log_fn,
+        otp_callback=otp_callback,
+        phone_callback=phone_callback,
+        auth_dir=auth_dir,
+        timeout=timeout,
+        session_token=session_token,
+        cookies=cookies,
+    )

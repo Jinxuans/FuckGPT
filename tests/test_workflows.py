@@ -211,6 +211,7 @@ def test_builtin_workflow_template_exposes_proxy_inputs():
     assert registration["extra"]["browser_visible"] is False
     assert definition["sample_input"]["registration"]["platform_proxy_mode"] == "direct"
     assert definition["sample_input"]["registration"]["platform_proxy_value"] == ""
+    assert definition["sample_input"]["codex"]["oauth_mode"] == "browser"
     assert definition["sample_input"]["codex"]["platform_proxy_mode"] == "direct"
     assert definition["sample_input"]["codex"]["platform_proxy_value"] == ""
 
@@ -222,6 +223,7 @@ def test_builtin_workflow_template_exposes_proxy_inputs():
     assert "registration.platform_proxy_mode" in field_paths
     assert "registration.platform_proxy_value" in field_paths
     assert "registration.extra.browser_visible" in field_paths
+    assert "codex.oauth_mode" in field_paths
     assert "codex.platform_proxy_mode" in field_paths
     assert "codex.platform_proxy_value" in field_paths
 
@@ -234,6 +236,17 @@ def test_builtin_workflow_template_exposes_proxy_inputs():
     assert [option["value"] for option in executor_field["options"]] == [
         "browser_protocol",
         "browser",
+    ]
+    codex_mode_field = next(
+        field
+        for section in definition["ui_schema"]["sections"]
+        for field in section["fields"]
+        if field["path"] == "codex.oauth_mode"
+    )
+    assert [option["value"] for option in codex_mode_field["options"]] == [
+        "browser",
+        "browser_protocol",
+        "protocol",
     ]
 
 
