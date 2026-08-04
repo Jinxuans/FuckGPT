@@ -93,6 +93,7 @@ const DEFAULT_REGISTER_CODEX_PUSH_INPUT = {
     },
   },
   codex: {
+    oauth_mode: 'browser',
     browser_mode: 'headless',
     keep_browser_open: 'false',
     platform_proxy_mode: 'direct',
