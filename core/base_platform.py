@@ -142,10 +142,45 @@ class BasePlatform(ABC):
             extra=dict(result.extra or {}),
         )
 
+    def export_registration_retry_state(self) -> dict | None:
+        """Return in-memory identity material that must survive a proxy swap."""
+        identity = getattr(self, "_last_identity", None)
+        if identity is None or not hasattr(self, "_last_registration_password"):
+            return None
+        return {
+            "identity": identity,
+            "password": getattr(self, "_last_registration_password", None),
+            "password_provided": bool(getattr(self, "_last_password_provided", False)),
+        }
+
+    def import_registration_retry_state(self, state: dict | None) -> None:
+        """Install identity material for the next registration attempt only."""
+        value = dict(state or {})
+        if value.get("identity") is None:
+            return
+        self._registration_retry_state = value
+
     def register(self, email: str = None, password: str = None) -> Account:
         self.raise_if_cancelled()
-        resolved_password = self._prepare_registration_password(password)
-        identity = self._resolve_identity(email, require_email=self._should_require_identity_email())
+        require_email = self._should_require_identity_email()
+        retry_state = getattr(self, "_registration_retry_state", None)
+        self._registration_retry_state = None
+        if retry_state:
+            identity = retry_state["identity"]
+            resolved_password = retry_state.get("password")
+            password_provided = bool(retry_state.get("password_provided"))
+            self._last_identity = identity
+            if require_email and not getattr(identity, "email", ""):
+                raise ValueError(
+                    f"{self.display_name} 注册流程未获取到可用邮箱，"
+                    f"请提供 email 或配置支持的 identity_provider"
+                )
+        else:
+            resolved_password = self._prepare_registration_password(password)
+            password_provided = bool(password)
+            identity = self._resolve_identity(email, require_email=require_email)
+        self._last_registration_password = resolved_password
+        self._last_password_provided = password_provided
         self.raise_if_cancelled()
         ctx = RegistrationContext(
             platform_name=self.name,
@@ -156,7 +191,7 @@ class BasePlatform(ABC):
             email=email,
             password=resolved_password,
             log_fn=self.log,
-            password_provided=bool(password),
+            password_provided=password_provided,
         )
 
         if (self.config.executor_type or "") in ("browser_protocol", "browser", "headless", "headed"):

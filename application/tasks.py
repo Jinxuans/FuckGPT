@@ -1678,6 +1678,7 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
         allocation_succeeded = False
         failure_reason = ""
         existing_account_failure = False
+        registration_retry_state = None
         try:
             logger.log(f"开始注册第 {index + 1}/{count} 个账号")
             from core.mailbox_lifecycle import MailboxAllocationLifecycle
@@ -1705,6 +1706,10 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
                     task_id=task_id,
                     subtask_id=subtask_id,
                 )
+                if registration_retry_state is not None:
+                    import_retry_state = getattr(platform, "import_registration_retry_state", None)
+                    if callable(import_retry_state):
+                        import_retry_state(registration_retry_state)
                 logger.log(
                     f"ChatGPT/Codex 代理: {mask_proxy_url(platform_proxy) if platform_proxy else '直连'}"
                     f"（{platform_proxy_mode}）"
@@ -1715,6 +1720,8 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
                     break
                 except Exception as exc:
                     allocation_id = MailboxAllocationLifecycle.allocation_id_from_platform(platform)
+                    export_retry_state = getattr(platform, "export_registration_retry_state", None)
+                    next_retry_state = export_retry_state() if callable(export_retry_state) else None
                     retry_proxy = (
                         platform_proxy_mode == PROXY_MODE_PROXY_SERVICE
                         and proxy_attempt < attempts
@@ -1726,13 +1733,21 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
                         proxy_lease.report_failure()
                         proxy_lease.release()
                         proxy_lease = None
-                    if allocation_id:
+                    registration_retry_state = next_retry_state
+                    if allocation_id and registration_retry_state is None:
                         MailboxAllocationLifecycle().release(
                             allocation_id,
                             outcome="failed",
                             reason=f"代理异常换 IP 重试: {exc}",
                         )
                         allocation_id = ""
+                    elif allocation_id:
+                        retry_identity = registration_retry_state.get("identity")
+                        retry_email = str(getattr(retry_identity, "email", "") or "").strip()
+                        logger.log(
+                            f"换代理重试复用已分配邮箱: {retry_email or '(mailbox)'}",
+                            level="warning",
+                        )
                     logger.log(
                         f"代理网络异常，关闭当前注册实例并换 IP 重试 "
                         f"({proxy_attempt + 1}/{attempts}): {exc}",
