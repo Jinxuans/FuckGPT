@@ -46,6 +46,7 @@ from platforms.chatgpt.codex_oauth import (
     _workspace_id_from_payload,
     has_codex_oauth_reusable_session,
     normalize_codex_oauth_mode,
+    perform_codex_oauth_login,
     perform_codex_oauth_login_on_page,
     perform_codex_oauth_login_with_mode,
 )
@@ -197,6 +198,41 @@ def test_chatgpt_codex_oauth_action_uses_browser_login_flow(monkeypatch):
     assert result["data"]["codex_access_token"] == "access-token"
 
 
+def test_chatgpt_codex_oauth_action_passes_browser_state_path(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(
+        "platforms.chatgpt.session_state.resolve_browser_state_path",
+        lambda value: value,
+    )
+
+    def fake_login(**kwargs):
+        captured.update(kwargs)
+        return {"codex_access_token": "access-token"}
+
+    monkeypatch.setattr("platforms.chatgpt.codex_oauth.perform_codex_oauth_login_with_mode", fake_login)
+
+    platform = ChatGPTPlatform(config=RegisterConfig())
+    result = platform.execute_action(
+        "codex_oauth_authorize",
+        Account(
+            platform="chatgpt",
+            email="user@example.com",
+            password="Secret123!",
+            extra={
+                "browser_state_path": "data/browser_states/chatgpt/user.storage.json",
+                "session_token": "session-token",
+                "cookies": "oai-did=device",
+            },
+        ),
+        {},
+    )
+
+    assert result["ok"] is True
+    assert captured["browser_state_path"] == "data/browser_states/chatgpt/user.storage.json"
+    assert captured["session_token"] == "session-token"
+    assert captured["cookies"] == "oai-did=device"
+
+
 def test_chatgpt_codex_oauth_action_can_run_headless(monkeypatch):
     captured = {}
 
@@ -236,6 +272,91 @@ def test_chatgpt_codex_oauth_action_can_keep_headed_browser_open(monkeypatch):
     assert result["ok"] is True
     assert captured["headless"] is False
     assert captured["keep_browser_open"] is True
+
+
+def test_codex_oauth_browser_mode_seeds_browser_state(monkeypatch):
+    seeded = {}
+    
+    class Attempt:
+        pkce = PKCECodes(code_verifier="verifier", code_challenge="challenge")
+        state = "state"
+        auth_url = "https://auth.openai.com/oauth/authorize"
+
+    class FakeContextManager:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def new_page(self):
+            return FakePage()
+
+    class FakePage:
+        def __init__(self):
+            self.context = type("Ctx", (), {"add_cookies": lambda self, cookies: seeded.setdefault("cookies", cookies)})()
+            self.url = "https://auth.openai.com/"
+            self.goto_calls = []
+
+        def goto(self, url, **kwargs):
+            self.url = url
+            self.goto_calls.append((url, kwargs))
+            return None
+
+        def evaluate(self, script, arg=None):
+            if "Object.keys(window.localStorage" in script:
+                return [{"name": "foo", "value": "bar"}]
+            if "fetch(sessionUrl" in script:
+                return {"status": 200, "url": "https://chatgpt.com/api/auth/session", "text": '{"accessToken":"token","user":{"email":"user@example.com"}}'}
+            if "window.localStorage.setItem" in script:
+                seeded["local_storage"] = arg
+                return None
+            return None
+
+    def fake_open_browser_backend(**kwargs):
+        seeded["launch_opts"] = kwargs["launch_opts"]
+        return FakeContextManager()
+
+    def fake_drive(page, **kwargs):
+        seeded["drive_kwargs"] = kwargs
+        assert seeded.get("seeded") is True
+        return {"code": "code", "state": kwargs["callback_server"].state}
+
+    monkeypatch.setattr("platforms.chatgpt.codex_oauth.open_browser_backend", fake_open_browser_backend)
+    monkeypatch.setattr("platforms.chatgpt.codex_oauth._drive_codex_oauth_page", fake_drive)
+    monkeypatch.setattr("platforms.chatgpt.codex_oauth._new_codex_oauth_attempt", lambda: Attempt())
+    monkeypatch.setattr(
+        "platforms.chatgpt.codex_oauth._OAuthCallbackServer",
+        lambda **kwargs: type(
+            "Srv",
+            (),
+            {
+                "__enter__": lambda self: self,
+                "__exit__": lambda self, *a: None,
+                "state": kwargs["state"],
+                "event": type("E", (), {"is_set": lambda self: True, "wait": lambda self, timeout: True})(),
+                "wait": lambda self, timeout: {"code": "code", "state": kwargs["state"]},
+            },
+        )(),
+    )
+    monkeypatch.setattr("platforms.chatgpt.codex_oauth._exchange_code_for_tokens", lambda *args, **kwargs: {"access_token": "a", "refresh_token": "r", "id_token": "i"})
+    monkeypatch.setattr("platforms.chatgpt.codex_oauth._save_codex_auth_file", lambda *args, **kwargs: "codex-auth.json")
+    monkeypatch.setattr("platforms.chatgpt.codex_oauth._token_identity", lambda token: {"email": "user@example.com", "account_id": "account", "plan_type": "unknown"})
+    monkeypatch.setattr("platforms.chatgpt.codex_oauth.seed_browser_state", lambda page, extra, log=None: seeded.setdefault("seeded", True) or {"seeded": True})
+
+    result = perform_codex_oauth_login(
+        email="user@example.com",
+        password="Secret123!",
+        proxy=None,
+        headless=False,
+        browser_state_path="data/browser_states/chatgpt/user.storage.json",
+        session_token="session-token",
+        cookies="oai-did=device",
+    )
+
+    assert result["codex_access_token"] == "a"
+    assert seeded["seeded"] is True
+    assert seeded["drive_kwargs"]["registration_auth_mode"] == ""
 
 
 def test_chatgpt_codex_oauth_action_passes_browser_protocol_mode(monkeypatch):

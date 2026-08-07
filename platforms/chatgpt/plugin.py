@@ -940,6 +940,7 @@ class ChatGPTPlatform(BasePlatform):
 
         if action_id == "codex_oauth_authorize":
             from platforms.chatgpt import codex_oauth
+            from platforms.chatgpt.session_state import resolve_browser_state_path
 
             self.raise_if_cancelled()
             if not account.email:
@@ -969,6 +970,7 @@ class ChatGPTPlatform(BasePlatform):
                 browser_mode = str((self.config.extra or {}).get("codex_oauth_browser_mode") or "headed").strip().lower()
             headless = browser_mode in {"headless", "true", "1", "yes", "后台", "后台浏览器"}
             keep_browser_open = _truthy(params.get("keep_browser_open") or (self.config.extra or {}).get("codex_oauth_keep_browser_open"))
+            browser_state_path = resolve_browser_state_path(extra.get("browser_state_path"))
             otp_callback = None
             try:
                 from core.mailbox_store import MailboxStore
@@ -1013,6 +1015,7 @@ class ChatGPTPlatform(BasePlatform):
                 otp_callback=otp_callback,
                 phone_callback=phone_callback,
                 keep_browser_open=keep_browser_open,
+                browser_state_path=str(browser_state_path or ""),
                 session_token=a.session_token,
                 cookies=a.cookies,
             )
