@@ -63,6 +63,12 @@ PERSISTED_ACTION_DATA_KEYS = {
     "codex_expires_at",
     "codex_last_refresh",
     "codex_auth_path",
+    "browser_state_path",
+    "browser_state_saved_at",
+    "browser_state_schema",
+    "browser_state_sha256",
+    "browser_state_cookie_count",
+    "browser_state_origin_count",
 }
 
 STATEFUL_ACTION_IDS = {"get_account_state", "switch_account", "query_state", "switch_desktop"}
@@ -76,6 +82,12 @@ RELOGIN_CREDENTIAL_KEYS = {
     "cookies",
     "workspace_id",
     "account_id",
+    "browser_state_path",
+    "browser_state_saved_at",
+    "browser_state_schema",
+    "browser_state_sha256",
+    "browser_state_cookie_count",
+    "browser_state_origin_count",
 }
 CODEX_OAUTH_SECRET_RESULT_KEYS = {
     "codex_access_token",

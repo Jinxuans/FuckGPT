@@ -3990,6 +3990,19 @@ class ChatGPTBrowserRegister:
                 "registration_state": final_state,
                 "registration_auth_mode": final_state.get("registration_auth_mode") or "email_otp",
             }
+            try:
+                from .session_state import save_browser_state
+
+                result.update(
+                    save_browser_state(
+                        page,
+                        email=email,
+                        account_id=str(result.get("account_id") or ""),
+                        log=self.log,
+                    )
+                )
+            except Exception as exc:
+                self.log(f"ChatGPT 浏览器状态保存失败，账号凭据仍已保存: {exc}")
             if self.post_codex_oauth:
                 self.log("注册后动作: 复用当前浏览器窗口执行 Codex OAuth")
                 from platforms.chatgpt.codex_oauth import perform_codex_oauth_login_on_page

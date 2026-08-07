@@ -21,6 +21,12 @@ RELOGIN_CREDENTIAL_KEYS = {
     "cookies",
     "workspace_id",
     "account_id",
+    "browser_state_path",
+    "browser_state_saved_at",
+    "browser_state_schema",
+    "browser_state_sha256",
+    "browser_state_cookie_count",
+    "browser_state_origin_count",
 }
 
 
