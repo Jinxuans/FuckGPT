@@ -43,6 +43,7 @@ from .browser_register import (
     _submit_oauth_password_direct,
     _wait_for_any_selector,
 )
+from .session_state import resolve_browser_state_path, seed_browser_state
 
 
 CODEX_AUTH_URL = "https://auth.openai.com/oauth/authorize"
@@ -3293,14 +3294,19 @@ def perform_codex_oauth_login(
     timeout: int = 300,
     backend_config: BrowserBackendConfig | None = None,
     keep_browser_open: bool = False,
+    browser_state_path: str | os.PathLike[str] | None = None,
+    session_token: str = "",
+    cookies: Any = None,
 ) -> dict[str, Any]:
     log = log_fn or (lambda _message: None)
     email = str(email or "").strip()
     password = str(password or "")
     normalized_auth_mode = str(registration_auth_mode or "").strip().lower()
+    state_path = resolve_browser_state_path(browser_state_path)
+    has_reusable_state = bool(state_path or str(session_token or "").strip() or cookies)
     if not email:
         raise RuntimeError("Codex OAuth 需要账号邮箱")
-    if not password and normalized_auth_mode != "email_otp":
+    if not password and normalized_auth_mode != "email_otp" and not has_reusable_state:
         raise RuntimeError("Codex OAuth 需要账号密码")
 
     browser_config = backend_config or BrowserBackendConfig.camoufox(headless=bool(headless))
@@ -3322,6 +3328,15 @@ def perform_codex_oauth_login(
     keep_open = bool(keep_browser_open and not browser_config.is_headless)
     try:
         page = browser.new_page()
+        seed_browser_state(
+            page,
+            {
+                "browser_state_path": str(state_path or ""),
+                "session_token": session_token,
+                "cookies": cookies,
+            },
+            log=log,
+        )
         last_error: Exception | None = None
         for attempt_index in range(1, CODEX_BROWSER_LOGIN_MAX_ATTEMPTS + 1):
             attempt = _new_codex_oauth_attempt()
@@ -3566,6 +3581,7 @@ def perform_codex_oauth_login_with_mode(
     timeout: int = 300,
     backend_config: BrowserBackendConfig | None = None,
     keep_browser_open: bool = False,
+    browser_state_path: str | os.PathLike[str] | None = None,
     session_token: str = "",
     cookies: Any = None,
 ) -> dict[str, Any]:
@@ -3584,6 +3600,9 @@ def perform_codex_oauth_login_with_mode(
             timeout=timeout,
             backend_config=backend_config,
             keep_browser_open=keep_browser_open,
+            browser_state_path=browser_state_path,
+            session_token=session_token,
+            cookies=cookies,
         )
         result["codex_oauth_mode"] = CODEX_OAUTH_MODE_BROWSER
         return result
