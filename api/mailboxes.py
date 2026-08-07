@@ -77,12 +77,24 @@ def get_mailboxes():
         "addresses": store.list_addresses(),
         "links": store.list_links(),
         "paths": _paths(),
+        "source": {
+            "kind": "sqlite",
+            "label": "SQLite 邮箱生命周期数据",
+        },
     }
 
 
 @router.get("/resources")
 def list_mailbox_resources():
     return {"items": _store().list_resources(), "paths": _paths()}
+
+
+@router.get("/resources/{mailbox_resource_id}")
+def get_mailbox_resource_detail(mailbox_resource_id: str):
+    item = _store().get_resource_detail(mailbox_resource_id)
+    if item is None:
+        raise HTTPException(404, "邮箱资源不存在")
+    return item
 
 
 @router.get("/accounts")

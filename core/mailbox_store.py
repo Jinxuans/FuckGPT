@@ -171,6 +171,37 @@ class MailboxStore:
         address_id = _text(address_id)
         return next((item for item in self.list_addresses() if item.get("id") == address_id), None)
 
+    def get_resource_detail(self, resource_id: str) -> dict[str, Any] | None:
+        from core.mailbox_lifecycle import MailboxAllocationLifecycle
+
+        resource_id = _text(resource_id)
+        canonical_id = MailboxAllocationLifecycle.parse_public_resource_id(resource_id)
+        if canonical_id is not None:
+            return MailboxAllocationLifecycle().get_resource_detail(canonical_id)
+
+        address = self.get_address(resource_id)
+        if address is None:
+            return None
+        mailbox_account_id = _text(address.get("mailbox_account_id"))
+        account = self.get_account(mailbox_account_id)
+        link = next(
+            (
+                item
+                for item in self.list_links()
+                if _text(item.get("mailbox_address_id")) == resource_id
+            ),
+            None,
+        )
+        return {
+            "source": "legacy_json",
+            "records": {
+                "resource": address,
+                "provider_account": account,
+                "allocation": None,
+                "link": link,
+            },
+        }
+
     def create_account(self, data: dict[str, Any]) -> dict[str, Any]:
         provider = _text(data.get("provider") or "local_ms_pool")
         email = _text(data.get("email"))

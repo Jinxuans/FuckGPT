@@ -2519,8 +2519,6 @@ export default function Accounts() {
   const copy = (text: string) => {
     void copyToClipboard(text)
   }
-  const emailApiLine = (email: string) =>
-    `${email} https://hsxhome.com/api/find/openai?email=${email}&t=fzKIywnF4KEGGB_i`
 
   const currentPlatformMeta = platformsMap[tab]
   const platformLabel = currentPlatformMeta?.display_name || tab
@@ -2984,7 +2982,7 @@ export default function Accounts() {
                 <td className="overflow-hidden px-3 py-2.5 font-mono text-sm text-[var(--text-primary)] align-top">
                   <div className="flex min-w-0 items-center gap-1.5">
                     <span className="truncate tracking-tight" title={accountEmail}>{accountEmail}</span>
-                    <button onClick={e => { e.stopPropagation(); copy(emailApiLine(accountEmail)) }} title="复制 Email+邮件API" className="text-[var(--text-muted)] hover:text-[var(--text-primary)] opacity-0 group-hover:opacity-100 transition-opacity"><Copy className="h-3 w-3" /></button>
+                    <button onClick={e => { e.stopPropagation(); copy(accountEmail) }} title="复制邮箱" className="text-[var(--text-muted)] hover:text-[var(--text-primary)] opacity-0 group-hover:opacity-100 transition-opacity"><Copy className="h-3 w-3" /></button>
                   </div>
                   <div className="mt-1.5 flex flex-wrap items-center gap-1 font-sans">
                     {planBadge && (
