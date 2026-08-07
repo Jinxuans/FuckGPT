@@ -173,6 +173,39 @@ def test_success_binds_one_account_and_keeps_provider_credentials_once():
         assert link.resource_id == allocation.resource_id
 
 
+def test_mailbox_api_exposes_canonical_resource_detail(client):
+    lifecycle = MailboxAllocationLifecycle()
+    allocation = lifecycle.allocate(
+        mailbox_account=_mailbox("detail@example.com", identifier="detail-key"),
+        provider="api_mailbox",
+        platform="chatgpt",
+        attempt_id="detail:worker_1",
+        task_id="detail-task",
+        subtask_id="worker_1",
+    )
+    with Session(db.engine) as session:
+        account = AccountModel(platform="chatgpt", email="detail-gpt@example.com", password="secret")
+        session.add(account)
+        session.commit()
+        session.refresh(account)
+        account_id = int(account.id)
+    lifecycle.succeed(allocation.id, account_id=account_id, account_email=account.email)
+
+    response = client.get(f"/api/mailboxes/resources/{lifecycle.public_resource_id(allocation.resource_id)}")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("application/json")
+    payload = response.json()
+    assert payload["source"] == "sqlite"
+    assert payload["records"]["resource"]["address"] == "detail@example.com"
+    assert payload["records"]["resource"]["provider_resource"]["resource_identifier"] == "detail-key"
+    assert "provider_resource_json" not in payload["records"]["resource"]
+    assert payload["records"]["provider_account"]["credentials"]["api_url"].endswith("token=secret")
+    assert "credentials_json" not in payload["records"]["provider_account"]
+    assert payload["records"]["allocation"]["id"] == allocation.id
+    assert payload["records"]["link"]["account_id"] == account_id
+
+
 def test_cancel_and_restart_interruption_return_resources():
     lifecycle = MailboxAllocationLifecycle()
     cancelled = lifecycle.allocate(

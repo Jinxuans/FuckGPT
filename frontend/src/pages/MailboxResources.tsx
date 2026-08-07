@@ -6,43 +6,6 @@ import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { TaskLogPanel } from "@/components/tasks/TaskLogPanel";
 
-type MailboxAccount = {
-  id: string;
-  provider: string;
-  email: string;
-  login_account?: string;
-  status?: string;
-  credentials?: Record<string, any>;
-  capabilities?: Record<string, any>;
-  usage?: Record<string, any>;
-  metadata?: Record<string, any>;
-  updated_at?: string;
-};
-
-type MailboxAddress = {
-  id: string;
-  mailbox_account_id: string;
-  address: string;
-  address_type?: string;
-  status?: string;
-  reserved?: boolean;
-  reserved_for?: Record<string, any>;
-  metadata?: Record<string, any>;
-  updated_at?: string;
-};
-
-type AccountMailboxLink = {
-  id: string;
-  platform: string;
-  account_id: number;
-  account_email?: string;
-  mailbox_address_id: string;
-  mailbox_account_id: string;
-  purpose?: string;
-  status?: string;
-  created_at?: string;
-};
-
 type MailboxResource = {
   id: string;
   resource_kind: "address";
@@ -83,10 +46,27 @@ type MailMessage = {
 
 type MailboxPayload = {
   resources: MailboxResource[];
-  accounts: MailboxAccount[];
-  addresses: MailboxAddress[];
-  links: AccountMailboxLink[];
-  paths?: Record<string, string>;
+  source?: {
+    kind?: string;
+    label?: string;
+  };
+};
+
+type MailboxResourceDetail = {
+  source: "sqlite" | "legacy_json";
+  records: {
+    resource: unknown;
+    provider_account: unknown;
+    allocation: unknown;
+    link: unknown;
+  };
+};
+
+type MailboxDetailState = {
+  resource: MailboxResource;
+  data: MailboxResourceDetail | null;
+  loading: boolean;
+  error: string;
 };
 
 type MailboxRegistrationOptions = {
@@ -171,7 +151,7 @@ function formatCompactTime(value?: string) {
 }
 
 function jsonBlock(value: unknown) {
-  return JSON.stringify(value ?? {}, null, 2);
+  return JSON.stringify(value ?? null, null, 2);
 }
 
 function StatusPill({ status }: { status?: string }) {
@@ -538,17 +518,26 @@ function MailMessagesModal({
 
 function DetailModal({
   resource,
-  account,
-  address,
-  link,
+  data,
+  loading,
+  error,
   onClose,
 }: {
   resource: MailboxResource;
-  account: MailboxAccount | null;
-  address: MailboxAddress | null;
-  link: AccountMailboxLink | null;
+  data: MailboxResourceDetail | null;
+  loading: boolean;
+  error: string;
   onClose: () => void;
 }) {
+  const rawRecords = data
+    ? [
+        ["resource", data.records.resource],
+        ["provider_account", data.records.provider_account],
+        ["allocation", data.records.allocation],
+        ["link", data.records.link],
+      ] as const
+    : [];
+
   return (
     <div className="dialog-backdrop" onClick={onClose}>
       <div className="dialog-panel dialog-panel-lg flex flex-col" style={{ maxHeight: "90vh" }} onClick={(event) => event.stopPropagation()}>
@@ -614,20 +603,26 @@ function DetailModal({
               </div>
             </div>
             <details open className="rounded-lg border border-[var(--border)] bg-[var(--bg-card)]">
-              <summary className="cursor-pointer px-3 py-2 text-sm font-medium text-[var(--text-primary)]">原始数据</summary>
-              <div className="grid gap-3 border-t border-[var(--border)] p-3 md:grid-cols-3">
-                <div>
-                  <div className="mb-1 text-xs text-[var(--text-muted)]">account</div>
-                  <pre className="control-surface control-surface-mono max-h-80 overflow-auto whitespace-pre-wrap">{jsonBlock(account)}</pre>
-                </div>
-                <div>
-                  <div className="mb-1 text-xs text-[var(--text-muted)]">address</div>
-                  <pre className="control-surface control-surface-mono max-h-80 overflow-auto whitespace-pre-wrap">{jsonBlock(address)}</pre>
-                </div>
-                <div>
-                  <div className="mb-1 text-xs text-[var(--text-muted)]">link</div>
-                  <pre className="control-surface control-surface-mono max-h-80 overflow-auto whitespace-pre-wrap">{jsonBlock(link)}</pre>
-                </div>
+              <summary className="cursor-pointer px-3 py-2 text-sm font-medium text-[var(--text-primary)]">
+                原始数据{data ? ` · ${data.source === "sqlite" ? "SQLite" : "旧 JSON"}` : ""}
+              </summary>
+              <div className="border-t border-[var(--border)] p-3">
+                {loading ? <div className="empty-state-panel">正在读取原始记录...</div> : null}
+                {!loading && error ? (
+                  <div className="rounded-lg border border-red-500/20 bg-red-500/10 px-3 py-2 text-sm text-red-400">
+                    {error}
+                  </div>
+                ) : null}
+                {!loading && !error && data ? (
+                  <div className="grid gap-3 xl:grid-cols-2">
+                    {rawRecords.map(([label, value]) => (
+                      <div key={label}>
+                        <div className="mb-1 text-xs text-[var(--text-muted)]">{label}</div>
+                        <pre className="control-surface control-surface-mono max-h-80 overflow-auto whitespace-pre-wrap">{jsonBlock(value)}</pre>
+                      </div>
+                    ))}
+                  </div>
+                ) : null}
               </div>
             </details>
           </div>
@@ -640,15 +635,12 @@ function DetailModal({
 export default function MailboxResources() {
   const [payload, setPayload] = useState<MailboxPayload>({
     resources: [],
-    accounts: [],
-    addresses: [],
-    links: [],
   });
   const [statusFilter, setStatusFilter] = useState("all");
   const [providerFilter, setProviderFilter] = useState("all");
   const [search, setSearch] = useState("");
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
-  const [detail, setDetail] = useState<MailboxResource | null>(null);
+  const [detail, setDetail] = useState<MailboxDetailState | null>(null);
   const [mailDialog, setMailDialog] = useState<{ resource: MailboxResource; messages: MailMessage[]; loading: boolean; error: string } | null>(null);
   const [registerCandidates, setRegisterCandidates] = useState<MailboxResource[]>([]);
   const [registerTask, setRegisterTask] = useState<{ resource: MailboxResource; taskId: string; status: string | null } | null>(null);
@@ -656,10 +648,6 @@ export default function MailboxResources() {
   const [bulkAction, setBulkAction] = useState("");
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
-
-  const accountById = useMemo(() => new Map(payload.accounts.map((item) => [item.id, item])), [payload.accounts]);
-  const addressById = useMemo(() => new Map(payload.addresses.map((item) => [item.id, item])), [payload.addresses]);
-  const linkByAddressId = useMemo(() => new Map(payload.links.map((item) => [item.mailbox_address_id, item])), [payload.links]);
 
   const providers = useMemo(() => {
     return Array.from(new Set(payload.resources.map((item) => item.provider).filter(Boolean))).sort();
@@ -735,10 +723,7 @@ export default function MailboxResources() {
       const data = await apiFetch("/mailboxes");
       setPayload({
         resources: Array.isArray(data?.resources) ? data.resources : [],
-        accounts: Array.isArray(data?.accounts) ? data.accounts : [],
-        addresses: Array.isArray(data?.addresses) ? data.addresses : [],
-        links: Array.isArray(data?.links) ? data.links : [],
-        paths: data?.paths || {},
+        source: data?.source || undefined,
       });
     } catch (exc: any) {
       setError(exc?.message || "加载邮箱资源失败");
@@ -750,6 +735,26 @@ export default function MailboxResources() {
   useEffect(() => {
     load();
   }, []);
+
+  const openDetail = (resource: MailboxResource) => {
+    setDetail({ resource, data: null, loading: true, error: "" });
+    void apiFetch(`/mailboxes/resources/${encodeURIComponent(resource.id)}`)
+      .then((data) => {
+        setDetail((current) => current?.resource.id === resource.id
+          ? { resource, data, loading: false, error: "" }
+          : current);
+      })
+      .catch((exc: unknown) => {
+        setDetail((current) => current?.resource.id === resource.id
+          ? {
+              resource,
+              data: null,
+              loading: false,
+              error: exc instanceof Error ? exc.message : "加载原始数据失败",
+            }
+          : current);
+      });
+  };
 
   const copyAddress = async (address: string) => {
     if (!address || !navigator?.clipboard) return;
@@ -766,7 +771,7 @@ export default function MailboxResources() {
   const deleteMailbox = async (resource: MailboxResource) => {
     if (!confirm(`归档邮箱 ${resource.address}？资源会从日常使用中隐藏，但分配和绑定历史会保留。`)) return;
     await apiFetch(`/mailboxes/accounts/${resource.mailbox_account_id}`, { method: "DELETE" });
-    if (detail?.id === resource.id) setDetail(null);
+    if (detail?.resource.id === resource.id) setDetail(null);
     await load();
   };
 
@@ -887,17 +892,13 @@ export default function MailboxResources() {
     }
   };
 
-  const detailAccount = detail ? accountById.get(detail.mailbox_account_id) || null : null;
-  const detailAddress = detail ? addressById.get(detail.mailbox_address_id) || null : null;
-  const detailLink = detail ? linkByAddressId.get(detail.mailbox_address_id) || null : null;
-
   return (
     <div className="flex h-full min-h-0 flex-col gap-3">
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="min-w-0">
           <h1 className="text-lg font-semibold text-[var(--text-primary)]">邮箱资源</h1>
           <div className="mt-1 text-[12px] text-[var(--text-muted)]">
-            {payload.paths?.accounts ? <span className="break-all">JSON: {payload.paths.accounts}</span> : "本地邮箱资源"}
+            {payload.source?.label || "SQLite 邮箱生命周期数据"}
           </div>
         </div>
         <Button variant="outline" size="sm" onClick={load} disabled={loading}>
@@ -1022,7 +1023,7 @@ export default function MailboxResources() {
                 <tr
                   key={resource.id}
                   className={`group cursor-pointer border-b border-[var(--border)]/30 transition-colors hover:bg-[var(--text-primary)]/[0.02] ${selectedIds.has(resource.id) ? "bg-[var(--accent-soft)]" : ""}`}
-                  onClick={() => setDetail(resource)}
+                  onClick={() => openDetail(resource)}
                 >
                   <td className="px-3 py-2.5 align-top" onClick={(event) => event.stopPropagation()}>
                     <input
@@ -1065,7 +1066,7 @@ export default function MailboxResources() {
                     <div className="flex items-center justify-end opacity-60 transition-opacity group-hover:opacity-100">
                       <ActionMenu
                         resource={resource}
-                        onDetail={() => setDetail(resource)}
+                        onDetail={() => openDetail(resource)}
                         onAction={handleAction}
                       />
                     </div>
@@ -1079,10 +1080,10 @@ export default function MailboxResources() {
 
       {detail ? (
         <DetailModal
-          resource={detail}
-          account={detailAccount}
-          address={detailAddress}
-          link={detailLink}
+          resource={detail.resource}
+          data={detail.data}
+          loading={detail.loading}
+          error={detail.error}
           onClose={() => setDetail(null)}
         />
       ) : null}
