@@ -696,6 +696,49 @@ class MailboxAllocationLifecycle:
             session.expunge(resource)
             return resource
 
+    def get_resource_detail(self, resource_id: int) -> dict[str, Any] | None:
+        """Return the canonical SQLite records behind one mailbox resource."""
+
+        with Session(db.engine) as session:
+            resource = session.get(MailboxResourceModel, int(resource_id))
+            if resource is None:
+                return None
+            provider_account = session.get(MailboxProviderAccountModel, resource.provider_account_id)
+            allocation = session.exec(
+                select(MailboxAllocationModel)
+                .where(MailboxAllocationModel.resource_id == int(resource.id or 0))
+                .order_by(MailboxAllocationModel.started_at.desc())
+            ).first()
+            link = session.exec(
+                select(MailboxAccountLinkModel).where(
+                    MailboxAccountLinkModel.resource_id == int(resource.id or 0)
+                )
+            ).first()
+
+            resource_record = resource.model_dump(mode="json")
+            resource_record["provider_resource"] = resource.get_provider_resource()
+            resource_record["metadata"] = resource.get_metadata()
+            resource_record.pop("provider_resource_json", None)
+            resource_record.pop("metadata_json", None)
+
+            provider_account_record = None
+            if provider_account is not None:
+                provider_account_record = provider_account.model_dump(mode="json")
+                provider_account_record["credentials"] = provider_account.get_credentials()
+                provider_account_record["metadata"] = provider_account.get_metadata()
+                provider_account_record.pop("credentials_json", None)
+                provider_account_record.pop("metadata_json", None)
+
+            return {
+                "source": "sqlite",
+                "records": {
+                    "resource": resource_record,
+                    "provider_account": provider_account_record,
+                    "allocation": allocation.model_dump(mode="json") if allocation else None,
+                    "link": link.model_dump(mode="json") if link else None,
+                },
+            }
+
     def get_provider_account_for_resource(self, resource_id: int) -> MailboxProviderAccountModel | None:
         with Session(db.engine) as session:
             resource = session.get(MailboxResourceModel, int(resource_id))
