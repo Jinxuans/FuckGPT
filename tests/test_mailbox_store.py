@@ -352,6 +352,15 @@ def test_mailbox_api_manages_json_resources(client, monkeypatch, tmp_path):
 
     listed = client.get("/api/mailboxes")
     assert listed.status_code == 200
+    assert listed.json()["source"]["kind"] == "sqlite"
     assert len(listed.json()["accounts"]) == 1
     assert len(listed.json()["addresses"]) == 1
     assert len(listed.json()["links"]) == 1
+
+    detail = client.get(f"/api/mailboxes/resources/{mailbox_address_id}")
+    assert detail.status_code == 200
+    assert detail.json()["source"] == "legacy_json"
+    assert detail.json()["records"]["resource"]["address"] == "parent+reg1@outlook.com"
+    assert detail.json()["records"]["provider_account"]["id"] == mailbox_account_id
+    assert detail.json()["records"]["allocation"] is None
+    assert detail.json()["records"]["link"]["account_id"] == 99
