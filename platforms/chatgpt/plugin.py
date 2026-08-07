@@ -469,6 +469,7 @@ class ChatGPTPlatform(BasePlatform):
         "query_state",      # Query account state/quota
         "switch_desktop",   # Switch to Codex desktop
         "relogin",          # Refresh ChatGPT browser login credentials
+        "launch_browser",   # Launch browser and inject saved ChatGPT login state
         "codex_oauth_authorize",  # Create Codex OAuth credentials through browser login
         "upload_cpa",       # Upload to CPA system
         "upload_tm",        # Upload to Team Manager
@@ -598,6 +599,12 @@ class ChatGPTPlatform(BasePlatform):
             "account_status": str(result.get("account_status") or (result.get("registration_state") or {}).get("account_status") or ""),
         }
         for key in (
+            "browser_state_path",
+            "browser_state_saved_at",
+            "browser_state_schema",
+            "browser_state_sha256",
+            "browser_state_cookie_count",
+            "browser_state_origin_count",
             "codex_auth_path",
             "codex_email",
             "codex_account_id",
@@ -768,6 +775,12 @@ class ChatGPTPlatform(BasePlatform):
         ]
         return [
             {"id": "switch_account", "label": "切换到 Codex 桌面端", "params": []},
+            {"id": "launch_browser", "label": "启动浏览器", "sync": True,
+             "params": [
+                 {"key": "browser_mode", "label": "浏览器", "type": "select", "options": ["camoufox_headed", "camoufox_headless", "bitbrowser_headed", "bitbrowser_hidden", "bitbrowser_headless"]},
+                 {"key": "bit_profile_id", "label": "BitBrowser Profile ID", "type": "text"},
+                 *proxy_params,
+             ]},
             {"id": "relogin", "label": "重新登录",
              "params": [
                  {"key": "browser_mode", "label": "浏览器模式", "type": "select", "options": ["headless", "headed"]},
@@ -905,6 +918,25 @@ class ChatGPTPlatform(BasePlatform):
                     "error": failure.message,
                     "data": {"failure_code": failure.code, "failed_at": utcnow_iso()},
                 }
+
+        if action_id == "launch_browser":
+            from platforms.chatgpt.session_state import launch_browser_with_state, resolve_browser_state_path
+
+            browser_state_path = resolve_browser_state_path(extra.get("browser_state_path"))
+            if not browser_state_path and not (a.session_token or a.cookies):
+                return {"ok": False, "error": "账号没有可注入的浏览器状态或 session/cookies，请先重新登录一次"}
+            browser_mode = str(params.get("browser_mode") or "camoufox_headed").strip().lower()
+            bit_profile_id = str(params.get("bit_profile_id") or "").strip()
+            result = launch_browser_with_state(
+                account_email=account.email,
+                account_id=a.account_id,
+                account_extra=extra,
+                proxy=proxy,
+                browser_mode=browser_mode,
+                bit_profile_id=bit_profile_id,
+                log=self.log,
+            )
+            return {"ok": True, "data": result}
 
         if action_id == "codex_oauth_authorize":
             from platforms.chatgpt import codex_oauth

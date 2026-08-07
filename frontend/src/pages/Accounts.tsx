@@ -444,6 +444,11 @@ function getActionOptionLabel(paramKey: string, value: string) {
     browser_mode: {
       headless: '后台浏览器',
       headed: '可视浏览器',
+      camoufox_headed: 'Camoufox 可视窗口',
+      camoufox_headless: 'Camoufox 后台',
+      bitbrowser_headed: 'BitBrowser 可视窗口',
+      bitbrowser_hidden: 'BitBrowser 隐藏窗口',
+      bitbrowser_headless: 'BitBrowser 后台',
     },
     keep_browser_open: {
       false: '否',
@@ -1258,6 +1263,9 @@ function ActionParamsModal({
         <div className="px-6 py-4 space-y-4">
           {params.map((param: any) => {
             if (param.key === 'platform_proxy_value' && form.platform_proxy_mode !== 'manual') {
+              return null
+            }
+            if (param.key === 'bit_profile_id' && !String(form.browser_mode || '').startsWith('bitbrowser_')) {
               return null
             }
             const value = form[param.key] ?? ''
